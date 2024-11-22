@@ -1,0 +1,43 @@
+version: "3.8"
+services:
+  web:
+    env_file: ".env"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        COMPOSER_MAGENTO_AUTH_USERNAME: ${COMPOSER_MAGENTO_AUTH_USERNAME}
+        COMPOSER_MAGENTO_AUTH_PASSWORD: ${COMPOSER_MAGENTO_AUTH_PASSWORD}
+    container_name: magento_web
+    volumes:
+      - ./html:/var/www/html
+    ports:
+      - "80:80"
+    depends_on:
+      - db
+      - opensearch
+
+  db:
+    image: mysql:5.7
+    container_name: magento_db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: magento
+      MYSQL_USER: magento
+      MYSQL_PASSWORD: magentopassword
+    volumes:
+      - ./db_data:/var/lib/mysql
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    container_name: magento_opensearch
+    environment:
+      - discovery.type=single-node
+    ports:
+      - "9200:9200"
+    volumes:
+      - ./opensearch_data:/usr/share/opensearch/data
+
+volumes:
+  db_data:
+  opensearch_data:
