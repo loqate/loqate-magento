@@ -162,7 +162,7 @@ class Validator
             return ['error' => true, 'message' => __('An unexpected error occurred while trying to validate your address.')];
         }
 
-        if (!$this->checkQualityIndex($response[0][0]['AQI'])) {
+        if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
             return ['error' => true, 'message' => __('The provided address is invalid.')];
         }
 
