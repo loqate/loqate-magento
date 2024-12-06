@@ -92,8 +92,8 @@ class Controller
             $searchText = $this->request->getParam('text');
             $origin = $this->request->getParam('origin');
             $containerId = $this->request->getParam('containerId');
-
-            $apiRequestParams = ['Text' => $searchText, 'source' => $this->version];
+            
+            $apiRequestParams = ['Text' => $searchText, 'source' => $this->version, 'IsMiddleware' => 'true'];
             if (!empty($origin)) {
                 $apiRequestParams['Origin'] = $origin;
             }
