@@ -204,17 +204,55 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     if (Array.isArray(response)) {
       response.forEach(function (item) {
         let addressItem = $(
-          "<div class='loqate-address-item' data-id='" +
-            item.Id +
-            "' data-type='" +
-            item.Type +
-            "'>" +
-            item.Text +
-            (item.Description ? item.Description : "") +
-            "</div>"
+          `<div class='loqate-address-item' data-id='${item.Id}' data-type='${
+            item.Type
+          }'>
+<span>${buildHighlights(item)}</span><span>${
+            item.Description ? item.Description : ""
+          }</span>
+</div>`
         );
         $(addressItem).appendTo($(addressList));
       });
+    }
+  }
+
+  function buildHighlights(findResponseItem, prefix, suffix) {
+    prefix = prefix || "<strong>";
+    suffix = suffix || "</strong>";
+
+    var highlights;
+
+    //initial values are all the same
+    highlightedText =
+      findResponseItem.title =
+      findResponseItem.tag =
+        findResponseItem.Text;
+
+    try {
+      //no highlight indexes
+      if (!findResponseItem.Highlight) return highlightedText;
+
+      highlights = findResponseItem.Highlight.split(",");
+
+      for (var i = highlights.length - 1; i >= 0; i--) {
+        var indexes = highlights[i].split("-");
+        highlightedText =
+          highlightedText.substring(0, parseInt(indexes[0])) +
+          prefix +
+          highlightedText.substring(
+            parseInt(indexes[0]),
+            parseInt(indexes[1])
+          ) +
+          suffix +
+          highlightedText.substring(
+            parseInt(indexes[1]),
+            highlightedText.length
+          );
+      }
+      return highlightedText;
+    } catch (e) {
+      return findResponseItem.Text;
     }
   }
 
