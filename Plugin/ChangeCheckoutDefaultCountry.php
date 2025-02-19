@@ -47,16 +47,24 @@ class ChangeCheckoutDefaultCountry
             try {
                 $countryModel = $this->countryFactory->create()->loadByCode($countryCode);
                 if ($countryModel->getId()) {
-                    $shippingAddressPath = &$jsLayout['components']['checkout']['children']['steps']['children']['shipping-step']
-                    ['children']['shippingAddress']['children']['shipping-address-fieldset']['children'];
-                    $shippingAddressPath['country_id']['value'] = $countryCode;
+                    if(isset($jsLayout['components']['checkout']['children']['steps']['children']['shipping-step']
+                    ['children']['shippingAddress']['children']['shipping-address-fieldset']['children']['country_id'])){
+                        $shippingAddressPath = &$jsLayout['components']['checkout']['children']['steps']['children']['shipping-step']
+                        ['children']['shippingAddress']['children']['shipping-address-fieldset']['children'];
+                        $shippingAddressPath['country_id']['value'] = $countryCode;
+                    }
 
-                    $billingAddressPath = &$jsLayout['components']['checkout']['children']['steps']['children']
+                    if(isset($jsLayout['components']['checkout']['children']['steps']['children']
                     ['billing-step']['children']['payment']['children']
                     ['payments-list']['children']['checkmo-form']['children']
-                    ['form-fields']['children'];
-
-                    $billingAddressPath['country_id']['value'] = $countryCode;
+                    ['form-fields']['children']['country_id'])){
+                        $billingAddressPath = &$jsLayout['components']['checkout']['children']['steps']['children']
+                        ['billing-step']['children']['payment']['children']
+                        ['payments-list']['children']['checkmo-form']['children']
+                        ['form-fields']['children'];
+    
+                        $billingAddressPath['country_id']['value'] = $countryCode;
+                    }
                 }
             } catch (\Exception) {
                 return $jsLayout;
