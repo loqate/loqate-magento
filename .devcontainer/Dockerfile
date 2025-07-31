@@ -23,10 +23,19 @@ RUN apt-get update && apt-get install -y \
     default-mysql-client \
     nodejs \
     npm \
+    ca-certificates \
+    nginx \
     && rm -rf /var/lib/apt/lists/*
 
+# Zscaler workaround (uncomment if you have DNS issues)
+# COPY zscaler.crt /usr/local/share/ca-certificates/
+# RUN update-ca-certificates
+
+# Setup nginx
+COPY nginx.conf /etc/nginx/nginx.conf
+
 # Install PHP extensions
-RUN docker-php-ext-install pdo_mysql intl gd bcmath soap xsl zip pcntl opcache sockets ftp
+RUN  docker-php-ext-configure gd --with-jpeg --with-freetype && docker-php-ext-install pdo_mysql intl gd bcmath soap xsl zip pcntl opcache sockets ftp
 
 # Install Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
@@ -50,6 +59,7 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    && usermod -aG www-data $USERNAME \
     && chown -R $USERNAME:$USERNAME /workspace
 
 USER $USERNAME 

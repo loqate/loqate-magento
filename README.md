@@ -38,19 +38,22 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 ### Quick Start
 
 1. **Open in VS Code**: Use the "Reopen in Container" command (requires the Remote - Containers extension).
-2. **Wait for Setup**: The devcontainer will build, install dependencies, and set up Magento 2 automatically.
-3. **Access Magento**:
-   - Storefront: [http://localhost](http://localhost)
-   - Admin: [http://localhost/admin](http://localhost/admin)
+1. **Wait for Setup**: The devcontainer will build, install dependencies, and set up Magento 2 automatically.
+1. **Temporary Workaround**: Currently as a work around you will need to go into the container and restart nginx for the `.devcontainer/nginx.conf` to be picked up.
+   * docker exec -u root -it `<container_id>` /bin/bash
+   * service nginx restart
+1. **Access Magento**:
+   - Storefront: [http://localhost:8080](http://localhost:8080)
+   - Admin: [http://localhost:8080/admin](http://localhost:8080/admin)
    - Default admin user: `admin` / `admin123`
-4. **Live Extension Development**: Your extension source is mounted into the running Magento instance. Changes are reflected immediately after running `bin/magento setup:upgrade` and clearing cache.
+1. **Live Extension Development**: Your extension source is mounted into the running Magento instance. Changes are reflected immediately after running `bin/magento setup:upgrade` and clearing cache.
 
 ### Services
 
 - PHP-FPM (8.1)
 - Nginx
 - MySQL 8
-- Elasticsearch 7
+- Opensearch
 - Redis
 
 ### Notes
@@ -58,3 +61,4 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 - The first startup may take several minutes (Magento install, Composer, DB setup).
 - The extension is symlinked into `app/code/Loqate/ApiIntegration`.
 - To re-run setup, use `.devcontainer/setup-magento.sh` inside the container.
+- If you have any DNS issues, you will need to copy your Zscaler certificate into the PHP container. (see line 30 in .devcontainer/Dockerfile)
