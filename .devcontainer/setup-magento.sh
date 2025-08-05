@@ -54,19 +54,26 @@ find var generated vendor pub/static pub/media app/etc -type d -exec chmod g+ws 
 chown -R :www-data .
 chmod u+x bin/magento
 
-# Enable developer mode
-bin/magento setup:upgrade
-bin/magento deploy:mode:set developer
-
-# Link the extension
+# Copy the extension
 if [ ! -L "$MAGENTO_DIR/app/code/Loqate/ApiIntegration" ]; then
   mkdir -p "$MAGENTO_DIR/app/code/Loqate"
-  ln -sfn "$EXTENSION_DIR" "$MAGENTO_DIR/app/code/Loqate/ApiIntegration"
+  mkdir -p "$MAGENTO_DIR/app/code/Loqate/ApiIntegration"
+  cp -r "$EXTENSION_DIR/*" "$MAGENTO_DIR/app/code/Loqate/ApiIntegration"
+  chown -R :www-data "$MAGENTO_DIR/app/code/Loqate/ApiIntegration"
 fi
 
-bin/magento module:enable Loqate_ApiIntegration || true
-bin/magento setup:upgrade
-bin/magento cache:flush
+# Install the Loqate API Connector
+composer require lqt/api-connector
 
-# Restart nginx
-# service nginx restart
+# Enable developer mode
+bin/magento deploy:mode:set developer
+
+# Enable the extension
+bin/magento module:enable Loqate_ApiIntegration || true
+
+# Compile the code
+bin/magento setup:upgrade
+bin/magento setup:di:compile
+
+# Flush the cache
+bin/magento cache:flush
