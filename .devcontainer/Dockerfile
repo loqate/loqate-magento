@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y \
     npm \
     ca-certificates \
     nginx \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Zscaler workaround (uncomment if you have DNS issues)

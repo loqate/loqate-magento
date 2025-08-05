@@ -14,6 +14,8 @@ services:
       - redis
     environment:
       - COMPOSER_ALLOW_SUPERUSER=1
+    env_file:
+      - devcontainer.env
     working_dir: /workspace/
 
   db:
