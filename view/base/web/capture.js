@@ -1,5 +1,15 @@
 requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
-  /*3.99 - Updates toolkit to 3.94 and introduces option to simulate react event*/
+  /* Based on v3.99 (custom changes have been made and are currently awaiting to be backported into the SDK 06/08/2025) - Updates toolkit to 3.94 and introduces option to simulate react event */
+
+  /*
+    Custom changes:
+    - Added new configurables to the options object:
+        - options.endpoint.literal - defines whether to use the `options.endpoint.find`/`options.endpoint.retrieve` endpoints directly
+        - options.endpoint.find - the find endpoint to use
+        - options.endpoint.retrieve - the retrieve endpoint to use
+        - options.endpoint.unwrapped - whether to assume the response from the endpoints will be unwrapped (i.e not in the `Items` array)
+    - Updated the `pca.fetch` method to pass through an options object, this is necessary for the unwrapped option to be toggleable
+  */
 
   /*! Copyright © 2009-2025 Postcode Anywhere (Holdings) Ltd. (http://www.postcodeanywhere.co.uk)
    *
