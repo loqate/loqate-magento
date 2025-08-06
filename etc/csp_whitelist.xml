@@ -6,5 +6,20 @@
 				<value id="loqate-api" type="host">api.addressy.com</value>
 			</values>
 		</policy>
+		<policy id="style-src">
+            <values>
+                <value id="capture-css" type="host">api.addressy.com</value>
+            </values>
+        </policy>
+		<policy id="script-src">
+            <values>
+                <value id="capture-js" type="host">api.addressy.com</value>
+            </values>
+        </policy>
+		<policy id="img-src">
+            <values>
+                <value id="capture-images" type="host">services.postcodeanywhere.co.uk</value>
+            </values>
+        </policy>
 	</policies>
 </csp_whitelist>

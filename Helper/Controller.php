@@ -89,9 +89,9 @@ class Controller
     {
         $resultJson = $this->resultJsonFactory->create(ResultFactory::TYPE_JSON);
         if ($this->apiConnector) {
-            $searchText = $this->request->getParam('text');
-            $origin = $this->request->getParam('origin');
-            $containerId = $this->request->getParam('containerId');
+            $searchText = $this->request->getParam('Text');
+            $origin = $this->request->getParam('Origin');
+            $container = $this->request->getParam('Container');
             
             $apiRequestParams = ['Text' => $searchText, 'source' => $this->version, 'IsMiddleware' => 'true'];
             if (!empty($origin)) {
@@ -103,8 +103,8 @@ class Controller
                 $apiRequestParams['Countries'] = $countries;
             }
 
-            if (!empty($containerId)) {
-                $apiRequestParams['Container'] = $containerId;
+            if (!empty($container)) {
+                $apiRequestParams['Container'] = $container;
             }
 
             $result = $this->apiConnector->find($apiRequestParams);
@@ -131,7 +131,7 @@ class Controller
     {
         $resultJson = $this->resultJsonFactory->create(ResultFactory::TYPE_JSON);
         if ($this->apiConnector) {
-            $addressId = $this->request->getParam('address_id');
+            $addressId = $this->request->getParam('Id');
             $apiRequestParams = ['Id' => $addressId, 'source' => $this->version];
 
             $enhancedDataSetsFields = $this->getEnhancedDataSetsFields();
