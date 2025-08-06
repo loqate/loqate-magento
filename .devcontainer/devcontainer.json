@@ -1,0 +1,15 @@
+{
+  "name": "Magento 2 DevContainer",
+  "dockerComposeFile": ["docker-compose.yml"],
+  "service": "php",
+  "forwardPorts": [8080, 3306, 15672, 9200],
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace/loqate-magento,type=bind"
+  ],
+  "postCreateCommand": "/workspace/loqate-magento/.devcontainer/setup-magento.sh",
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash"
+  },
+  "remoteUser": "vscode"
+}
