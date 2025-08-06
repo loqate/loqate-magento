@@ -5635,8 +5635,8 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         { element: "company", field: "Company", mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE },
         { element: "city", field: "City", mode: pca.fieldMode.POPULATE },
         { element: "region", field: "ProvinceName", mode: pca.fieldMode.POPULATE },
-        { element: "postcode", field: "PostalCode" },
-        { element: "country_id", field: "CountryName", mode: pca.fieldMode.COUNTRY }
+        { element: "postcode", field: "PostalCode", mode: pca.fieldMode.POPULATE },
+        { element: "country_id", field: "CountryIso2", mode: pca.fieldMode.COUNTRY }
     ];
 
       new pca.Address(fields, { key: " ", endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
