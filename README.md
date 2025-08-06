@@ -37,6 +37,7 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 ### Quick Start
 
+1. **Create a devcontainer.env**: Before opening the dev container you will need to create a devcontainer.env file which you can copy from the `devcontainer.env.example` file.
 1. **Open in VS Code**: Use the "Reopen in Container" command (requires the Remote - Containers extension).
 1. **Wait for Setup**: The devcontainer will build, install dependencies, and set up Magento 2 automatically.
 1. **Temporary Workaround**: Currently as a work around you will need to go into the container and restart nginx for the `.devcontainer/nginx.conf` to be picked up.

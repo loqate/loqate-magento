@@ -5624,7 +5624,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         { element: "street[1]", field: "Line2", mode: pca.fieldMode.POPULATE },
         { element: "company", field: "Company", mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE },
         { element: "city", field: "City", mode: pca.fieldMode.POPULATE },
-        { element: "region", field: "Province", mode: pca.fieldMode.POPULATE },
+        { element: "region", field: "ProvinceName", mode: pca.fieldMode.POPULATE },
         { element: "postcode", field: "PostalCode" },
         { element: "country_id", field: "CountryName", mode: pca.fieldMode.COUNTRY }
     ];
