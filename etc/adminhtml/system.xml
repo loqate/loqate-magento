@@ -39,13 +39,83 @@
                     <can_be_empty>1</can_be_empty>
                 </field>
             </group>
-            <group id="address_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
-                <label>Address Verify</label>
-                <field id="address_quality_index" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
-                    <label>Address Quality Index</label>
-                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AddressQualityIndex</source_model>
-                    <comment>The Address Quality Index (AQI) is used to indicate the quality of an address, e.g., Excellent quality, Good quality, Average quality, Poor quality, and Bad quality.</comment>
+            <group id="verify_threshold_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                <label>Address Verification - Thresholds</label>
+                <field id="show_advanced_avc_settings" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Override default AVC threshold?</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                    <comment>
+                        By default we use a best practice threshold for AVC. This requires a verification status of "Partially Verified" or better, with a matchscore above 95.
+                        If you want to change it, you can enable this setting and then change the thresholds below. More information can be found in the Loqate documentation.
+                    </comment>
                 </field>
+                <field id="avc_verification_status" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Verification Status</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCVerificationStatus</source_model>
+                    <comment>Some AVC stuff</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_post_match_level" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Post Match Level</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCPostProcessedMatchLevel</source_model>
+                    <comment>The post-processed verification match level gives the level to which the input data matches the available reference data once all changes and additions performed during the verification process have been taken into account.</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_pre_match_level" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Pre Match Level</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCPreProcessedMatchLevel</source_model>
+                    <comment>The pre-processed verification match level gives the level to which the input data matches the available reference data prior to any changes or additions performed during the verification process.</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_parsing_status" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Parsing Status</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCParsingStatus</source_model>
+            
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_lexicon_identification_match_level" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Lexicon identification match level</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCLexiconIdentificationMatchLevel</source_model>
+                    <comment>The lexicon identification match level gives the level to which the output data has some recognized form, through the use of pattern matching (e.g. a numeric value could be a premise number) and lexicon matching (e.g. 'rd' could be a ThoroughfareType, 'Road'; 'London' could be a Locality)</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_context_identification_match_level" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Context identification match level</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCContextIdentificationMatchLevel</source_model>
+                    <comment>The context identification match level gives the level to which the output data can be recognized based on the context in which it appears. This is the least accurate form of matching and is based on identifying a word as, for instance, a Thoroughfare based on it being preceded by something that could be a Premise, and followed by something that could be a Locality, the latter items being identified through a match against the reference data or the lexicon.</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_postcode_status" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Postcode Status</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCPostcodeStatus</source_model>
+               
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+                <field id="avc_matchscore" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>AVC Matchscore</label>
+                    <comment>The matchscore indicates how much the input data has been changed during the verification process in order to achieve the post-processed verification match level. 100% means no changes have been made. Data additions are not measured by the matchscore, only changes. Generally a matchscore of 95 or above indicates only a character or two have been changed during the process.</comment>
+                    <depends>
+                        <field id="show_advanced_avc_settings">1</field>
+                    </depends>
+                </field>
+            </group>
+            <group id="address_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                <label>Address Verification - General</label>
+
                 <field id="enable_customer_account" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Enable on Customer Account</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>

@@ -162,8 +162,12 @@ class Validator
             return ['error' => true, 'message' => __('An unexpected error occurred while trying to validate your address.')];
         }
 
-        if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
-            return ['error' => true, 'message' => __('The provided address is invalid.')];
+        // if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
+        //     return ['error' => true, 'message' => __('The provided address is invalid.')];
+        // }
+
+        if (!isset($response[0][0]['AVC']) || !$this->checkAVCStatus($response[0][0]['AVC'])) {
+            return ['error' => true, 'message' => __("The provided address is invalid.")];
         }
 
         return ['error' => false];
@@ -262,6 +266,39 @@ class Validator
         $configIndex = $this->helper->getConfigValue('loqate_settings/address_settings/address_quality_index');
 
         return $qualityIndex <= $configIndex;
+    }
+
+    /**
+     * Check if response avc matches the settings customer has set
+     *
+     * @param $qualityIndex
+     * @return bool
+     */
+    private function checkAVCStatus($avcCode): bool
+    {
+        $avc = new AVC($avcCode);
+        $avcVerificationStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_verification_status');
+        $avcPostMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_post_match_level');
+        $avcPreMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_pre_match_level');
+        $avcParsingStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_parsing_status');
+        $avcLexiconIdentificationMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_lexicon_identification_match_level');
+        $avcContextIdentificationMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_context_identification_match_level');
+        $avcPostcodeStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_postcode_status');
+        $avcMatchscore = $this->helper->getConfigValue('loqate_settings/address_settings/avc_matchscore');
+
+        $comparerAVCString = sprintf(
+            '%s%s%s-%s%s%s-%s-%s',
+            $avcVerificationStatus,
+            $avcPostMatchLevel,
+            $avcPreMatchLevel,
+            $avcParsingStatus,
+            $avcLexiconIdentificationMatchLevel,
+            $avcContextIdentificationMatchLevel,
+            $avcPostcodeStatus,
+            $avcMatchscore
+        );
+
+        return $avc->compareTo(new AVC($comparerAVCString))['overall'] == 'better';
     }
 
     /**
