@@ -1,10 +1,10 @@
 <?php
 /** @var Magento\Framework\View\Element\Template $block */
 ?>
-<script src="<?= $block->getViewFileUrl('Loqate_ApiIntegration::capture.js') ?>"></script>
-<link href="<?= $block->getViewFileUrl('Loqate_ApiIntegration::capture.css') ?>" rel="stylesheet" type="text/css" />
+<script src="<?= $escaper->escapeHtml($block->getViewFileUrl('Loqate_ApiIntegration::capture.js')) ?>"></script>
+<link href="<?= $escaper->escapeHtml($block->getViewFileUrl('Loqate_ApiIntegration::capture.css')) ?>" rel="stylesheet" type="text/css" />
 
 <div id="loqate-urls"
-     data-find-url="<?= $block->getUrl('loqate_admin/capture/find'); ?>"
-     data-retrieve-url="<?= $block->getUrl('loqate_admin/capture/retrieve'); ?>">
+     data-find-url="<?= $escaper->escapeHtml($block->getUrl('loqate_admin/capture/find')); ?>"
+     data-retrieve-url="<?= $escaper->escapeHtml($block->getUrl('loqate_admin/capture/retrieve')); ?>">
 </div>
