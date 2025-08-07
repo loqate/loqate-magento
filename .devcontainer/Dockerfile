@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     nginx \
     jq \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Zscaler workaround (uncomment if you have DNS issues)
@@ -61,6 +62,11 @@ ARG USER_GID=1000
 RUN groupadd --gid $USER_GID $USERNAME \
     && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
     && usermod -aG www-data $USERNAME \
+    && usermod -aG sudo $USERNAME \
     && chown -R $USERNAME:$USERNAME /workspace
+
+# Allow sudo without password for the vscode user
+RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
 
 USER $USERNAME 

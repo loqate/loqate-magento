@@ -95,3 +95,6 @@ bin/magento setup:di:compile
 
 # Flush the cache
 bin/magento cache:flush
+
+# restart nginx
+sudo service nginx restart
