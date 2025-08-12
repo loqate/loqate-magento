@@ -9,6 +9,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         - options.endpoint.retrieve - the retrieve endpoint to use
         - options.endpoint.unwrapped - whether to assume the response from the endpoints will be unwrapped (i.e not in the `Items` array)
     - Updated the `pca.fetch` method to pass through an options object, this is necessary for the unwrapped option to be toggleable
+    - Updated event logic to init the 'change' event for text inputs (see commit #6e3fa015c69f657572009a578ea15f1efbe09af3)
   */
 
   /*! Copyright © 2009-2025 Postcode Anywhere (Holdings) Ltd. (http://www.postcodeanywhere.co.uk)
