@@ -5615,6 +5615,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
 
   let loqateFindUrl;
   let loqateRetrieveUrl;
+  let pcaControl;
 
   $(document).ready(function () {
     var loqateElement = document.getElementById("loqate-urls");
@@ -5645,7 +5646,17 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         { element: "country_id", field: "CountryIso2", mode: pca.fieldMode.COUNTRY }
     ];
 
-      new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
+      pcaControl = new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
+
+      pcaControl.listen('populate', function(event) {
+        console.log('populate', event);
+        const regionSelect = document.querySelector('select[name="region_id"]');
+        const regionMap = Object.fromEntries(Array.from(regionSelect.options).map(option => [option.text, option.value]));
+        
+        regionSelect.value = regionMap[event.ProvinceName];
+        regionSelect.dispatchEvent(new Event('change'));
+      });
+
       clearInterval(pcaCheckInterval);
     }, 200);
   });
