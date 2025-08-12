@@ -5628,8 +5628,13 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     }
 
     // wait until the address fields are rendered
-    // TODO: add a smarter check to ensure fields are rendered before initialising Capture
-    setTimeout(function () {
+    const pcaCheckInterval = setInterval(function () {
+      const street1 = document.querySelector('input[name="street[0]"]');
+
+      if(street1 == null || !pca) {
+        return;
+      }
+
       var fields = [
         { element: "street[0]", field: "Line1", mode: pca.fieldMode.DEFAULT },
         { element: "street[1]", field: "Line2", mode: pca.fieldMode.POPULATE },
@@ -5641,6 +5646,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     ];
 
       new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
-    }, 2000);
+      clearInterval(pcaCheckInterval);
+    }, 200);
   });
 });
