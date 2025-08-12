@@ -5649,7 +5649,6 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       pcaControl = new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
 
       pcaControl.listen('populate', function(event) {
-        console.log('populate', event);
         const regionSelect = document.querySelector('select[name="region_id"]');
         const regionMap = Object.fromEntries(Array.from(regionSelect.options).map(option => [option.text, option.value]));
         
