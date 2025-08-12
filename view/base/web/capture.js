@@ -9,6 +9,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         - options.endpoint.retrieve - the retrieve endpoint to use
         - options.endpoint.unwrapped - whether to assume the response from the endpoints will be unwrapped (i.e not in the `Items` array)
     - Updated the `pca.fetch` method to pass through an options object, this is necessary for the unwrapped option to be toggleable
+    - Updated event logic to init the 'change' event for text inputs (see commit #6e3fa015c69f657572009a578ea15f1efbe09af3)
   */
 
   /*! Copyright © 2009-2025 Postcode Anywhere (Holdings) Ltd. (http://www.postcodeanywhere.co.uk)
@@ -2791,7 +2792,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       }
 
       if (nodeName === 'select' ||
-        (nodeName === 'input' && type === 'file')) {
+        (nodeName === 'input' && type === 'file') || (nodeName === 'input' && type === 'text')) {
         // IE9-IE11, non-IE
         // Dispatch change.
         event = document.createEvent('HTMLEvents');
@@ -5627,8 +5628,13 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     }
 
     // wait until the address fields are rendered
-    // TODO: add a smarter check to ensure fields are rendered before initialising Capture
-    setTimeout(function () {
+    const pcaCheckInterval = setInterval(function () {
+      const streetField = document.querySelector('input[name="street[0]"]');
+
+      if(streetField == null || !pca) {
+        return;
+      }
+
       var fields = [
         { element: "street[0]", field: "Line1", mode: pca.fieldMode.DEFAULT },
         { element: "street[1]", field: "Line2", mode: pca.fieldMode.POPULATE },
@@ -5639,7 +5645,8 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         { element: "country_id", field: "CountryIso2", mode: pca.fieldMode.COUNTRY }
     ];
 
-      new pca.Address(fields, { key: " ", endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
-    }, 2000);
+      new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
+      clearInterval(pcaCheckInterval);
+    }, 200);
   });
 });
