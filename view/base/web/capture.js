@@ -5629,9 +5629,9 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
 
     // wait until the address fields are rendered
     const pcaCheckInterval = setInterval(function () {
-      const street1 = document.querySelector('input[name="street[0]"]');
+      const streetField = document.querySelector('input[name="street[0]"]');
 
-      if(street1 == null || !pca) {
+      if(streetField == null || !pca) {
         return;
       }
 
