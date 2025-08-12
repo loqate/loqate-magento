@@ -2791,7 +2791,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       }
 
       if (nodeName === 'select' ||
-        (nodeName === 'input' && type === 'file')) {
+        (nodeName === 'input' && type === 'file') || (nodeName === 'input' && type === 'text')) {
         // IE9-IE11, non-IE
         // Dispatch change.
         event = document.createEvent('HTMLEvents');
@@ -5639,7 +5639,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         { element: "country_id", field: "CountryIso2", mode: pca.fieldMode.COUNTRY }
     ];
 
-      new pca.Address(fields, { key: " ", endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
+      new pca.Address(fields, { key: " ", simulateReactEvents: true, endpoint: { literal: true, find: "/loqate/capture/find", retrieve: "/loqate/capture/retrieve", unwrapped: true } });
     }, 2000);
   });
 });
