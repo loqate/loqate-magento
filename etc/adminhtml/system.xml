@@ -39,20 +39,45 @@
                     <can_be_empty>1</can_be_empty>
                 </field>
             </group>
+            
+            <group id="address_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                <label>Address Verification - General</label>
+
+                <field id="enable_customer_account" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Enable on Customer Account</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="enable_checkout" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
+                    <label>Enable on Checkout</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="enable_customer_account_admin" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Enable on Customer Account (ADMIN)</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="enable_create_order_admin" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Enable on Create Order (ADMIN)</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+                <field id="enable_customer_import" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Enable on Customer Import (ADMIN)</label>
+                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
+                </field>
+            </group>
             <group id="verify_threshold_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                 <label>Address Verification - Thresholds</label>
                 <field id="show_advanced_avc_settings" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>Override default AVC threshold?</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                     <comment>
-                        By default we use a best practice threshold for AVC. This requires a verification status of "Partially Verified" or better, with a matchscore above 95.
+                        The AVC threshold is the quality threshold that will trigger a validation message to the user in the event the address they have provided does not exceed the threshold set. By default we use a best practice threshold for AVC. This requires a verification status of "Partially Verified" or better, a verification match level of 4 (premise) or better, and a matchscore above 95.
                         If you want to change it, you can enable this setting and then change the thresholds below. More information can be found in the Loqate documentation.
                     </comment>
                 </field>
                 <field id="avc_verification_status" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>AVC Verification Status</label>
                     <source_model>Loqate\ApiIntegration\Model\Config\Source\AVCVerificationStatus</source_model>
-                    <comment>Some AVC stuff</comment>
+                    <comment>The verification status indicates the high level outcome of the address match.</comment>
                     <depends>
                         <field id="show_advanced_avc_settings">1</field>
                     </depends>
@@ -107,34 +132,10 @@
                 </field>
                 <field id="avc_matchscore" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                     <label>AVC Matchscore</label>
-                    <comment>The matchscore indicates how much the input data has been changed during the verification process in order to achieve the post-processed verification match level. 100% means no changes have been made. Data additions are not measured by the matchscore, only changes. Generally a matchscore of 95 or above indicates only a character or two have been changed during the process.</comment>
+                    <comment>The matchscore indicates how much the input data has been changed during the verification process in order to achieve the post-processed verification match level. 100% means no changes have been made. Data additions are not measured by the matchscore, only changes. Generally a matchscore of 95 or above indicates only a character or two have been changed during the process. (Default: 95)</comment>
                     <depends>
                         <field id="show_advanced_avc_settings">1</field>
                     </depends>
-                </field>
-            </group>
-            <group id="address_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
-                <label>Address Verification - General</label>
-
-                <field id="enable_customer_account" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
-                    <label>Enable on Customer Account</label>
-                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                </field>
-                <field id="enable_checkout" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
-                    <label>Enable on Checkout</label>
-                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                </field>
-                <field id="enable_customer_account_admin" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
-                    <label>Enable on Customer Account (ADMIN)</label>
-                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                </field>
-                <field id="enable_create_order_admin" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
-                    <label>Enable on Create Order (ADMIN)</label>
-                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
-                </field>
-                <field id="enable_customer_import" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
-                    <label>Enable on Customer Import (ADMIN)</label>
-                    <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
             </group>
             <group id="email_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">

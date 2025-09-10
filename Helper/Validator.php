@@ -269,22 +269,58 @@ class Validator
     }
 
     /**
-     * Check if response avc matches the settings customer has set
-     *
-     * @param $qualityIndex
-     * @return bool
+     * Compare an AVC code against either:
+     *  - user-configured thresholds (when "show_advanced_avc_settings" = Yes), or
+     *  - baked-in defaults from etc/config.xml (when = No).
      */
     private function checkAVCStatus($avcCode): bool
     {
         $avc = new AVC($avcCode);
-        $avcVerificationStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_verification_status');
-        $avcPostMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_post_match_level');
-        $avcPreMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_pre_match_level');
-        $avcParsingStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_parsing_status');
-        $avcLexiconIdentificationMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_lexicon_identification_match_level');
-        $avcContextIdentificationMatchLevel = $this->helper->getConfigValue('loqate_settings/address_settings/avc_context_identification_match_level');
-        $avcPostcodeStatus = $this->helper->getConfigValue('loqate_settings/address_settings/avc_postcode_status');
-        $avcMatchscore = $this->helper->getConfigValue('loqate_settings/address_settings/avc_matchscore');
+        $advancedToggle = $this->helper->getConfigValue('loqate_settings/verify_threshold_settings/show_advanced_avc_settings');
+        $useAdvanced = ((int)$advancedToggle) === 1;
+
+        $defaults = [
+            'avc_verification_status'                 => 'P',
+            'avc_post_match_level'                    => '4',
+            'avc_pre_match_level'                     => '0',
+            'avc_parsing_status'                      => 'U',
+            'avc_lexicon_identification_match_level'  => '0',
+            'avc_context_identification_match_level'  => '0',
+            'avc_postcode_status'                     => 'P0',
+            'avc_matchscore'                          => '95',
+        ];
+
+        // Base path where the threshold fields actually live:
+        $base = 'loqate_settings/verify_threshold_settings';
+
+        // Helper to read a path or fall back to default if empty/missing.
+        $getOrDefault = function (string $key) use ($base, $defaults) {
+            $val = $this->helper->getConfigValue($base . '/' . $key);
+            $val = ($val === null || $val === '') ? $defaults[$key] : (string)$val;
+            return $val;
+        };
+
+        if ($useAdvanced) {
+            $avcVerificationStatus   = $getOrDefault('avc_verification_status');
+            $avcPostMatchLevel  = $getOrDefault('avc_post_match_level');
+            $avcPreMatchLevel  = $getOrDefault('avc_pre_match_level');
+            $avcParsingStatus   = $getOrDefault('avc_parsing_status');
+            $avcLexiconIdentificationMatchLevel  = $getOrDefault('avc_lexicon_identification_match_level');
+            $avcContextIdentificationMatchLevel  = $getOrDefault('avc_context_identification_match_level');
+            $avcPostcodeStatus  = $getOrDefault('avc_postcode_status');
+            $avcMatchscore   = $getOrDefault('avc_matchscore');
+        } else {
+            // Hard use the defaults
+            $avcVerificationStatus   = $defaults['avc_verification_status'];
+            $avcPostMatchLevel  = $defaults['avc_post_match_level'];
+            $avcPreMatchLevel  = $defaults['avc_pre_match_level'];
+            $avcParsingStatus   = $defaults['avc_parsing_status'];
+            $avcLexiconIdentificationMatchLevel  = $defaults['avc_lexicon_identification_match_level'];
+            $avcContextIdentificationMatchLevel  = $defaults['avc_context_identification_match_level'];
+            $avcPostcodeStatus  = $defaults['avc_postcode_status'];
+            $avcMatchscore   = $defaults['avc_matchscore'];
+        }
+
 
         $comparerAVCString = sprintf(
             '%s%s%s-%s%s%s-%s-%s',
@@ -297,7 +333,12 @@ class Validator
             $avcPostcodeStatus,
             $avcMatchscore
         );
-
+        // print_r($comparerAVCString);
+        // print("\n");
+        // print_r($avcCode);
+        // print("\n");
+        // print_r($avc->compareTo(new AVC($comparerAVCString)));
+        // return false;
         return $avc->compareTo(new AVC($comparerAVCString))['overall'] == 'better';
     }
 

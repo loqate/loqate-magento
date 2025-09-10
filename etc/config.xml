@@ -9,8 +9,8 @@
                 <enable_create_order_admin>1</enable_create_order_admin>
             </capture_settings>
             <address_settings>
-                <avc_verification_status>V</avc_verification_status>
-                <avc_post_match_level>0</avc_post_match_level>
+                <avc_verification_status>P</avc_verification_status>
+                <avc_post_match_level>4</avc_post_match_level>
                 <avc_pre_match_level>0</avc_pre_match_level>
                 <avc_parsing_status>U</avc_parsing_status>
                 <avc_lexicon_identification_match_level>0</avc_lexicon_identification_match_level>
