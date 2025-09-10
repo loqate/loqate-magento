@@ -17,8 +17,6 @@
                 <avc_context_identification_match_level>0</avc_context_identification_match_level>
                 <avc_postcode_status>P0</avc_postcode_status>
                 <avc_matchscore>95</avc_matchscore>
-                
-
                 <address_quality_index>A</address_quality_index>
                 <enable_customer_account>1</enable_customer_account>
                 <enable_checkout>1</enable_checkout>
