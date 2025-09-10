@@ -4,8 +4,9 @@
 
 Performs address capture and data validation (email, phone number and address) using Loqate API.
 
-##Download
-###Download via composer
+## Download
+
+### Download via composer
 
 Request composer to fetch the module:
 
@@ -13,13 +14,13 @@ Request composer to fetch the module:
 composer require loqate-integration/adobe
 ```
 
-###Manual Download
+### Manual Download
 
-Download & copy the git content to /app/code/Loqate/ApiIntegration
+Download & copy the git content to `/app/code/Loqate/ApiIntegration`.
 
 ## Install
 
-Please run the following commands after you download the module
+Please run the following commands after you download the module.
 
 ```
 php bin/magento module:enable Loqate_ApiIntegration
@@ -37,11 +38,9 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 ### Quick Start
 
+1. **Create a devcontainer.env**: Before opening the devcontainer you will need to create a `devcontainer.env` file which you can copy from [`devcontainer.env.example`](.devcontainer/devcontainer.env.example).
 1. **Open in VS Code**: Use the "Reopen in Container" command (requires the Remote - Containers extension).
 1. **Wait for Setup**: The devcontainer will build, install dependencies, and set up Magento 2 automatically.
-1. **Temporary Workaround**: Currently as a work around you will need to go into the container and restart nginx for the `.devcontainer/nginx.conf` to be picked up.
-   * docker exec -u root -it `<container_id>` /bin/bash
-   * service nginx restart
 1. **Access Magento**:
    - Storefront: [http://localhost:8080](http://localhost:8080)
    - Admin: [http://localhost:8080/admin](http://localhost:8080/admin)
@@ -60,5 +59,5 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 - The first startup may take several minutes (Magento install, Composer, DB setup).
 - The extension is symlinked into `app/code/Loqate/ApiIntegration`.
-- To re-run setup, use `.devcontainer/setup-magento.sh` inside the container.
-- If you have any DNS issues, you will need to copy your Zscaler certificate into the PHP container. (see line 30 in .devcontainer/Dockerfile)
+- To re-run setup, use [`.devcontainer/setup-magento.sh`](.devcontainer/setup-magento.sh) inside the container.
+- If you have any DNS issues, you will need to copy your Zscaler certificate into the PHP container - see the Zscaler workaround comment in the [`Dockerfile`](.devcontainer/Dockerfile).
