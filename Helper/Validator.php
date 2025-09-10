@@ -333,12 +333,6 @@ class Validator
             $avcPostcodeStatus,
             $avcMatchscore
         );
-        // print_r($comparerAVCString);
-        // print("\n");
-        // print_r($avcCode);
-        // print("\n");
-        // print_r($avc->compareTo(new AVC($comparerAVCString)));
-        // return false;
         return $avc->compareTo(new AVC($comparerAVCString))['overall'] == 'better';
     }
 
