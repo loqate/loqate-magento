@@ -162,8 +162,12 @@ class Validator
             return ['error' => true, 'message' => __('An unexpected error occurred while trying to validate your address.')];
         }
 
-        if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
-            return ['error' => true, 'message' => __('The provided address is invalid.')];
+        // if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
+        //     return ['error' => true, 'message' => __('The provided address is invalid.')];
+        // }
+
+        if (!isset($response[0][0]['AVC']) || !$this->checkAVCStatus($response[0][0]['AVC'])) {
+            return ['error' => true, 'message' => __("The provided address is invalid.")];
         }
 
         return ['error' => false];
@@ -262,6 +266,74 @@ class Validator
         $configIndex = $this->helper->getConfigValue('loqate_settings/address_settings/address_quality_index');
 
         return $qualityIndex <= $configIndex;
+    }
+
+    /**
+     * Compare an AVC code against either:
+     *  - user-configured thresholds (when "show_advanced_avc_settings" = Yes), or
+     *  - baked-in defaults from etc/config.xml (when = No).
+     */
+    private function checkAVCStatus($avcCode): bool
+    {
+        $avc = new AVC($avcCode);
+        $advancedToggle = $this->helper->getConfigValue('loqate_settings/verify_threshold_settings/show_advanced_avc_settings');
+        $useAdvanced = ((int)$advancedToggle) === 1;
+
+        $defaults = [
+            'avc_verification_status'                 => 'P',
+            'avc_post_match_level'                    => '4',
+            'avc_pre_match_level'                     => '0',
+            'avc_parsing_status'                      => 'U',
+            'avc_lexicon_identification_match_level'  => '0',
+            'avc_context_identification_match_level'  => '0',
+            'avc_postcode_status'                     => 'P0',
+            'avc_matchscore'                          => '95',
+        ];
+
+        // Base path where the threshold fields actually live:
+        $base = 'loqate_settings/verify_threshold_settings';
+
+        // Helper to read a path or fall back to default if empty/missing.
+        $getOrDefault = function (string $key) use ($base, $defaults) {
+            $val = $this->helper->getConfigValue($base . '/' . $key);
+            $val = ($val === null || $val === '') ? $defaults[$key] : (string)$val;
+            return $val;
+        };
+
+        if ($useAdvanced) {
+            $avcVerificationStatus   = $getOrDefault('avc_verification_status');
+            $avcPostMatchLevel  = $getOrDefault('avc_post_match_level');
+            $avcPreMatchLevel  = $getOrDefault('avc_pre_match_level');
+            $avcParsingStatus   = $getOrDefault('avc_parsing_status');
+            $avcLexiconIdentificationMatchLevel  = $getOrDefault('avc_lexicon_identification_match_level');
+            $avcContextIdentificationMatchLevel  = $getOrDefault('avc_context_identification_match_level');
+            $avcPostcodeStatus  = $getOrDefault('avc_postcode_status');
+            $avcMatchscore   = $getOrDefault('avc_matchscore');
+        } else {
+            // Hard use the defaults
+            $avcVerificationStatus   = $defaults['avc_verification_status'];
+            $avcPostMatchLevel  = $defaults['avc_post_match_level'];
+            $avcPreMatchLevel  = $defaults['avc_pre_match_level'];
+            $avcParsingStatus   = $defaults['avc_parsing_status'];
+            $avcLexiconIdentificationMatchLevel  = $defaults['avc_lexicon_identification_match_level'];
+            $avcContextIdentificationMatchLevel  = $defaults['avc_context_identification_match_level'];
+            $avcPostcodeStatus  = $defaults['avc_postcode_status'];
+            $avcMatchscore   = $defaults['avc_matchscore'];
+        }
+
+
+        $comparerAVCString = sprintf(
+            '%s%s%s-%s%s%s-%s-%s',
+            $avcVerificationStatus,
+            $avcPostMatchLevel,
+            $avcPreMatchLevel,
+            $avcParsingStatus,
+            $avcLexiconIdentificationMatchLevel,
+            $avcContextIdentificationMatchLevel,
+            $avcPostcodeStatus,
+            $avcMatchscore
+        );
+        return $avc->compareTo(new AVC($comparerAVCString))['overall'] == 'better';
     }
 
     /**
