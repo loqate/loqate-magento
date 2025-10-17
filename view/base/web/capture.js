@@ -7756,10 +7756,126 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
 
   let loqateFindUrl;
   let loqateRetrieveUrl;
-  let pcaControl;
+  const fieldMappings = {
+    default: [
+      { element: "street[0]", field: "Line1", mode: pca.fieldMode.DEFAULT },
+      { element: "street[1]", field: "Line2", mode: pca.fieldMode.POPULATE },
+      {
+        element: "company",
+        field: "Company",
+        mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE,
+      },
+      { element: "city", field: "City", mode: pca.fieldMode.POPULATE },
+      {
+        element: "region",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "region_id",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "postcode",
+        field: "PostalCode",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "country_id",
+        field: "CountryIso2",
+        mode: pca.fieldMode.COUNTRY,
+      },
+    ],
+    billingFields: [
+      {
+        element: "order[billing_address][street][0]",
+        field: "Line1",
+        mode: pca.fieldMode.DEFAULT,
+      },
+      {
+        element: "order[billing_address][street][1]",
+        field: "Line2",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[billing_address][company]",
+        field: "Company",
+        mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE,
+      },
+      {
+        element: "order[billing_address][city]",
+        field: "City",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[billing_address][region]",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[billing_address][region_id]",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[billing_address][postcode]",
+        field: "PostalCode",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[billing_address][country_id]",
+        field: "CountryIso2",
+        mode: pca.fieldMode.COUNTRY,
+      },
+    ],
+    shippingFields: [
+      {
+        element: "order[shipping_address][street][0]",
+        field: "Line1",
+        mode: pca.fieldMode.DEFAULT,
+      },
+      {
+        element: "order[shipping_address][street][1]",
+        field: "Line2",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[shipping_address][company]",
+        field: "Company",
+        mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE,
+      },
+      {
+        element: "order[shipping_address][city]",
+        field: "City",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[shipping_address][region]",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[shipping_address][region_id]",
+        field: "ProvinceName",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[shipping_address][postcode]",
+        field: "PostalCode",
+        mode: pca.fieldMode.POPULATE,
+      },
+      {
+        element: "order[shipping_address][country_id]",
+        field: "CountryIso2",
+        mode: pca.fieldMode.COUNTRY,
+      },
+    ],
+  };
 
   $(document).ready(function () {
-    var loqateElement = document.getElementById("loqate-urls");
+    const loqateElement = document.getElementById("loqate-urls");
+    const pcaInstances = {};
 
     if (loqateElement) {
       loqateFindUrl = loqateElement.getAttribute("data-find-url");
@@ -7770,64 +7886,38 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     }
 
     // wait until the address fields are rendered
-    const pcaCheckInterval = setInterval(function () {
-      const streetField = document.querySelector('input[name="street[0]"]');
-
-      if (streetField == null || !pca) {
-        return;
-      }
-
-      var fields = [
-        { element: "street[0]", field: "Line1", mode: pca.fieldMode.DEFAULT },
-        { element: "street[1]", field: "Line2", mode: pca.fieldMode.POPULATE },
-        {
-          element: "company",
-          field: "Company",
-          mode: pca.fieldMode.POPULATE | pca.fieldMode.PRESERVE,
-        },
-        { element: "city", field: "City", mode: pca.fieldMode.POPULATE },
-        {
-          element: "region",
-          field: "ProvinceName",
-          mode: pca.fieldMode.POPULATE,
-        },
-        {
-          element: "postcode",
-          field: "PostalCode",
-          mode: pca.fieldMode.POPULATE,
-        },
-        {
-          element: "country_id",
-          field: "CountryIso2",
-          mode: pca.fieldMode.COUNTRY,
-        },
-      ];
-
-      pcaControl = new pca.Address(fields, {
-        key: " ",
-        simulateReactEvents: true,
-        endpoint: {
-          literal: true,
-          find: "/loqate/capture/find",
-          retrieve: "/loqate/capture/retrieve",
-          unwrapped: true,
-        },
-      });
-
-      pcaControl.listen("populate", function (event) {
-        const regionSelect = document.querySelector('select[name="region_id"]');
-        const regionMap = Object.fromEntries(
-          Array.from(regionSelect.options).map((option) => [
-            option.text,
-            option.value,
-          ])
+    setInterval(function () {
+      for (const [key, value] of Object.entries(fieldMappings)) {
+        const anchorElement = document.querySelector(
+          `input[name="${value[0].element}"]`
         );
 
-        regionSelect.value = regionMap[event.ProvinceName];
-        regionSelect.dispatchEvent(new Event("change"));
-      });
+        // if line1 doesn't exist or is already registered, skip
+        if (
+          anchorElement === null ||
+          document.body.contains(pcaInstances[key]?.anchorElement)
+        ) {
+          continue;
+        }
 
-      clearInterval(pcaCheckInterval);
+        // clean-up old instances
+        if (pcaInstances[key]?.control) {
+          pcaInstances[key].control.destroy();
+        }
+
+        const control = new pca.Address(value, {
+          key: " ",
+          simulateReactEvents: true,
+          endpoint: {
+            literal: true,
+            find: loqateFindUrl,
+            retrieve: loqateRetrieveUrl,
+            unwrapped: true,
+          },
+        });
+
+        pcaInstances[key] = { anchorElement, control };
+      }
     }, 200);
   });
 });
