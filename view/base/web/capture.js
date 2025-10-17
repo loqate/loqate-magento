@@ -7873,6 +7873,11 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     ],
   };
 
+  function getElementByName(name, context) {
+    context = context || document;
+    return context.querySelector(`[name="${name}"]`);
+  }
+
   $(document).ready(function () {
     const loqateElement = document.getElementById("loqate-urls");
     const pcaInstances = {};
@@ -7900,12 +7905,20 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
           continue;
         }
 
+        const context = anchorElement.closest(".admin__fieldset");
+        const addressFieldsWithElements = value.map((field) => {
+          return {
+            ...field,
+            element: getElementByName(field.element, context),
+          };
+        });
+
         // clean-up old instances
         if (pcaInstances[key]?.control) {
           pcaInstances[key].control.destroy();
         }
 
-        const control = new pca.Address(value, {
+        const control = new pca.Address(addressFieldsWithElements, {
           key: " ",
           simulateReactEvents: true,
           endpoint: {
