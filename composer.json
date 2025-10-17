@@ -2,7 +2,7 @@
   "name": "gbg-loqate/loqate-integration",
   "description": "Performs address capture and data validation (email, phone number and address) using Loqate API.",
   "type": "magento2-module",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "require": {
     "lqt/api-connector": "*"
   },
