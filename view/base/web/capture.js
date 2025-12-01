@@ -20,7 +20,6 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
    * p-w-e-w1-4-ls3d 04/08/2025 13:24:47
    */
   /*3.94 - Adds the ability to simular a react event on setvalue /*
-  
   /** @namespace pca */
   (function (window, undefined) {
     var pca = (window.pca = window.pca || {}),
@@ -7878,6 +7877,86 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     return context.querySelector(`[name="${name}"]`);
   }
 
+  function normalizeRegionValue(value) {
+    return (value || "").toString().trim().toLowerCase();
+  }
+
+  function dispatchChange(element) {
+    const event = new Event("change", { bubbles: true, cancelable: true });
+    element.dispatchEvent(event);
+  }
+
+  function mapRegionSelectValue(selectElement, details) {
+    if (!selectElement || selectElement.tagName !== "SELECT" || !details) {
+      return false;
+    }
+
+    const candidates = [];
+    if (details.ProvinceName) candidates.push(details.ProvinceName);
+    if (details.Province) candidates.push(details.Province);
+    if (details.ProvinceCode) candidates.push(details.ProvinceCode);
+
+    if (!candidates.length) {
+      return false;
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = normalizeRegionValue(candidates[i]);
+      if (!candidate) {
+        continue;
+      }
+
+      for (let optionIndex = 0; optionIndex < selectElement.options.length; optionIndex++) {
+        const option = selectElement.options[optionIndex];
+        const optionValues = [
+          option.text,
+          option.getAttribute("data-title"),
+          option.getAttribute("data-code"),
+          option.getAttribute("data-region-code"),
+          option.value,
+        ];
+
+        for (let valueIndex = 0; valueIndex < optionValues.length; valueIndex++) {
+          const optionValue = normalizeRegionValue(optionValues[valueIndex]);
+          if (optionValue && optionValue === candidate) {
+            const valueChanged = selectElement.value !== option.value;
+            selectElement.value = option.value;
+            selectElement.selectedIndex = optionIndex;
+            selectElement.setAttribute("value", option.value);
+            dispatchChange(selectElement);
+            if (!valueChanged) {
+              // force validation to re-check even if the underlying value matched
+              dispatchChange(selectElement);
+            }
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function mapRegionSelectValueWithRetry(
+    selectElement,
+    details,
+    attempt = 0,
+    maxAttempts = 5
+  ) {
+    if (mapRegionSelectValue(selectElement, details)) {
+      return;
+    }
+
+    if (attempt >= maxAttempts) {
+      return;
+    }
+
+    const delay = 150 * Math.pow(2, attempt);
+    window.setTimeout(function () {
+      mapRegionSelectValueWithRetry(selectElement, details, attempt + 1, maxAttempts);
+    }, delay);
+  }
+
   $(document).ready(function () {
     const loqateElement = document.getElementById("loqate-urls");
     const pcaInstances = {};
@@ -7928,6 +8007,21 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
             unwrapped: true,
           },
         });
+
+        const regionSelectFields = addressFieldsWithElements.filter(
+          (field) =>
+            field.field === "ProvinceName" &&
+            field.element &&
+            field.element.tagName === "SELECT"
+        );
+
+        if (regionSelectFields.length) {
+          control.listen("populate", function (details) {
+            regionSelectFields.forEach((regionField) => {
+              mapRegionSelectValueWithRetry(regionField.element, details);
+            });
+          });
+        }
 
         pcaInstances[key] = { anchorElement, control };
       }
