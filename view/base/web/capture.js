@@ -7884,6 +7884,13 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
   function dispatchChange(element) {
     const event = new Event("change", { bubbles: true, cancelable: true });
     element.dispatchEvent(event);
+
+    if (window.jQuery && typeof window.jQuery === "function") {
+      const $el = window.jQuery(element);
+      if ($el.valid) {
+        $el.valid();
+      }
+    }
   }
 
   function mapRegionSelectValue(selectElement, details) {
@@ -7919,15 +7926,10 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         for (let valueIndex = 0; valueIndex < optionValues.length; valueIndex++) {
           const optionValue = normalizeRegionValue(optionValues[valueIndex]);
           if (optionValue && optionValue === candidate) {
-            const valueChanged = selectElement.value !== option.value;
             selectElement.value = option.value;
             selectElement.selectedIndex = optionIndex;
             selectElement.setAttribute("value", option.value);
             dispatchChange(selectElement);
-            if (!valueChanged) {
-              // force validation to re-check even if the underlying value matched
-              dispatchChange(selectElement);
-            }
             return true;
           }
         }
@@ -7941,7 +7943,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     selectElement,
     details,
     attempt = 0,
-    maxAttempts = 5
+    maxAttempts = 4
   ) {
     if (mapRegionSelectValue(selectElement, details)) {
       return;
@@ -7951,7 +7953,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       return;
     }
 
-    const delay = 150 * Math.pow(2, attempt);
+    const delay = 75 * Math.pow(2, attempt);
     window.setTimeout(function () {
       mapRegionSelectValueWithRetry(selectElement, details, attempt + 1, maxAttempts);
     }, delay);
