@@ -7951,7 +7951,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       return;
     }
 
-    const delay = 150 * Math.pow(2, attempt);
+    const delay = 75 * Math.pow(2, attempt);
     window.setTimeout(function () {
       mapRegionSelectValueWithRetry(selectElement, details, attempt + 1, maxAttempts);
     }, delay);
