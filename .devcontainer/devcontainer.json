@@ -8,7 +8,6 @@
     "source=${localWorkspaceFolder},target=/workspace/loqate-magento,type=bind"
   ],
   "postCreateCommand": "/workspace/loqate-magento/.devcontainer/setup-magento.sh",
-  "postStartCommand": "sudo service nginx start || true",
   "settings": {
     "terminal.integrated.shell.linux": "/bin/bash"
   },
