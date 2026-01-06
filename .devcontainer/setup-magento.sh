@@ -80,6 +80,13 @@ chmod u+x bin/magento
 # Install the extension
 composer require lqt/loqate-integration:@dev
 
+# Ensure symlink is created (Composer sometimes copies instead of symlinking)
+if [ -d "$MAGENTO_DIR/vendor/lqt/loqate-integration" ] && [ ! -L "$MAGENTO_DIR/vendor/lqt/loqate-integration" ]; then
+    echo "Replacing copied module with symlink..."
+    rm -rf "$MAGENTO_DIR/vendor/lqt/loqate-integration"
+    ln -s "$EXTENSION_DIR" "$MAGENTO_DIR/vendor/lqt/loqate-integration"
+fi
+
 # Install the Loqate API Connector
 composer require lqt/api-connector
 
