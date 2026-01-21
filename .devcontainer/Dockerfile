@@ -30,8 +30,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Zscaler workaround (uncomment if you have DNS issues)
-# COPY zscaler.crt /usr/local/share/ca-certificates/
-# RUN update-ca-certificates
+#COPY zscaler.crt /usr/local/share/ca-certificates/
+#RUN update-ca-certificates
 
 # Setup nginx
 COPY nginx.conf /etc/nginx/nginx.conf

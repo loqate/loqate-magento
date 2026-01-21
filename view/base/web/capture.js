@@ -7974,9 +7974,47 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     // wait until the address fields are rendered
     setInterval(function () {
       for (const [key, value] of Object.entries(fieldMappings)) {
-        const anchorElement = document.querySelector(
-          `input[name="${value[0].element}"]`
-        );
+        let anchorElement;
+        
+        if (key === "default") {
+          // For default mapping, find ALL street[0] fields and initialize each separately
+          const allStreetFields = document.querySelectorAll('input[name="street[0]"]');
+          
+          allStreetFields.forEach((streetField) => {
+            // Check if this field is already registered
+            const fieldId = streetField.id || streetField.name + '_' + Array.from(allStreetFields).indexOf(streetField);
+            const instanceKey = key + '_' + fieldId;
+            
+            if (pcaInstances[instanceKey]?.anchorElement && 
+                document.body.contains(pcaInstances[instanceKey].anchorElement)) {
+              return; // Skip if already registered
+            }
+
+            anchorElement = streetField;
+            
+            // Find the best context for this specific field
+            const context =
+              anchorElement.closest("form") ||
+              anchorElement.closest(".fieldset") ||
+              anchorElement.closest(".admin__fieldset") ||
+              anchorElement.closest(".checkout-billing-address") ||
+              anchorElement.closest(".billing-address-form") ||
+              anchorElement.closest(".checkout-shipping-address") ||
+              anchorElement.closest(".shipping-address-form") ||
+              anchorElement.closest('[data-bind]')?.parentElement ||
+              document;
+            
+            // Initialize for this specific field
+            initializeLoqateForField(key, value, anchorElement, context, instanceKey);
+          });
+          
+          // Skip the rest of the loop for default mapping since we handled it above
+          continue;
+        } else {
+          anchorElement = document.querySelector(
+            `input[name="${value[0].element}"]`
+          );
+        }
 
         // if line1 doesn't exist or is already registered, skip
         if (
@@ -7986,47 +8024,64 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
           continue;
         }
 
-        const context = anchorElement.closest(".admin__fieldset");
-        const addressFieldsWithElements = value.map((field) => {
-          return {
-            ...field,
-            element: getElementByName(field.element, context),
-          };
-        });
-
-        // clean-up old instances
-        if (pcaInstances[key]?.control) {
-          pcaInstances[key].control.destroy();
-        }
-
-        const control = new pca.Address(addressFieldsWithElements, {
-          key: " ",
-          simulateReactEvents: true,
-          endpoint: {
-            literal: true,
-            find: loqateFindUrl,
-            retrieve: loqateRetrieveUrl,
-            unwrapped: true,
-          },
-        });
-
-        const regionSelectFields = addressFieldsWithElements.filter(
-          (field) =>
-            field.field === "ProvinceName" &&
-            field.element &&
-            field.element.tagName === "SELECT"
-        );
-
-        if (regionSelectFields.length) {
-          control.listen("populate", function (details) {
-            regionSelectFields.forEach((regionField) => {
-              mapRegionSelectValueWithRetry(regionField.element, details);
-            });
-          });
-        }
-
-        pcaInstances[key] = { anchorElement, control };
+        // Determine context for non-default mappings
+        const context =
+          anchorElement.closest(".admin__fieldset") ||
+          anchorElement.closest(".fieldset") ||
+          anchorElement.closest(".checkout-billing-address") ||
+          anchorElement.closest(".billing-address-form") ||
+          anchorElement.closest("form") ||
+          document;
+        
+        initializeLoqateForField(key, value, anchorElement, context, key);
       }
     }, 200);
+
+    function initializeLoqateForField(mappingKey, fieldMapping, anchorElement, context, instanceKey) {
+      const addressFieldsWithElements = fieldMapping.map((field) => {
+        return {
+          ...field,
+          element: getElementByName(field.element, context),
+        };
+      });
+
+      // Check if all required fields are found
+      if (!addressFieldsWithElements[0]?.element) {
+        return; // Skip if the primary field (Line1) wasn't found
+      }
+
+      // clean-up old instances
+      if (pcaInstances[instanceKey]?.control) {
+        pcaInstances[instanceKey].control.destroy();
+      }
+
+      const control = new pca.Address(addressFieldsWithElements, {
+        key: " ",
+        simulateReactEvents: true,
+        endpoint: {
+          literal: true,
+          find: loqateFindUrl,
+          retrieve: loqateRetrieveUrl,
+          unwrapped: true,
+        },
+      });
+
+      const regionSelectFields = addressFieldsWithElements.filter(
+        (field) =>
+          field.field === "ProvinceName" &&
+          field.element &&
+          field.element.tagName === "SELECT"
+      );
+
+      if (regionSelectFields.length) {
+        control.listen("populate", function (details) {
+          regionSelectFields.forEach((regionField) => {
+            mapRegionSelectValueWithRetry(regionField.element, details);
+          });
+        });
+      }
+
+      pcaInstances[instanceKey] = { anchorElement, control };
+    }
   });
 });

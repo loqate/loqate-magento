@@ -271,6 +271,13 @@
                     <label>Field 20 Format</label>
                 </field>
             </group>
+            <group id="version_info" translate="label" type="text" sortOrder="100" showInDefault="1" showInWebsite="0" showInStore="0">
+                <label>Version Information</label>
+                <field id="version" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Loqate Integration Version</label>
+                    <frontend_model>Loqate\ApiIntegration\Block\Adminhtml\System\Config\Version</frontend_model>
+                </field>
+            </group>
 		</section>
 	</system>
 </config>

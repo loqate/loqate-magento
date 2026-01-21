@@ -7,13 +7,13 @@ MAG_REPO_PUBLIC_KEY="$MAG_REPO_PUBLIC_KEY"
 MAG_REPO_PRIVATE_KEY="$MAG_REPO_PRIVATE_KEY"
 
 # Wait for MySQL
-until mysql -h db -u magento -pmagento -e "show databases;"; do
+until mysql -h db -u magento -pmagento --skip-ssl -e "show databases;"; do
   echo "Waiting for MySQL..."
   sleep 5
 done
 
 # Enable log_bin_trust_function_creators
-mysql -h db -u root -proot -e "SET GLOBAL log_bin_trust_function_creators = 1;";
+mysql -h db -u root -proot --skip-ssl -e "SET GLOBAL log_bin_trust_function_creators = 1;";
 
 echo "Configurting composer authentication..."
 
