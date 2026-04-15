@@ -12,9 +12,6 @@ until mysql -h db -u magento -pmagento --skip-ssl -e "show databases;"; do
   sleep 5
 done
 
-# Enable log_bin_trust_function_creators
-mysql -h db -u root -proot --skip-ssl -e "SET GLOBAL log_bin_trust_function_creators = 1;";
-
 echo "Configuring composer authentication..."
 
 
