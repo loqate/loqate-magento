@@ -1,0 +1,60 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "d982f28c642dc0f6bb85ef24de80ffbe",
+    "packages": [
+        {
+            "name": "lqt/api-connector",
+            "version": "dev-master",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/loqate/loqate-sdk-php.git",
+                "reference": "2fcbb9988708b2e89b9645bf490aff300e8e2b1e"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/loqate/loqate-sdk-php/zipball/2fcbb9988708b2e89b9645bf490aff300e8e2b1e",
+                "reference": "2fcbb9988708b2e89b9645bf490aff300e8e2b1e",
+                "shasum": ""
+            },
+            "require": {
+                "ext-curl": "*",
+                "ext-json": "*",
+                "php": ">= 7.0"
+            },
+            "default-branch": true,
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Loqate\\ApiConnector\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "authors": [
+                {
+                    "name": "Henry Thomas"
+                }
+            ],
+            "description": "Loqate API connector library",
+            "support": {
+                "issues": "https://github.com/loqate/loqate-sdk-php/issues",
+                "source": "https://github.com/loqate/loqate-sdk-php/tree/v1.1.2"
+            },
+            "time": "2024-11-19T16:21:00+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "dev",
+    "stability-flags": {
+        "lqt/api-connector": 20
+    },
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {},
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}

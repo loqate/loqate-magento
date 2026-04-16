@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libcurl4-openssl-dev \
     cron \
     nano \
+    vim \
     gnupg \
     lsb-release \
     default-mysql-client \
@@ -27,6 +28,7 @@ RUN apt-get update && apt-get install -y \
     nginx \
     jq \
     sudo \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # Zscaler workaround (uncomment if you have DNS issues)
@@ -69,4 +71,8 @@ RUN groupadd --gid $USER_GID $USERNAME \
 RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
     && chmod 0440 /etc/sudoers.d/$USERNAME
 
-USER $USERNAME 
+# Set up supervisor to manage nginx and php-fpm
+RUN mkdir -p /var/log/supervisor
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

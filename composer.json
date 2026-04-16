@@ -4,7 +4,7 @@
   "type": "magento2-module",
   "version": "2.0.3",
   "require": {
-    "lqt/api-connector": "*"
+    "lqt/api-connector": "dev-master"
   },
   "authors": [
     {
