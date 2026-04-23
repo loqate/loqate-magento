@@ -1,4 +1,4 @@
-requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
+(function () {
   /* Based on v3.99 (custom changes have been made and are currently awaiting to be backported into the SDK 06/08/2025) - Updates toolkit to 3.94 and introduces option to simulate react event */
 
   /*
@@ -7959,7 +7959,7 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
     }, delay);
   }
 
-  $(document).ready(function () {
+  function loqateInit() {
     const loqateElement = document.getElementById("loqate-urls");
     const pcaInstances = {};
 
@@ -7971,8 +7971,8 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
       return;
     }
 
-    // wait until the address fields are rendered
-    setInterval(function () {
+    // React to DOM changes instead of polling with setInterval
+    function scanForFields() {
       for (const [key, value] of Object.entries(fieldMappings)) {
         let anchorElement;
         
@@ -8035,7 +8035,17 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
         
         initializeLoqateForField(key, value, anchorElement, context, key);
       }
-    }, 200);
+    }
+
+    scanForFields();
+    if (typeof MutationObserver !== 'undefined') {
+      var scanDebounceTimer = null;
+      var loqateObserver = new MutationObserver(function () {
+        clearTimeout(scanDebounceTimer);
+        scanDebounceTimer = setTimeout(scanForFields, 50);
+      });
+      loqateObserver.observe(document.body, { childList: true, subtree: true });
+    }
 
     function initializeLoqateForField(mappingKey, fieldMapping, anchorElement, context, instanceKey) {
       const addressFieldsWithElements = fieldMapping.map((field) => {
@@ -8083,5 +8093,11 @@ requirejs(["jquery", "mage/url", "domReady"], function ($, urlBuilder) {
 
       pcaInstances[instanceKey] = { anchorElement, control };
     }
-  });
-});
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', loqateInit);
+  } else {
+    loqateInit();
+  }
+})();
