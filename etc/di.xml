@@ -14,7 +14,7 @@
         </arguments>
     </type>
 
-<!--    plugins-->
+    <!-- plugins -->
     <type name="Magento\Customer\Controller\Address\FormPost">
         <plugin name="LoqateCustomerAccountAddress" type="Loqate\ApiIntegration\Plugin\Frontend\CustomerAccountAddress" sortOrder="1" />
     </type>
