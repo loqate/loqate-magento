@@ -74,22 +74,22 @@ Releasing a new version requires two separate deployments: one to the **Adobe Ma
 
 ### Adobe Marketplace
 
-1. Create a zip archive of the module directory. Ensure that `.devcontainer/devcontainer.env` is excluded, as it contains sensitive credentials. The following command will produce a clean archive:
+1. Create a zip of the whole repository. Ensure that `.devcontainer`, `.git` and `.gitignore` are excluded, as the Magento malware scan does not allow them to be uploaded. The following command will produce a clean archive:
    ```bash
-   zip -r loqate-integration.zip . -x "*.git*" -x ".devcontainer/devcontainer.env" -x ".devcontainer/zscaler.crt"
+   zip -r loqate-integration.zip . -x "*.git*" -x "*.devcontainer*"
    ```
 2. Log in to your Adobe account at [account.magento.com](https://account.magento.com/customer/account/login).
 3. Navigate to the [extension versions page](https://commercedeveloper.adobe.com/extensions/versions/gbg-loqate-loqate-integration) on the Adobe Commerce Developer Portal.
 4. Upload the zip archive.
-5. Adobe will automatically process and scan the submission. This can take up to **3 days**.
+5. Adobe will automatically process and scan the submission. This can take up to **15 business days** if a manual approval is required.
    - If the scan **fails**, review the provided feedback, address the reported issues, and resubmit.
    - If the scan **passes**, the extension will be published to the marketplace within the hour.
 
 ### Composer
 
-1. Create a new Git tag in GitHub matching the release version number (e.g. `2.0.4`) and push it:
+1. Create a new Git tag in GitHub matching the release version number (e.g. `v2.0.4`) and push it:
    ```bash
-   git tag 2.0.4
-   git push origin 2.0.4
+   git tag v2.0.4
+   git push origin v2.0.4
    ```
-2. Composer will automatically detect the new tag and make the release available.
+2. Composer will automatically detect the new tag and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
