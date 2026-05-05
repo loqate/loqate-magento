@@ -1,11 +1,54 @@
 <?php
 /** @var Magento\Framework\View\Element\Template $block */
+// Helper to shorten script tag repetition
+$js = static fn(string $path): string =>
+    $escaper->escapeHtml($block->getViewFileUrl('Loqate_ApiIntegration::' . $path));
 ?>
-<!-- (We're currently using v3.99 with custom changes - once the changes are backported into the SDK we can revert to using the official version) -->
+<!-- PCA SDK v3.99 (custom build) – Loqate_ApiIntegration -->
 <link rel="stylesheet" type="text/css" href="https://api.addressy.com/css/address-3.99.css" />
-
-<script src="<?= $escaper->escapeHtml($block->getViewFileUrl('Loqate_ApiIntegration::capture.js')) ?>"></script>
 <link href="<?= $escaper->escapeHtml($block->getViewFileUrl('Loqate_ApiIntegration::capture.css')) ?>" rel="stylesheet" type="text/css" />
+
+<!--
+  Scripts are split into self-contained IIFE modules under view/base/web/loqate/.
+  Load order matters: each file depends on window.pca being populated by previous files.
+
+  PCA SDK – core layer (namespace, Eventable, request pipeline)
+-->
+<script src="<?= $js('loqate/pca/core.js') ?>"></script>
+
+<!-- PCA SDK – string / format utilities -->
+<script src="<?= $js('loqate/pca/utils/format.js') ?>"></script>
+
+<!-- PCA SDK – DOM utilities + finalises document-ready detection -->
+<script src="<?= $js('loqate/pca/utils/dom.js') ?>"></script>
+
+<!-- PCA SDK – dynamic asset loader helpers -->
+<script src="<?= $js('loqate/pca/assets.js') ?>"></script>
+
+<!-- PCA SDK – UI components -->
+<script src="<?= $js('loqate/pca/ui/item.js') ?>"></script>
+<script src="<?= $js('loqate/pca/ui/collection.js') ?>"></script>
+<script src="<?= $js('loqate/pca/ui/list.js') ?>"></script>
+<script src="<?= $js('loqate/pca/ui/autocomplete.js') ?>"></script>
+<script src="<?= $js('loqate/pca/ui/modal.js') ?>"></script>
+<script src="<?= $js('loqate/pca/ui/tooltip.js') ?>"></script>
+
+<!-- PCA SDK – country data and selector -->
+<script src="<?= $js('loqate/pca/countries/data.js') ?>"></script>
+<script src="<?= $js('loqate/pca/countries/list.js') ?>"></script>
+
+<!-- PCA SDK – browser detection, field-mode enums, i18n messages -->
+<script src="<?= $js('loqate/pca/browser.js') ?>"></script>
+<script src="<?= $js('loqate/pca/enums.js') ?>"></script>
+<script src="<?= $js('loqate/pca/messages.js') ?>"></script>
+
+<!-- PCA SDK – main Address capture control -->
+<script src="<?= $js('loqate/pca/address.js') ?>"></script>
+
+<!-- Loqate Magento integration layer -->
+<script src="<?= $js('loqate/magento/field-mappings.js') ?>"></script>
+<script src="<?= $js('loqate/magento/region-mapper.js') ?>"></script>
+<script src="<?= $js('loqate/magento/init.js') ?>"></script>
 
 <div id="loqate-urls"
      data-find-url="<?= $escaper->escapeHtml($block->getUrl('loqate/capture/find')); ?>"

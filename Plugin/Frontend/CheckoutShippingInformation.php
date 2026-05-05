@@ -23,7 +23,7 @@ class CheckoutShippingInformation extends AbstractPlugin
         $addressInformation
     ) {
         if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
-            $proceed($cartId, $addressInformation);
+            return $proceed($cartId, $addressInformation);
         }
 
         if ($shippingAddress = $addressInformation->getShippingAddress()->getData()) {

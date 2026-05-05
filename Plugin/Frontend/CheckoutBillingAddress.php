@@ -24,7 +24,7 @@ class CheckoutBillingAddress extends AbstractPlugin
         $useForShipping = false
     ) {
         if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
-            $proceed($cartId, $address, $useForShipping);
+            return $proceed($cartId, $address, $useForShipping);
         }
 
         if ($billingAddress = $address->getData()) {
