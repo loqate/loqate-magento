@@ -1,0 +1,113 @@
+# ==============================================================================
+# Auto Tag on Merge to Master
+# ==============================================================================
+# This workflow automatically creates version tags based on conventional commits
+# when changes are merged to the master branch.
+#
+# Version Bumping Rules (Semantic Versioning):
+# - feat: commits     → MINOR version bump (v2.0.4 → v2.1.0)
+# - fix: commits      → PATCH version bump (v2.0.4 → v2.0.5)
+# - BREAKING CHANGE:  → MAJOR version bump (v2.0.4 → v3.0.0)
+# - Other types       → No version bump
+#
+# Tag Format: v{major}.{minor}.{patch} (e.g., v2.0.4)
+# ==============================================================================
+
+name: Auto Tag on Merge to Master
+
+# Trigger: Runs automatically when code is pushed to master branch
+# (typically when a pull request is merged)
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    
+    # Grant write permissions to create tags and releases
+    permissions:
+      contents: write
+    
+    steps:
+      # Step 1: Checkout the repository with full git history
+      # fetch-depth: 0 ensures we get all commits and tags, not just the latest
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history and tags for proper version detection
+          
+      # Step 2: Force fetch all tags from remote
+      # This ensures we have the latest tags even if checkout missed some
+      - name: Fetch all tags
+        run: git fetch --force --tags
+      
+      # Step 3: Identify the current latest tag
+      # This step reads existing tags to determine the starting point for versioning
+      # Example: If current tag is v2.0.4, this will be the base for the next version
+      - name: Get current latest tag
+        id: get_latest_tag
+        run: |
+          # Search for tags starting with 'v' and sort by version (highest first)
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+          
+          # If no tags exist, start from v0.0.0
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found. Will start from v0.0.0"
+            echo "current_tag=v0.0.0" >> $GITHUB_OUTPUT
+          else
+            echo "Latest tag found: $LATEST_TAG"
+            echo "current_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 4: Analyze commits and create new version tag
+      # This action reads commits since the last tag and determines version bump
+      # based on conventional commit messages
+      - name: Bump version and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch              # Default to patch bump if no conventional commit found
+          release_branches: master         # Only create tags from master branch
+          pre_release_branches: develop,beta  # Mark tags from these branches as pre-release
+          tag_prefix: v                    # Maintain 'v' prefix (e.g., v2.0.4)
+          fetch_all_tags: true             # Ensure all tags are fetched for accurate versioning
+          
+          # Conventional Commit Rules:
+          # -------------------------
+          # feat: new feature               → MINOR bump (v2.0.4 → v2.1.0)
+          # fix: bug fix                    → PATCH bump (v2.0.4 → v2.0.5)
+          # feat!: or BREAKING CHANGE:      → MAJOR bump (v2.0.4 → v3.0.0)
+          # docs:, style:, refactor:, etc.  → NO bump (no tag created)
+          #
+          # Examples:
+          # - "feat: add address validation" → v2.0.4 becomes v2.1.0
+          # - "fix: correct postcode logic"  → v2.0.4 becomes v2.0.5
+          # - "feat!: redesign API"          → v2.0.4 becomes v3.0.0
+      
+      # Step 5: Display version information in workflow logs
+      # This helps with debugging and provides visibility into what changed
+      - name: Display version information
+        if: steps.tag_version.outputs.new_tag != ''
+        run: |
+          echo "========================================="
+          echo "Version Bump Summary"
+          echo "========================================="
+          echo "Previous tag: ${{ steps.get_latest_tag.outputs.current_tag }}"
+          echo "New tag created: ${{ steps.tag_version.outputs.new_tag }}"
+          echo "Version bump type: ${{ steps.tag_version.outputs.part }}"
+          echo "========================================="
+
+      # Step 6: Create a GitHub release with changelog
+      # This creates a release page on GitHub with auto-generated notes
+      # from conventional commits
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        if: steps.tag_version.outputs.new_tag != ''
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}          # Use the newly created tag
+          name: Release ${{ steps.tag_version.outputs.new_tag }} # Release title
+          body: ${{ steps.tag_version.outputs.changelog }}       # Auto-generated changelog
+          token: ${{ secrets.GITHUB_TOKEN }}
