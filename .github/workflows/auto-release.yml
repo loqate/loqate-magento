@@ -1,0 +1,152 @@
+# ==============================================================================
+# Auto Release on Tag Creation
+# ==============================================================================
+# This workflow automatically creates a GitHub release with a packaged zip file
+# when the auto-tag workflow successfully creates a new tag.
+#
+# Package Contents:
+# - Includes: All project files necessary for deployment
+# - Excludes: .devcontainer/, .github/, .gitignore (development/CI files)
+#
+# Release Assets:
+# - Zip file named: loqate-magento-{version}.zip
+# ==============================================================================
+
+name: Auto Release on New Tag
+
+# Trigger: Runs after the "Auto Tag on Merge to Master" workflow completes successfully
+on:
+  workflow_run:
+    workflows: ["Auto Tag on Merge to Master"]
+    types:
+      - completed
+    branches:
+      - master
+
+jobs:
+  create-release:
+    # Only run if the auto-tag workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    
+    # Grant write permissions to create releases and upload assets
+    permissions:
+      contents: write
+    
+    steps:
+      # Step 1: Checkout the repository with full git history
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history and tags
+          ref: master     # Ensure we're on master branch
+      
+      # Step 2: Fetch all tags from remote
+      - name: Fetch all tags
+        run: git fetch --force --tags
+      
+      # Step 3: Get the latest tag that was just created
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No tag found. Exiting."
+            exit 1
+          fi
+          
+          echo "Latest tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          # Extract version without 'v' prefix for zip filename
+          VERSION=${LATEST_TAG#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      # Step 4: Checkout the specific tag
+      - name: Checkout tag
+        run: git checkout ${{ steps.get_tag.outputs.tag }}
+      
+      # Step 5: Create zip file excluding specified files/directories
+      # Excludes: .devcontainer/, .github/, .gitignore
+      - name: Create release package
+        id: create_package
+        run: |
+          ZIP_NAME="${{ steps.get_tag.outputs.tag }}.zip"
+          echo "Creating package: $ZIP_NAME"
+          
+          # Create zip with all files except excluded ones
+          # -r: recursive
+          # -q: quiet mode
+          # -x: exclude patterns
+          zip -r -q "$ZIP_NAME" . \
+            -x "*.git*" \
+            -x "*.devcontainer/*" \
+            -x ".github/*" \
+            -x ".gitignore"
+          
+          # Verify zip was created
+          if [ -f "$ZIP_NAME" ]; then
+            echo "✓ Package created successfully"
+            ls -lh "$ZIP_NAME"
+            echo "zip_file=$ZIP_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Failed to create package"
+            exit 1
+          fi
+      
+      # Step 6: Generate release notes from commits
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Get the previous tag for comparison
+          PREVIOUS_TAG=$(git tag -l "v*" --sort=-v:refname | sed -n '2p')
+          CURRENT_TAG="${{ steps.get_tag.outputs.tag }}"
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            # First release - show all commits
+            NOTES=$(git log --pretty=format:"- %s (%h)" $CURRENT_TAG)
+          else
+            # Show commits between previous and current tag
+            NOTES=$(git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..$CURRENT_TAG)
+          fi
+          
+          # Create release notes with header
+          cat > release_notes.md << EOF
+          ## Changes in $CURRENT_TAG
+          
+          $NOTES
+          
+          ## Installation
+          
+          Download the \`${{ steps.get_tag.outputs.tag }}.zip\` file and extract it to your Magento installation directory.
+          
+          ## Package Contents
+          
+          This package includes all files necessary for the Loqate Magento extension, excluding development and CI/CD configuration files.
+          EOF
+          
+          echo "Release notes generated"
+      
+      # Step 7: Create GitHub release with the zip file
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: Release ${{ steps.get_tag.outputs.tag }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: ${{ steps.create_package.outputs.zip_file }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Step 8: Display release summary
+      - name: Display release summary
+        run: |
+          echo "========================================="
+          echo "Release Created Successfully"
+          echo "========================================="
+          echo "Tag: ${{ steps.get_tag.outputs.tag }}"
+          echo "Package: ${{ steps.create_package.outputs.zip_file }}"
+          echo "========================================="
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_tag.outputs.tag }}"

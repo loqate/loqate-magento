@@ -66,3 +66,30 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 - `php -r '$e=include "app/etc/env.php"; $d=$e["db"]["connection"]["default"]; printf("mysql -h%s -u%s -p%s %s\n",$d["host"],$d["username"],$d["password"],$d["dbname"]);'` Will extract the command to access mysql within the devcontainer, currently that command is `mysql -hdb -umagento -pmagento magento`
 - `bin/magento config:show` will list all of the config currently set in the instance, this can be set with `bin/magento config:set <PATH> <VALUE>`
+
+
+## Deployment
+
+Releasing a new version requires two separate deployments: one to the **Adobe Marketplace** and one via **Composer**. Before proceeding with either, update the version number in both [`composer.json`](composer.json) and [`etc/module.xml`](etc/module.xml) to reflect the new release, then commit and push the change.
+
+### Adobe Marketplace
+
+1. Create a zip archive of the module directory. Ensure that `.devcontainer/devcontainer.env` is excluded, as it contains sensitive credentials. The following command will produce a clean archive:
+   ```bash
+   zip -r loqate-integration.zip . -x "*.git*" -x ".devcontainer/devcontainer.env" -x ".devcontainer/zscaler.crt"
+   ```
+2. Log in to your Adobe account at [account.magento.com](https://account.magento.com/customer/account/login).
+3. Navigate to the [extension versions page](https://commercedeveloper.adobe.com/extensions/versions/gbg-loqate-loqate-integration) on the Adobe Commerce Developer Portal.
+4. Upload the zip archive.
+5. Adobe will automatically process and scan the submission. This can take up to **3 days**.
+   - If the scan **fails**, review the provided feedback, address the reported issues, and resubmit.
+   - If the scan **passes**, the extension will be published to the marketplace within the hour.
+
+### Composer
+
+1. Create a new Git tag in GitHub matching the release version number (e.g. `2.0.4`) and push it:
+   ```bash
+   git tag 2.0.4
+   git push origin 2.0.4
+   ```
+2. Composer will automatically detect the new tag and make the release available.
