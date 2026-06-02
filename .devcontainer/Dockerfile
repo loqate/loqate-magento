@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     cron \
     nano \
     vim \
+    bash-completion \
     gnupg \
     lsb-release \
     default-mysql-client \
@@ -62,7 +63,7 @@ ARG USERNAME=vscode
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m --shell /bin/bash $USERNAME \
     && usermod -aG www-data $USERNAME \
     && usermod -aG sudo $USERNAME \
     && chown -R $USERNAME:$USERNAME /workspace
@@ -70,6 +71,10 @@ RUN groupadd --gid $USER_GID $USERNAME \
 # Allow sudo without password for the vscode user
 RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
     && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# Give the vscode user an interactive bash setup (completion, git-aware prompt, aliases)
+COPY bashrc /home/$USERNAME/.bashrc
+RUN chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc
 
 # Set up supervisor to manage nginx and php-fpm
 RUN mkdir -p /var/log/supervisor
