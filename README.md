@@ -72,6 +72,8 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 Releasing a new version requires two separate deployments: one to the **Adobe Marketplace** and one via **Composer**. Before proceeding with either, update the version number in both [`composer.json`](composer.json) and [`etc/module.xml`](etc/module.xml) to reflect the new release, then commit and push the change.
 
+Note that the Git tag for the Composer release is created automatically when changes are merged to `master` — see the [Composer](#composer) section below.
+
 ### Adobe Marketplace
 
 1. Create a zip of the whole repository. Ensure that `.devcontainer`, `.git` and `.gitignore` are excluded, as the Magento malware scan does not allow them to be uploaded. The following command will produce a clean archive:
@@ -87,9 +89,13 @@ Releasing a new version requires two separate deployments: one to the **Adobe Ma
 
 ### Composer
 
-1. Create a new Git tag in GitHub matching the release version number (e.g. `v2.0.4`) and push it:
-   ```bash
-   git tag v2.0.4
-   git push origin v2.0.4
-   ```
-2. Composer will automatically detect the new tag and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
+The Git tag for a Composer release is created automatically. When changes are merged to `master`, the [`auto-tag.yml`](.github/workflows/auto-tag.yml) GitHub Action analyses the commits since the previous tag and creates a new version tag based on [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `feat:` commits → **MINOR** bump (e.g. `v2.0.4` → `v2.1.0`)
+- `fix:` commits → **PATCH** bump (e.g. `v2.0.4` → `v2.0.5`)
+- `feat!:` or `BREAKING CHANGE:` → **MAJOR** bump (e.g. `v2.0.4` → `v3.0.0`)
+- Other types (`docs:`, `style:`, `refactor:`, etc.) → no bump (no tag created)
+
+If no conventional commit is found, the action defaults to a **PATCH** bump. The workflow also publishes a GitHub release with an auto-generated changelog. Once the new tag is pushed, Composer will automatically detect it and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
+
+To ensure a release is tagged correctly, make sure your commit messages follow the Conventional Commits format.
