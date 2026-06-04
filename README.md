@@ -66,3 +66,36 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 - `php -r '$e=include "app/etc/env.php"; $d=$e["db"]["connection"]["default"]; printf("mysql -h%s -u%s -p%s %s\n",$d["host"],$d["username"],$d["password"],$d["dbname"]);'` Will extract the command to access mysql within the devcontainer, currently that command is `mysql -hdb -umagento -pmagento magento`
 - `bin/magento config:show` will list all of the config currently set in the instance, this can be set with `bin/magento config:set <PATH> <VALUE>`
+
+
+## Deployment
+
+Releasing a new version requires two separate deployments: one to the **Adobe Marketplace** and one via **Composer**. Before proceeding with either, update the version number in both [`composer.json`](composer.json) and [`etc/module.xml`](etc/module.xml) to reflect the new release, then commit and push the change.
+
+Note that the Git tag for the Composer release is created automatically when changes are merged to `master` — see the [Composer](#composer) section below.
+
+### Adobe Marketplace
+
+1. Create a zip of the whole repository. Ensure that `.devcontainer`, `.git` and `.gitignore` are excluded, as the Magento malware scan does not allow them to be uploaded. The following command will produce a clean archive:
+   ```bash
+   zip -r loqate-integration.zip . -x "*.git*" -x "*.devcontainer*"
+   ```
+2. Log in to your Adobe account at [account.magento.com](https://account.magento.com/customer/account/login).
+3. Navigate to the [extension versions page](https://commercedeveloper.adobe.com/extensions/versions/gbg-loqate-loqate-integration) on the Adobe Commerce Developer Portal.
+4. Upload the zip archive.
+5. Adobe will automatically process and scan the submission. This can take up to **15 business days** if a manual approval is required.
+   - If the scan **fails**, review the provided feedback, address the reported issues, and resubmit.
+   - If the scan **passes**, the extension will be published to the marketplace within the hour.
+
+### Composer
+
+The Git tag for a Composer release is created automatically. When changes are merged to `master`, the [`auto-tag.yml`](.github/workflows/auto-tag.yml) GitHub Action analyses the commits since the previous tag and creates a new version tag based on [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `feat:` commits → **MINOR** bump (e.g. `v2.0.4` → `v2.1.0`)
+- `fix:` commits → **PATCH** bump (e.g. `v2.0.4` → `v2.0.5`)
+- `feat!:` or `BREAKING CHANGE:` → **MAJOR** bump (e.g. `v2.0.4` → `v3.0.0`)
+- Other types (`docs:`, `style:`, `refactor:`, etc.) → no bump (no tag created)
+
+If no conventional commit is found, the action defaults to a **PATCH** bump. The workflow also publishes a GitHub release with an auto-generated changelog. Once the new tag is pushed, Composer will automatically detect it and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
+
+To ensure a release is tagged correctly, make sure your commit messages follow the Conventional Commits format.

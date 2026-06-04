@@ -21,8 +21,6 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     lsb-release \
     default-mysql-client \
-    nodejs \
-    npm \
     ca-certificates \
     nginx \
     jq \
@@ -45,7 +43,6 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 # Install Node.js (LTS) and npm
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
-    npm install -g npm@latest && \
     npm install -g grunt-cli && \
     npm install -g yarn
 
