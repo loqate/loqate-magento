@@ -105,7 +105,8 @@ jobs:
             -x "*.git*" \
             -x "*.devcontainer/*" \
             -x ".github/*" \
-            -x ".gitignore"
+            -x ".gitignore" \
+            -x "Test/*"
           
           # Verify zip was created
           if [ -f "$ZIP_NAME" ]; then

@@ -146,6 +146,6 @@ The Git tag for a Composer release is created automatically. When changes are me
 - `feat!:` or `BREAKING CHANGE:` → **MAJOR** bump (e.g. `v2.0.4` → `v3.0.0`)
 - Other types (`docs:`, `style:`, `refactor:`, etc.) → no bump (no tag created)
 
-If no conventional commit is found, the action defaults to a **PATCH** bump. The workflow also publishes a GitHub release with an auto-generated changelog. Once the new tag is pushed, Composer will automatically detect it and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
+If none of the commits since the previous tag are `feat:`, `fix:`, or a breaking change, **no tag is created and no release is published** — so commits like `docs:`, `chore:`, `ci:`, `refactor:`, etc. can be merged to `master` without cutting a release. When a release *is* cut, the workflow also publishes a GitHub release with an auto-generated changelog. Once the new tag is pushed, Composer will automatically detect it and make the release available on [packagist](https://packagist.org/packages/lqt/loqate-integration).
 
 To ensure a release is tagged correctly, make sure your commit messages follow the Conventional Commits format.

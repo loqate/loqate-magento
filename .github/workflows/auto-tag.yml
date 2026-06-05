@@ -191,7 +191,8 @@ jobs:
         uses: mathieudutour/github-tag-action@v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch              # Default to patch bump if no conventional commit found
+          default_bump: false              # Do NOT bump when no feat/fix/BREAKING CHANGE commit is found
+                                           # (without this it defaults to 'patch' and releases on every commit)
           release_branches: master         # Only create tags from master branch
           pre_release_branches: develop,beta  # Mark tags from these branches as pre-release
           tag_prefix: v                    # Maintain 'v' prefix (e.g., v2.0.4)
