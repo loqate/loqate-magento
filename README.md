@@ -68,6 +68,56 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 - `bin/magento config:show` will list all of the config currently set in the instance, this can be set with `bin/magento config:set <PATH> <VALUE>`
 
 
+## Testing
+
+### Automated unit tests
+
+Unit tests live under [`Test/Unit`](Test/Unit) and run with Magento's unit test suite. From the Magento root of an instance that has the module installed:
+
+```bash
+# Module installed via composer:
+vendor/bin/phpunit -c dev/tests/unit/phpunit.xml.dist \
+  vendor/gbg-loqate/loqate-integration/Test/Unit
+
+# Module installed under app/code:
+vendor/bin/phpunit -c dev/tests/unit/phpunit.xml.dist \
+  app/code/Loqate/ApiIntegration/Test/Unit
+```
+
+`Test/Unit/Helper/ValidatorTest.php` covers the captured-address (Loqate lookup) bypass: array-street parsing, that a looked-up address is recognised across countries (e.g. UK province-name vs region, US `CA` vs `California`), case/whitespace tolerance, and the guards that a different or empty address is **not** bypassed.
+
+### Manual testing (checkout flow)
+
+**Prerequisites** (Admin → Stores → Configuration → Loqate, or `bin/magento config:set`):
+
+- `loqate_settings/settings/api_key` — a valid Loqate API key
+- `loqate_settings/address_settings/enable_checkout` = `1` (verification enabled at checkout)
+- Capture/lookup enabled on checkout
+- Optional: set strict thresholds under `loqate_settings/verify_threshold_settings` so a hand-typed address would be rejected, making the bypass behaviour obvious
+
+**Verify a looked-up address is accepted (the main regression):**
+
+1. Go to checkout (guest or logged-in).
+2. Use the **Loqate lookup** and **select a suggested address from the dropdown** — do not hand-type it.
+3. Proceed through shipping / place order. The address should be accepted and checkout should proceed (the selected address bypasses re-verification).
+
+**Different-country checks** (the bypass is locale-agnostic):
+
+- **US** — lookup returns the state as a full name (e.g. *California*) while Magento stores the region as `CA`; the address should still be accepted.
+- **UK** — lookup an address with no region; should be accepted.
+
+**Guard checks (verification is still active):**
+
+- Hand-type an invalid address **without** using the lookup → verification still fires and rejects it.
+- Select a lookup address, then **edit** a field (e.g. the street) → it is re-verified, since it no longer matches the captured address.
+
+**Observe via logs** — a bypassed (captured) address makes no verify API call, whereas a hand-typed one does:
+
+```bash
+tail -f var/log/loqate*.log
+```
+
+
 ## Deployment
 
 Releasing a new version requires two separate deployments: one to the **Adobe Marketplace** and one via **Composer**. Before proceeding with either, update the version number in both [`composer.json`](composer.json) and [`etc/module.xml`](etc/module.xml) to reflect the new release, then commit and push the change.
