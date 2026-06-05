@@ -66,7 +66,29 @@ jobs:
       # Step 4: Checkout the specific tag
       - name: Checkout tag
         run: git checkout ${{ steps.get_tag.outputs.tag }}
-      
+
+      # Step 4b: Align composer.json "version" with the tag
+      # ------------------------------------------------------------------------
+      # master is protected (changes must go through a PR), so we cannot commit a
+      # version bump back to the branch. Instead we rewrite composer.json's
+      # "version" field here — in the checked-out tag, right before packaging — to
+      # the tag's numeric version (no 'v' prefix). This change is NOT committed or
+      # pushed anywhere; it only affects the contents of the release zip, so the
+      # published artifact's composer.json always matches its git tag.
+      - name: Align composer.json version with tag
+        env:
+          VERSION: ${{ steps.get_tag.outputs.version }}
+        run: |
+          echo "Setting composer.json version to: $VERSION"
+
+          # Rewrite the "version" field atomically via a temp file so a failure
+          # never leaves a half-written composer.json.
+          jq --arg v "$VERSION" '.version = $v' composer.json > composer.json.tmp
+          mv composer.json.tmp composer.json
+
+          echo "composer.json now reads:"
+          grep '"version"' composer.json
+
       # Step 5: Create zip file excluding specified files/directories
       # Excludes: .devcontainer/, .github/, .gitignore
       - name: Create release package
