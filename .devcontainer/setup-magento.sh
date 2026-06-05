@@ -12,10 +12,7 @@ until mysql -h db -u magento -pmagento --skip-ssl -e "show databases;"; do
   sleep 5
 done
 
-# Enable log_bin_trust_function_creators
-mysql -h db -u root -proot --skip-ssl -e "SET GLOBAL log_bin_trust_function_creators = 1;";
-
-echo "Configurting composer authentication..."
+echo "Configuring composer authentication..."
 
 
 # Clone Magento 2 (if it doesn't exist)
@@ -31,57 +28,57 @@ else
   cd "$MAGENTO_DIR"
 fi
 
-# Install Magento 2
-echo "Installing Magento 2..."
-bin/magento setup:install \
---base-url=http://localhost:8080 \
---db-host=db \
---db-name=magento \
---db-user=magento \
---db-password=magento \
---admin-firstname=Admin \
---admin-lastname=User \
---admin-email=admin@example.com \
---admin-user=admin \
---admin-password=admin123 \
---language=en_GB \
---currency=GBP \
---timezone=Europe/London \
---use-rewrites=1 \
---search-engine=opensearch \
---opensearch-host=opensearch \
---opensearch-port=9200 \
---opensearch-enable-auth=true \
---opensearch-username=admin \
---opensearch-password='0i.N020>R!=&' \
---backend-frontname=admin
+# Install Magento 2 (only if not already installed)
+if [ ! -f "$MAGENTO_DIR/app/etc/env.php" ]; then
+  echo "Installing Magento 2..."
+  bin/magento setup:install \
+  --base-url=http://localhost:8080 \
+  --db-host=db \
+  --db-name=magento \
+  --db-user=magento \
+  --db-password=magento \
+  --admin-firstname=Admin \
+  --admin-lastname=User \
+  --admin-email=admin@example.com \
+  --admin-user=admin \
+  --admin-password=admin123 \
+  --language=en_GB \
+  --currency=GBP \
+  --timezone=Europe/London \
+  --use-rewrites=1 \
+  --search-engine=opensearch \
+  --opensearch-host=opensearch \
+  --opensearch-port=9200 \
+  --opensearch-enable-auth=false \
+  --backend-frontname=admin
 
-jq -n --arg user "$MAG_REPO_PUBLIC_KEY" --arg pass "$MAG_REPO_PRIVATE_KEY" '{
-    "http-basic": {
-      "repo.magento.com": {
-        "username": $user,
-        "password": $pass
+  jq -n --arg user "$MAG_REPO_PUBLIC_KEY" --arg pass "$MAG_REPO_PRIVATE_KEY" '{
+      "http-basic": {
+        "repo.magento.com": {
+          "username": $user,
+          "password": $pass
+        }
       }
-    }
-  }' > $MAGENTO_DIR/var/composer_home/auth.json
+    }' > $MAGENTO_DIR/var/composer_home/auth.json
 
-# Disable 2 factor auth
-bin/magento module:disable Magento_AdminAdobeImsTwoFactorAuth Magento_TwoFactorAuth
+  # Disable 2 factor auth
+  bin/magento module:disable Magento_AdminAdobeImsTwoFactorAuth Magento_TwoFactorAuth
 
-# Deploy sample data
-bin/magento sampledata:deploy
+  # Deploy sample data
+  bin/magento sampledata:deploy
+
+  # Install the extension
+  composer require lqt/loqate-integration:@dev
+
+  # Install the Loqate API Connector
+  composer require lqt/api-connector
+fi
 
 # Set permissions
 find var generated vendor pub/static pub/media app/etc -type f -exec chmod g+w {} +
 find var generated vendor pub/static pub/media app/etc -type d -exec chmod g+ws {} +
-chown -R :www-data .
+sudo chown -R :www-data .
 chmod u+x bin/magento
-
-# Install the extension
-composer require lqt/loqate-integration:@dev
-
-# Install the Loqate API Connector
-composer require lqt/api-connector
 
 # Enable developer mode
 bin/magento deploy:mode:set developer
@@ -95,6 +92,3 @@ bin/magento setup:di:compile
 
 # Flush the cache
 bin/magento cache:flush
-
-# restart nginx
-sudo service nginx restart
