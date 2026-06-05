@@ -125,6 +125,15 @@ namespace Magento\Framework\Module {
     }
 }
 
+namespace Magento\Framework\Data {
+    if (!interface_exists(\Magento\Framework\Data\OptionSourceInterface::class, false)) {
+        interface OptionSourceInterface
+        {
+            public function toOptionArray();
+        }
+    }
+}
+
 namespace Magento\Framework\Serialize {
     if (!interface_exists(\Magento\Framework\Serialize\SerializerInterface::class, false)) {
         interface SerializerInterface
@@ -132,6 +141,97 @@ namespace Magento\Framework\Serialize {
             public function serialize($data);
 
             public function unserialize($string);
+        }
+    }
+}
+
+namespace Magento\Framework\App\Action {
+    if (!class_exists(\Magento\Framework\App\Action\Context::class, false)) {
+        class Context
+        {
+            public function getMessageManager()
+            {
+                return null;
+            }
+
+            public function getResultRedirectFactory()
+            {
+                return null;
+            }
+
+            public function getRedirect()
+            {
+                return null;
+            }
+        }
+    }
+}
+
+namespace Magento\Framework {
+    if (!interface_exists(\Magento\Framework\UrlInterface::class, false)) {
+        interface UrlInterface
+        {
+        }
+    }
+}
+
+namespace Magento\Framework\Controller\Result {
+    if (!class_exists(\Magento\Framework\Controller\Result\JsonFactory::class, false)) {
+        class JsonFactory
+        {
+            public function create(array $data = [])
+            {
+                return null;
+            }
+        }
+    }
+}
+
+namespace Magento\Directory\Model {
+    if (!class_exists(\Magento\Directory\Model\CountryFactory::class, false)) {
+        class CountryFactory
+        {
+            public function create(array $data = [])
+            {
+                return null;
+            }
+        }
+    }
+}
+
+namespace Magento\Customer\Api\Data {
+    if (!interface_exists(\Magento\Customer\Api\Data\AddressInterface::class, false)) {
+        interface AddressInterface
+        {
+        }
+    }
+}
+
+namespace Magento\Checkout\Block\Checkout {
+    if (!interface_exists(\Magento\Checkout\Block\Checkout\LayoutProcessorInterface::class, false)) {
+        interface LayoutProcessorInterface
+        {
+        }
+    }
+}
+
+namespace {
+    if (!function_exists('__')) {
+        /**
+         * Minimal stand-in for Magento's global translation function. Returns the
+         * text with Magento-style %1/%2 placeholders substituted, as a plain
+         * string (stringly compatible with the real Phrase via (string) casts).
+         */
+        function __($text, ...$arguments)
+        {
+            $text = (string)$text;
+            if ($arguments && isset($arguments[0]) && is_array($arguments[0])) {
+                $arguments = $arguments[0];
+            }
+            foreach (array_values($arguments) as $index => $value) {
+                $text = str_replace('%' . ($index + 1), (string)$value, $text);
+            }
+            return $text;
         }
     }
 }
