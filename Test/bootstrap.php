@@ -12,12 +12,9 @@
 
 declare(strict_types=1);
 
-// Must be loaded BEFORE the Composer autoloader: vendor/autoload.php eagerly
-// runs the module's registration.php (a "files" autoload), which calls Magento's
-// ComponentRegistrar. This stub turns that into a no-op outside Magento.
-require __DIR__ . '/stubs/registration.php';
-
 require __DIR__ . '/../vendor/autoload.php';
 
-// Remaining Magento framework stubs the unit tests depend on.
+// Magento framework stubs the unit tests depend on (skipped automatically when
+// the real Magento classes are available). registration.php guards its own
+// ComponentRegistrar call, so the Composer "files" autoload is safe here.
 require __DIR__ . '/stubs/magento.php';
