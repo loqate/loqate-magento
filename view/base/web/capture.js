@@ -2916,7 +2916,7 @@
               .replace(/(?:^|:|,)(?:\s*\[)+/g, "")
           )
         )
-          return typeof JSON != "undefined" ? JSON.parse(text) : eval(text);
+          return JSON.parse(text);
 
         return {};
       };
