@@ -195,7 +195,7 @@ class Validator
             $parsedAddress = $this->parseAddress($address);
             if (isset($storedAddresses)
                 && $storedAddresses
-                && ($checkedAddress = $this->checkForCapturedAddress($address, $storedAddresses))) {
+                && ($checkedAddress = $this->checkForCapturedAddress($parsedAddress, $storedAddresses))) {
                 //store all the address keys in a new array, so we can preserve the original keys/identifiers
                 //because we are not sending the original array for validation and we need them to display results
                 $addressesToCheck[$index] = $checkedAddress;
@@ -252,7 +252,41 @@ class Validator
             }
         }
 
+        // Magento stores the street under a single "street" key as an array (or a
+        // newline-separated string); it has no street_1/street_2 fields, so the
+        // ADDRESS_MAPPING above never populates the street lines. Without this the
+        // street never reaches the verify request and, crucially, an address picked
+        // from the Loqate lookup can never be matched against the captured-address
+        // store - so it gets re-verified and may be rejected.
+        $streetLines = $this->extractStreetLines($address);
+        if ($streetLines) {
+            $formattedAddress['Address'] = implode(', ', $streetLines);
+            $formattedAddress['Address1'] = $streetLines[0];
+            if (isset($streetLines[1])) {
+                $formattedAddress['Address2'] = $streetLines[1];
+            }
+        }
+
         return $formattedAddress;
+    }
+
+    /**
+     * Normalise Magento's street value (array or newline-separated string) into a
+     * list of trimmed, non-empty street lines.
+     *
+     * @param $address
+     * @return array
+     */
+    private function extractStreetLines($address): array
+    {
+        if (!isset($address['street'])) {
+            return [];
+        }
+
+        $street = $address['street'];
+        $lines = is_array($street) ? $street : preg_split('/\r\n|\r|\n/', (string)$street);
+
+        return array_values(array_filter(array_map('trim', $lines), 'strlen'));
     }
 
     /**
@@ -344,17 +378,61 @@ class Validator
      */
     private function checkForCapturedAddress($address, $storedAddresses): bool
     {
-        $formattedAddress = [];
-        foreach (self::ADDRESS_CAPTURE_MAPPING as $key => $value) {
-            if (isset($address[$key]) && !is_array($address[$key])) {
-                $formattedAddress[$key] = $address[$key];
+        $candidateSignature = $this->buildCapturedSignature($address);
+        if ($candidateSignature === '') {
+            return false;
+        }
+
+        foreach ($storedAddresses as $stored) {
+            try {
+                $storedData = $this->serializer->unserialize($stored);
+            } catch (\InvalidArgumentException $e) {
+                continue;
+            }
+
+            if (!is_array($storedData)) {
+                continue;
+            }
+
+            if ($this->buildCapturedSignature($storedData) === $candidateSignature) {
+                return true;
             }
         }
 
-        if (in_array($this->serializer->serialize($formattedAddress), $storedAddresses)) {
-            return true;
+        return false;
+    }
+
+    /**
+     * Build a normalised, comparable signature for an address.
+     *
+     * Used to decide whether an address being verified is one the customer
+     * already selected from the Loqate lookup (stored via Controller::storeCapturedAddress).
+     * Both sides are keyed with the Loqate field names (Address1, Address2, ...),
+     * so a parsed Magento address and a stored captured address can be compared
+     * directly. Region/province is deliberately excluded: the lookup stores a
+     * province *name* while Magento supplies its own region representation, and
+     * street + city + postcode + country already identify the address uniquely.
+     * Values are trimmed, whitespace-collapsed and upper-cased so trivial
+     * formatting differences do not break the match.
+     *
+     * @param $address
+     * @return string
+     */
+    private function buildCapturedSignature($address): string
+    {
+        $keys = ['Address1', 'Address2', 'Address3', 'PostalCode', 'Country'];
+
+        $parts = [];
+        foreach ($keys as $key) {
+            $value = (isset($address[$key]) && !is_array($address[$key])) ? (string)$address[$key] : '';
+            $value = preg_replace('/\s+/', ' ', trim($value));
+            $parts[] = mb_strtoupper($value);
         }
 
-        return false;
+        if (trim(implode('', $parts)) === '') {
+            return '';
+        }
+
+        return implode('|', $parts);
     }
 }
