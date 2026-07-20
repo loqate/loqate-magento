@@ -77,10 +77,16 @@ find var generated vendor pub/static pub/media app/etc -type d -exec chmod g+ws 
 chown -R :www-data .
 chmod u+x bin/magento
 
-# Install the extension
-composer require lqt/loqate-integration:@dev
+# Install the LOCAL dev copy of the extension.
+# The "loqate-local" path repository (configured above with symlink=true) exposes
+# the source at $EXTENSION_DIR under its composer.json name, gbg-loqate/loqate-integration.
+# Requiring that name resolves to the path repo and symlinks the working copy into
+# vendor/gbg-loqate/loqate-integration, so edits under $EXTENSION_DIR take effect live.
+# (Do NOT require lqt/loqate-integration here — that pulls the published Packagist
+# release instead of your local source.)
+composer require gbg-loqate/loqate-integration:@dev
 
-# Install the Loqate API Connector
+# Install the Loqate API Connector (also pulled transitively, kept explicit for clarity)
 composer require lqt/api-connector
 
 # Enable developer mode

@@ -6,17 +6,19 @@ Performs address capture and data validation (email, phone number and address) u
 
 ## Download
 
+> **Developing in this repo's devcontainer?** You don't need any of the download steps below — the devcontainer already installs and symlinks your local working copy. See [Using the local dev copy](#using-the-local-dev-copy).
+
 ### Download via composer
 
-Request composer to fetch the module:
+Request composer to fetch the published release from Packagist:
 
 ```
-composer require loqate-integration/adobe
+composer require lqt/loqate-integration
 ```
 
 ### Manual Download
 
-Download & copy the git content to `/app/code/Loqate/ApiIntegration`.
+Download & copy the git content to `app/code/Loqate/ApiIntegration`.
 
 ## Install
 
@@ -45,11 +47,59 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
    - Storefront: [http://localhost:8080](http://localhost:8080)
    - Admin: [http://localhost:8080/admin](http://localhost:8080/admin)
    - Default admin user: `admin` / `admin123`
-1. **Live Extension Development**: Your extension source is mounted into the running Magento instance. Changes are reflected immediately after running `bin/magento setup:upgrade` and clearing cache.
+1. **Live Extension Development**: Your working copy is symlinked into the Magento instance (see [Using the local dev copy](#using-the-local-dev-copy) below). Edits to the source take effect immediately; changes to DI/config (`etc/*.xml`, `di.xml`) also need `bin/magento setup:upgrade && bin/magento setup:di:compile && bin/magento cache:flush`.
+
+### Using the local dev copy
+
+The devcontainer runs **your local working copy** (`/workspace/loqate-magento`) rather than the published Marketplace/Packagist release, so your edits are what Magento executes. This is wired up in [`setup-magento.sh`](.devcontainer/setup-magento.sh):
+
+1. A Composer **path repository** named `loqate-local` is registered against the extension directory, with `symlink: true`.
+2. The extension is installed by its **path-repo package name** — `gbg-loqate/loqate-integration` (the `name` in this repo's [`composer.json`](composer.json)):
+
+   ```bash
+   composer require gbg-loqate/loqate-integration:@dev
+   ```
+
+   Composer resolves this to the path repo and **symlinks** `/workspace/loqate-magento` into `vendor/gbg-loqate/loqate-integration`. Because it's a symlink, saving a file here changes what Magento runs — no reinstall needed.
+
+> **Important:** do *not* require `lqt/loqate-integration` — that is the **published Packagist release** and would install a fixed version into `vendor/lqt/loqate-integration`, ignoring your local changes. Only one of the two may be installed at a time: both register the same module name (`Loqate_ApiIntegration`), so having both present causes a "module already registered" error.
+
+**Verify you're running the local copy:**
+
+```bash
+cd /workspace/magento2
+# should print your working-copy version (matches composer.json here), and be a symlink
+grep '"version"' vendor/gbg-loqate/loqate-integration/composer.json
+ls -l vendor/gbg-loqate | grep loqate-integration      # -> symlink to /workspace/loqate-magento
+bin/magento module:status Loqate_ApiIntegration        # -> "Module is enabled"
+```
+
+**After editing the code:**
+
+- PHP class body / template / JS changes → just reload the page (developer mode already active).
+- New or changed `etc/*.xml`, `di.xml`, plugins, observers, DB schema/data → run:
+
+  ```bash
+  cd /workspace/magento2
+  bin/magento setup:upgrade
+  bin/magento setup:di:compile
+  bin/magento cache:flush
+  ```
+
+**Switching an already-built instance from the published copy to the local copy** (e.g. if `vendor/lqt/loqate-integration` was installed first):
+
+```bash
+cd /workspace/magento2
+composer config repositories.loqate-local path /workspace/loqate-magento
+composer config repositories.loqate-local.options.symlink true    # if not already set
+composer remove lqt/loqate-integration
+composer require gbg-loqate/loqate-integration:@dev
+bin/magento setup:upgrade && bin/magento setup:di:compile && bin/magento cache:flush
+```
 
 ### Services
 
-- PHP-FPM (8.1)
+- PHP-FPM (8.4)
 - Nginx
 - MySQL 8
 - Opensearch
@@ -58,7 +108,7 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 ### Notes
 
 - The first startup may take several minutes (Magento install, Composer, DB setup).
-- The extension is symlinked into `app/code/Loqate/ApiIntegration`.
+- The extension is installed from the local `loqate-local` Composer path repository and symlinked into `vendor/gbg-loqate/loqate-integration` (see [Using the local dev copy](#using-the-local-dev-copy)).
 - To re-run setup, use [`.devcontainer/setup-magento.sh`](.devcontainer/setup-magento.sh) inside the container.
 - If you have any DNS issues, you will need to copy your Zscaler certificate into the PHP container - see the Zscaler workaround comment in the [`Dockerfile`](.devcontainer/Dockerfile).
 
