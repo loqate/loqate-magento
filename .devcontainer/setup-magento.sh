@@ -77,10 +77,24 @@ find var generated vendor pub/static pub/media app/etc -type d -exec chmod g+ws 
 chown -R :www-data .
 chmod u+x bin/magento
 
-# Install the extension
-composer require lqt/loqate-integration:@dev
+# Install the LOCAL dev copy of the extension.
+#
+# The "loqate-local" path repository exposes the source at $EXTENSION_DIR under its
+# composer.json name, gbg-loqate/loqate-integration. Requiring that name registers the
+# package (composer autoload / lock) and pulls its dependencies.
+# (Do NOT require lqt/loqate-integration here — that pulls the published Packagist
+# release instead of your local source.)
+composer require gbg-loqate/loqate-integration:@dev
 
-# Install the Loqate API Connector
+# IMPORTANT: Composer installs a same-filesystem path repo as a SYMLINK, and Magento
+# cannot render templates from a module whose real path is outside the Magento base
+# dir (you get "Path ... cannot be used with directory ..." at checkout). A bind mount
+# would keep the files under the base dir with live edit, but this container is not
+# privileged enough to bind-mount. So we replace the symlink with a REAL COPY under
+# vendor/. Edits to $EXTENSION_DIR are then applied with .devcontainer/sync-extension.sh.
+"$(dirname "$(realpath "$0")")/sync-extension.sh" --no-build
+
+# Install the Loqate API Connector (also pulled transitively, kept explicit for clarity)
 composer require lqt/api-connector
 
 # Enable developer mode
