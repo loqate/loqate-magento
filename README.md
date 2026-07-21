@@ -6,17 +6,19 @@ Performs address capture and data validation (email, phone number and address) u
 
 ## Download
 
+> **Developing in this repo's devcontainer?** You don't need any of the download steps below — the devcontainer already installs and symlinks your local working copy. See [Using the local dev copy](#using-the-local-dev-copy).
+
 ### Download via composer
 
-Request composer to fetch the module:
+Request composer to fetch the published release from Packagist:
 
 ```
-composer require loqate-integration/adobe
+composer require lqt/loqate-integration
 ```
 
 ### Manual Download
 
-Download & copy the git content to `/app/code/Loqate/ApiIntegration`.
+Download & copy the git content to `app/code/Loqate/ApiIntegration`.
 
 ## Install
 
@@ -79,7 +81,63 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
    - Storefront: [http://localhost:8080](http://localhost:8080)
    - Admin: [http://localhost:8080/admin](http://localhost:8080/admin)
    - Default admin user: `admin` / `admin123`
-1. **Live Extension Development**: Your extension source is mounted into the running Magento instance. Changes are reflected immediately after running `bin/magento setup:upgrade` and clearing cache.
+1. **Live Extension Development**: The devcontainer runs **your local working copy** (`/workspace/loqate-magento`), mirrored into the Magento instance. After editing the source, run [`sync-extension.sh`](.devcontainer/sync-extension.sh) to apply the changes (see [Using the local dev copy](#using-the-local-dev-copy) below).
+
+### Using the local dev copy
+
+The devcontainer runs **your local working copy** (`/workspace/loqate-magento`) rather than the published Marketplace/Packagist release, so your edits are what Magento executes.
+
+#### Why it's a copy, not a symlink
+
+Magento **cannot render templates (or read other view files) from a module whose real path is outside the Magento base dir**. A Composer path repository on the same filesystem is installed as a **symlink**, and the symlinked module registers its *real* path (`/workspace/loqate-magento`, via `registration.php`'s `__DIR__`) — which is outside `/workspace/magento2`. The result is an error at checkout / address forms:
+
+```
+Path "/workspace/loqate-magento/view/frontend/templates/config.phtml"
+cannot be used with directory "/workspace/magento2/"
+```
+
+A bind mount would keep the files under the base dir *and* stay live-editable, but this container isn't privileged enough to bind-mount. So the extension is installed as a **real copy** under `vendor/gbg-loqate/loqate-integration`, and edits are re-applied with a sync script. [`setup-magento.sh`](.devcontainer/setup-magento.sh) wires this up:
+
+1. A Composer **path repository** named `loqate-local` is registered against the extension directory.
+2. The extension is required by its **path-repo package name**, `gbg-loqate/loqate-integration` (the `name` in this repo's [`composer.json`](composer.json)), which registers the package + pulls dependencies:
+
+   ```bash
+   composer require gbg-loqate/loqate-integration:@dev
+   ```
+
+3. [`sync-extension.sh`](.devcontainer/sync-extension.sh) then replaces the symlink Composer created with a real copy of the source.
+
+> **Important:** do *not* require `lqt/loqate-integration` — that is the **published Packagist release** and would install a fixed version into `vendor/lqt/loqate-integration`, ignoring your local changes. Only one of the two may be installed at a time: both register the same module name (`Loqate_ApiIntegration`), so having both present causes a "module already registered" error.
+
+#### After editing the code — sync your changes
+
+Run the sync script from anywhere in the container:
+
+```bash
+.devcontainer/sync-extension.sh          # copy source + cache:flush  (PHP body / template / JS edits)
+.devcontainer/sync-extension.sh --full   # also setup:upgrade + di:compile  (di.xml / config / plugins / schema)
+```
+
+> Because it's a copy, **your edits are not live** — nothing changes in Magento until you run the sync script. (`composer install`/`update`/`reinstall` will re-create the symlink and reintroduce the template error; if that happens, just run the sync script again.)
+
+**Verify you're running the local copy:**
+
+```bash
+cd /workspace/magento2
+grep '"version"' vendor/gbg-loqate/loqate-integration/composer.json   # your working-copy version
+ls -ld vendor/gbg-loqate/loqate-integration                          # a real directory, NOT a symlink
+bin/magento module:status Loqate_ApiIntegration                      # -> "Module is enabled"
+```
+
+**Switching an already-built instance from the published copy to the local copy** (e.g. if `vendor/lqt/loqate-integration` was installed first):
+
+```bash
+cd /workspace/magento2
+composer config repositories.loqate-local path /workspace/loqate-magento
+composer remove lqt/loqate-integration
+composer require gbg-loqate/loqate-integration:@dev
+.devcontainer/sync-extension.sh --full
+```
 
 ### Services
 
@@ -91,8 +149,8 @@ This repository includes a [devcontainer](.devcontainer/) for rapid Magento 2 ex
 
 ### Notes
 
-- The first startup can take **10–30 minutes** (Magento install, Composer, sample data deploy, DI compilation).
-- The extension is symlinked into `app/code/Loqate/ApiIntegration`.
+- The first startup may take several minutes (Magento install, Composer, DB setup).
+- The extension is installed from the local `loqate-local` Composer path repository as a **real copy** in `vendor/gbg-loqate/loqate-integration`; re-apply source edits with [`sync-extension.sh`](.devcontainer/sync-extension.sh) (see [Using the local dev copy](#using-the-local-dev-copy)).
 - To re-run setup, use [`.devcontainer/setup-magento.sh`](.devcontainer/setup-magento.sh) inside the container.
 - If you have any DNS issues, you will need to copy your Zscaler certificate into the PHP container - see the Zscaler workaround comment in the [`Dockerfile`](.devcontainer/Dockerfile).
 
