@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y \
     libcurl4-openssl-dev \
     cron \
     nano \
+    vim \
+    bash-completion \
     gnupg \
     lsb-release \
     default-mysql-client \
@@ -25,6 +27,7 @@ RUN apt-get update && apt-get install -y \
     nginx \
     jq \
     sudo \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # Zscaler workaround (uncomment if you have DNS issues)
@@ -57,7 +60,7 @@ ARG USERNAME=vscode
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd --gid $USER_GID $USERNAME \
-    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m --shell /bin/bash $USERNAME \
     && usermod -aG www-data $USERNAME \
     && usermod -aG sudo $USERNAME \
     && chown -R $USERNAME:$USERNAME /workspace
@@ -66,4 +69,12 @@ RUN groupadd --gid $USER_GID $USERNAME \
 RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
     && chmod 0440 /etc/sudoers.d/$USERNAME
 
-USER $USERNAME 
+# Give the vscode user an interactive bash setup (completion, git-aware prompt, aliases)
+COPY bashrc /home/$USERNAME/.bashrc
+RUN chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc
+
+# Set up supervisor to manage nginx and php-fpm
+RUN mkdir -p /var/log/supervisor
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+CMD ["/usr/bin/supervisord", "-n", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

@@ -1,0 +1,51 @@
+# ~/.bashrc for the devcontainer vscode user
+
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# --- History ---
+HISTCONTROL=ignoreboth          # no duplicate lines or lines starting with space
+HISTSIZE=10000
+HISTFILESIZE=20000
+shopt -s histappend             # append to history, don't overwrite
+shopt -s checkwinsize           # keep LINES/COLUMNS up to date
+
+# --- Bash completion ---
+if ! shopt -oq posix; then
+  if [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+  elif [ -f /etc/bash_completion ]; then
+    . /etc/bash_completion
+  fi
+fi
+
+# --- Git-aware prompt ---
+# git-sh-prompt ships with git and provides __git_ps1
+if [ -f /usr/lib/git-core/git-sh-prompt ]; then
+  . /usr/lib/git-core/git-sh-prompt
+  GIT_PS1_SHOWDIRTYSTATE=1
+  GIT_PS1_SHOWUNTRACKEDFILES=1
+fi
+
+# Colored prompt: user@host:cwd (git-branch) $
+if type __git_ps1 >/dev/null 2>&1; then
+  PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0;33m\]$(__git_ps1 " (%s)")\[\e[0m\]\$ '
+else
+  PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+fi
+
+# --- Aliases ---
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+
+# --- PATH: prefer project binaries (Magento bin/, composer vendor/bin) ---
+export PATH="./bin:./vendor/bin:$HOME/.composer/vendor/bin:$PATH"
+
+# Default editor
+export EDITOR=vim

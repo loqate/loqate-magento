@@ -2,14 +2,19 @@
   "name": "Magento 2 DevContainer",
   "dockerComposeFile": ["docker-compose.yml"],
   "service": "php",
-  "forwardPorts": [8080, 3306, 15672, 9200],
+  "forwardPorts": [8080, 3306, 9200],
   "workspaceFolder": "/workspace",
   "mounts": [
     "source=${localWorkspaceFolder},target=/workspace/loqate-magento,type=bind"
   ],
+  "initializeCommand": "[ -f ${localWorkspaceFolder}/.devcontainer/devcontainer.env ] || cp ${localWorkspaceFolder}/.devcontainer/devcontainer.env.example ${localWorkspaceFolder}/.devcontainer/devcontainer.env",
   "postCreateCommand": "/workspace/loqate-magento/.devcontainer/setup-magento.sh",
-  "settings": {
-    "terminal.integrated.shell.linux": "/bin/bash"
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
   },
   "remoteUser": "vscode"
 }

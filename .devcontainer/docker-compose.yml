@@ -15,7 +15,8 @@ services:
     environment:
       - COMPOSER_ALLOW_SUPERUSER=1
     env_file:
-      - devcontainer.env
+      - path: devcontainer.env
+        required: false
     working_dir: /workspace/
 
   db:
@@ -30,14 +31,14 @@ services:
       - "3306:3306"
     volumes:
       - dbdata:/var/lib/mysql
-    command: --default-authentication-plugin=mysql_native_password --ssl=0
+    command: --default-authentication-plugin=mysql_native_password --ssl=0 --log-bin-trust-function-creators=1
 
   opensearch:
     image: opensearchproject/opensearch:2.19.3
     environment:
       - discovery.type=single-node
       - plugins.security.disabled=true
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=0i.N020>R!=&
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=0i.N020>R!=&"
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g
     ulimits:
       memlock:
