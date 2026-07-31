@@ -5,9 +5,17 @@
  *
  * The tests run without a full Magento installation. We autoload the module
  * (and PHPUnit) via Composer, then register lightweight stubs for the handful
- * of Magento framework classes the unit tests depend on. The stubs are only
- * defined when the real classes are absent, so the exact same suite also runs
- * unchanged inside a real Magento instance (e.g. via dev/tests/unit).
+ * of Magento framework classes the unit tests depend on.
+ *
+ * Scope: this bootstrap is for running the suite standalone (composer install in
+ * the module directory, then vendor/bin/phpunit). Each stub guards itself with
+ * class_exists($class, false) - autoloading disabled - so it only checks for a
+ * class that is ALREADY loaded. It therefore does not detect a real Magento class
+ * that Composer would merely be able to autoload: under this bootstrap the stub
+ * wins and shadows it. Running the tests against the real framework classes needs
+ * Magento's own dev/tests/unit bootstrap (which loads them first) rather than this
+ * file; the test doubles are written to work either way, but this bootstrap alone
+ * does not put the real classes in play.
  */
 
 declare(strict_types=1);

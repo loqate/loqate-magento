@@ -43,6 +43,24 @@ class Data extends AbstractHelper
     }
 
     /**
+     * Get current store view ID
+     *
+     * Narrower than getCurrentWebsite(): getConfigValue() reads at SCOPE_STORE, so
+     * anything cached against a config-dependent verdict has to be scoped per store
+     * view, not per website.
+     *
+     * @return int
+     */
+    public function getCurrentStore(): int
+    {
+        try {
+            return (int)$this->storeManager->getStore()->getId();
+        } catch (NoSuchEntityException $e) {
+            return 0;
+        }
+    }
+
+    /**
      * Get config value for website
      *
      * @param $configPath
