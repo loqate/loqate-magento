@@ -14,6 +14,7 @@ use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
 use ReflectionMethod;
 use ReflectionProperty;
 
@@ -21,14 +22,21 @@ use ReflectionProperty;
  * Unit tests for the verify-request de-duplication cache in Validator.
  *
  * Regression cover for LOQ-16969: Validator::verifyAddress() calls the *billable*
- * Loqate Cleansing API on every invocation, and a single checkout of a single
- * address invokes it 3-5 times depending on Magento version and checkout
- * front-end (shipping-information POST, billing save, the billing save replayed by
- * savePaymentInformation at place-order, then the QuoteSubmitBefore observer
- * calls). Customers are therefore charged 3-5 times for one address. The only
- * existing guard, "captured_addresses", matches solely addresses picked from the
- * Loqate Capture lookup, so a typed address is re-verified - and re-billed - on
- * every one of those paths.
+ * Loqate Cleansing API on every invocation, and it is wired in from SIX call
+ * statements across five classes: Plugin\Frontend\CheckoutShippingInformation.php:32,
+ * Plugin\Frontend\CheckoutBillingAddress.php:34 (which savePaymentInformation replays
+ * at place order, so that one statement runs twice in a checkout),
+ * Observer\QuoteSubmitBefore.php:60 and :84,
+ * Plugin\Frontend\CustomerAccountAddress.php:37 and
+ * Plugin\Admin\ValidateAddress.php:42. A single checkout of a single address therefore
+ * invokes it 3-5 times depending on Magento version and checkout front-end, and
+ * account saves and admin re-tests replay the same address on top of that. Customers
+ * are charged for every one of those. The only existing guard,
+ * "captured_addresses", matches solely addresses picked from the Loqate Capture
+ * lookup, so a typed address is re-verified - and re-billed - on every one of those
+ * paths. (The two verifyMultipleAddresses() sites, Plugin\Admin\OrderSave.php:49 and
+ * Plugin\Admin\ValidateImportAddress.php:38, are deliberately NOT covered by this
+ * cache - LOQ-16976 - and so are not covered here either.)
  *
  * The contract asserted here: identical addresses are verified once per session
  * and the verdict is replayed from a bounded, session-scoped cache keyed by the
@@ -47,10 +55,23 @@ use ReflectionProperty;
  * testACountyVariantLoqateNeverRejectedStillPassesFromTheCachedSuccess().
  * Both verify keys also cover the FULL joined street Loqate is actually sent, not
  * just the two lines the captured-address signature carries - see
- * testEditingAStreetLineBeyondTheSecondIsVerifiedAgain(). Entries are additionally
- * namespaced per STORE VIEW, since the AVC thresholds a verdict depends on are read
- * at SCOPE_STORE. Genuine edits must still be verified; transport failures and
- * responses with no readable AVC must never be cached, so the next attempt retries.
+ * testEditingAStreetLineBeyondTheSecondIsVerifiedAgain(). More generally, the strict
+ * key must project EVERY field parseAddress() sends to Loqate and the lossy key
+ * exactly that list minus the county; that invariant is pinned structurally by
+ * testStrictCacheKeyProjectsEveryFieldSentToLoqate() and, load-bearingly, per field
+ * by testEditingAnyFieldSentToLoqateAfterARejectionIsVerifiedAgain() and
+ * testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess().
+ *
+ * Entries are additionally namespaced per STORE VIEW and by a fingerprint of the
+ * RESOLVED AVC thresholds, since the thresholds a verdict depends on are read at
+ * SCOPE_STORE and a merchant can change them mid-session - see
+ * testChangingAnAppliedAvcThresholdInvalidatesTheCachedVerdict() and, for the
+ * over-invalidation that must NOT happen,
+ * testEditingIgnoredThresholdFieldsDoesNotInvalidateAnyVerdict(). Genuine edits must
+ * still be verified; transport failures and responses with no readable AVC must never
+ * be cached, so the next attempt retries. The debug instrumentation that makes the
+ * saving auditable must never write an address or a signature to the log - see
+ * testCacheOutcomeLoggingNeverLeaksTheAddressOrTheSignature().
  *
  * "Session-scoped" is itself part of the contract and is asserted here: a verdict
  * is customer data, so it must be readable by the same shopper on a later request
@@ -85,6 +106,76 @@ class ValidatorVerifyCacheTest extends TestCase
         'region' => 'Greater London',
         'postcode' => 'SW1A 1AA',
         'country_id' => 'GB',
+    ];
+
+    /**
+     * Base address for the per-mapped-field tests: carries every Magento key
+     * Validator::ADDRESS_MAPPING reads except street_1/street_2.
+     */
+    private const FIELD_EDIT_BASE = [
+        'street' => ['1 High St', 'Flat 2'],
+        'city' => 'London',
+        'region' => 'Greater London',
+        'postcode' => 'SW1A 1AA',
+        'country_id' => 'GB',
+    ];
+
+    /**
+     * Base address for the street_1/street_2 mappings, which is the same address WITHOUT
+     * the 'street' key.
+     *
+     * It has to omit 'street': parseAddress() applies ADDRESS_MAPPING first and then
+     * overwrites Address1/Address2 from extractStreetLines(), so while a 'street' value is
+     * present an edit to street_1 changes nothing at all - not the key and not the request
+     * either. The fields are only observable in the shape where Magento supplies them
+     * alone, which is the shape this base models.
+     */
+    private const FIELD_EDIT_BASE_STREET_PARTS = [
+        'street_1' => '1 High St',
+        'street_2' => 'Flat 2',
+        'city' => 'London',
+        'region' => 'Greater London',
+        'postcode' => 'SW1A 1AA',
+        'country_id' => 'GB',
+    ];
+
+    /**
+     * One "base address + edit to exactly this field" fixture per Magento key in
+     * Validator::ADDRESS_MAPPING.
+     *
+     * This map is the coverage gate of the invariant behind LOQ-16969: adding a mapping
+     * without adding a fixture makes the two per-field tests FAIL, so a field can never
+     * be sent to Loqate without something pinning that it also reaches the cache key.
+     */
+    private const FIELD_EDIT_FIXTURES = [
+        'street' => [
+            'base' => self::FIELD_EDIT_BASE,
+            'edit' => ['street' => ['9 Different Road', 'Flat 2']],
+        ],
+        'street_1' => [
+            'base' => self::FIELD_EDIT_BASE_STREET_PARTS,
+            'edit' => ['street_1' => '11 High St'],
+        ],
+        'street_2' => [
+            'base' => self::FIELD_EDIT_BASE_STREET_PARTS,
+            'edit' => ['street_2' => 'Flat 3'],
+        ],
+        'city' => [
+            'base' => self::FIELD_EDIT_BASE,
+            'edit' => ['city' => 'Manchester'],
+        ],
+        'region' => [
+            'base' => self::FIELD_EDIT_BASE,
+            'edit' => ['region' => 'Co. Meath'],
+        ],
+        'postcode' => [
+            'base' => self::FIELD_EDIT_BASE,
+            'edit' => ['postcode' => 'M1 1AA'],
+        ],
+        'country_id' => [
+            'base' => self::FIELD_EDIT_BASE,
+            'edit' => ['country_id' => 'IE'],
+        ],
     ];
 
     /** @var Validator The Validator under test (the "primary" shopper). */
@@ -133,20 +224,42 @@ class ValidatorVerifyCacheTest extends TestCase
      * model a request handled by a different store view off the same session, and an
      * $unserialize callback to model a serializer that rejects what it is given.
      *
+     * Pass a $config ArrayObject to model store configuration: it is read LIVE on every
+     * getConfigValue() call, so a test can change a value between two verifications the
+     * way a merchant saving the admin form does, and the same Validator instance sees the
+     * new value (see the AVC threshold fingerprint tests).
+     *
      * @param ArrayObject|null $session Session backing store to reuse, or null for a new session.
      * @param int $storeId Store view the request is being handled by (Data::getCurrentStore()).
      * @param callable|null $unserialize Replacement SerializerInterface::unserialize() behaviour.
-     * @return array{validator: Validator, connector: Verify&MockObject, requests: ArrayObject, session: ArrayObject}
+     * @param ArrayObject|null $config Live store configuration, config path => value.
+     * @return array{validator: Validator, connector: Verify&MockObject, requests: ArrayObject,
+     *     session: ArrayObject, config: ArrayObject, events: ArrayObject}
      */
     private function createShopper(
         ?ArrayObject $session = null,
         int $storeId = 0,
-        ?callable $unserialize = null
+        ?callable $unserialize = null,
+        ?ArrayObject $config = null
     ): array {
         $sessionStore = $session ?? new ArrayObject();
         $requests = new ArrayObject();
+        $configStore = $config ?? new ArrayObject();
+
+        // Single ordered timeline of everything the Validator emitted: every log record
+        // AND every billable request, so the tests can assert both WHAT was logged (it
+        // must never contain the address) and WHEN (a miss must be logged before the
+        // request it accounts for).
+        $events = new ArrayObject();
 
         $logger = $this->createMock(Logger::class);
+        $recordLog = static function (string $level) use ($events): callable {
+            return static function ($message, array $context = []) use ($events, $level) {
+                $events[] = ['type' => $level, 'message' => (string)$message, 'context' => $context];
+            };
+        };
+        $logger->method('debug')->willReturnCallback($recordLog('debug'));
+        $logger->method('info')->willReturnCallback($recordLog('info'));
 
         // The shared Test/stubs Session is a no-op (getData() returns null,
         // setData() stores nothing), so the dedup cache could never survive
@@ -221,7 +334,7 @@ class ValidatorVerifyCacheTest extends TestCase
 
         $helper = $this->createMock(Data::class);
         $helper->method('getConfigValue')->willReturnCallback(
-            static function ($configPath) {
+            static function ($configPath) use ($configStore) {
                 // A non-empty API key is required twice: the constructor only
                 // builds the connector when it is set, and verifyAddress()
                 // short-circuits with noKeyFound when it is not.
@@ -229,9 +342,11 @@ class ValidatorVerifyCacheTest extends TestCase
                     return self::API_KEY;
                 }
 
-                // Everything else empty: show_advanced_avc_settings != 1 makes
-                // checkAVCStatus() use the baked-in default thresholds.
-                return '';
+                // Anything not explicitly configured reads as empty, which is what the
+                // admin form leaves behind for an untouched field: in particular
+                // show_advanced_avc_settings != 1 makes checkAVCStatus() use the
+                // baked-in default thresholds.
+                return $configStore[$configPath] ?? '';
             }
         );
         // Verdicts are namespaced per STORE VIEW, because the AVC thresholds they
@@ -273,6 +388,8 @@ class ValidatorVerifyCacheTest extends TestCase
             'connector' => $connector,
             'requests' => $requests,
             'session' => $sessionStore,
+            'config' => $configStore,
+            'events' => $events,
         ];
     }
 
@@ -895,6 +1012,194 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
+     * The STRUCTURAL half of the invariant the whole scheme rests on: the strict
+     * (rejection) key must project EVERY field parseAddress() sends to Loqate - every
+     * value of Validator::ADDRESS_MAPPING - and the lossy (success) key must be exactly
+     * that list minus the county.
+     *
+     * READ THIS BEFORE TRUSTING IT. This test cannot catch a field being ADDED to
+     * ADDRESS_MAPPING, and it is not claimed to: strictSignatureFields() and
+     * verifySignatureFields() DERIVE their lists from ADDRESS_MAPPING, so a new mapping
+     * extends both keys by construction and the sets stay equal. Adding
+     * 'company' => 'Company' to ADDRESS_MAPPING leaves this test green (verified with
+     * that exact mutant). What it does pin is the derivation itself: hand-writing either
+     * list again, dropping a field from one of them, or naming a COUNTY_FIELD that is not
+     * in ADDRESS_MAPPING at all, all fail here. The BEHAVIOURAL defence - that a mapped
+     * field genuinely reaches the key and genuinely costs a second billable request when
+     * it changes - is
+     * testEditingAnyFieldSentToLoqateAfterARejectionIsVerifiedAgain() and
+     * testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess(),
+     * which iterate ADDRESS_MAPPING and fail on an unpinned new field.
+     */
+    public function testStrictCacheKeyProjectsEveryFieldSentToLoqate(): void
+    {
+        $sentToLoqate = array_values(Validator::ADDRESS_MAPPING);
+        $county = (string)$this->privateConstant('COUNTY_FIELD');
+        $strict = $this->invokePrivate('strictSignatureFields', []);
+        $lossy = $this->invokePrivate('verifySignatureFields', []);
+
+        $this->assertContains(
+            $county,
+            $sentToLoqate,
+            'COUNTY_FIELD must be one of the fields parseAddress() actually sends, or the strict key '
+            . 'appends a segment Loqate never sees and the lossy key drops nothing real.'
+        );
+        $this->assertEqualsCanonicalizing(
+            $sentToLoqate,
+            $strict,
+            'The STRICT (rejection) key must project every field sent to Loqate: a rejection may only be '
+            . 'replayed for the exact address Loqate judged. A field that reaches the request but not this '
+            . 'list would make editing it replay a stale verdict - a wrong "invalid" the shopper cannot '
+            . 'clear (the checkout dead-end) or a wrong "valid" that lets an unverified address through.'
+        );
+        $this->assertEqualsCanonicalizing(
+            array_values(array_diff($sentToLoqate, [$county])),
+            $lossy,
+            'The LOSSY (success) key must be exactly the strict key minus the county: it may ignore the '
+            . 'churning county (that is the LOQ-16969 fix) and nothing else.'
+        );
+        $this->assertSame(
+            [$county],
+            array_values(array_diff($strict, $lossy)),
+            'The county must be the ONLY field the two key families differ by.'
+        );
+        $this->assertSame(
+            [],
+            array_values(array_diff($lossy, $strict)),
+            'The lossy key must not project anything the strict key does not.'
+        );
+        $this->assertSame(
+            count($strict),
+            count(array_unique($strict)),
+            'No field may appear twice in the key: a duplicated segment is dead weight in the session payload.'
+        );
+    }
+
+    /**
+     * The BEHAVIOURAL, load-bearing half of the same invariant, and the no-dead-end
+     * property itself: for EVERY field parseAddress() sends to Loqate, a shopper whose
+     * address was REJECTED must be re-verified once they edit that field.
+     *
+     * Driven from Validator::ADDRESS_MAPPING itself and through the public
+     * verifyAddress(), so it pins the two things that actually matter and that the
+     * structural test above cannot see: that the field reaches the strict cache KEY, and
+     * that a change to it costs a second BILLABLE call rather than replaying the
+     * rejection. A field added to ADDRESS_MAPPING with no fixture here fails outright
+     * (that is the point: adding 'company' => 'Company' must not be able to leave the
+     * suite green), and a field left out of the key fails on the call count.
+     *
+     * @param string $magentoField Magento address key, e.g. 'postcode'.
+     * @param string $loqateField Loqate request field it is mapped onto, e.g. 'PostalCode'.
+     */
+    #[DataProvider('fieldSentToLoqateProvider')]
+    public function testEditingAnyFieldSentToLoqateAfterARejectionIsVerifiedAgain(
+        string $magentoField,
+        string $loqateField
+    ): void {
+        [$base, $edited] = $this->mappedFieldFixture($magentoField, $loqateField);
+
+        // Precondition, established on throwaway shoppers so it holds even if the cache
+        // is broken: the edit really does change the request Loqate is asked.
+        $this->assertEditChangesTheLoqateRequest($base, $edited, $loqateField);
+
+        $this->stubApiResponses([self::rejectedResponse(), self::acceptedResponse()]);
+
+        $rejected = $this->validator->verifyAddress($base);
+        $this->assertTrue($rejected['error'], 'The first submission must be rejected off the wire.');
+        $this->assertSame(1, $this->apiCallCount(), 'The first submission must reach the API.');
+
+        $corrected = $this->validator->verifyAddress($edited);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            sprintf(
+                'Editing "%s" (sent to Loqate as %s) after a rejection must trigger a fresh verification: '
+                . 'the STRICT key must project every field Loqate judged, or the shopper is served the stale '
+                . 'rejection and can never get out of checkout however often they correct that field.',
+                $magentoField,
+                $loqateField
+            )
+        );
+        $this->assertSame(
+            ['error' => false],
+            $corrected,
+            'The edited address must get the live verdict, not the cached rejection.'
+        );
+    }
+
+    /**
+     * The mirror image on the success path: for every field EXCEPT the county, editing it
+     * after an acceptance must be verified again, or an unverified address is smuggled
+     * past checkout on another address's "valid".
+     *
+     * The county is the one deliberate exception (the LOQ-16969 trade-off) and is asserted
+     * as such here rather than skipped, so the exception stays exactly one field wide -
+     * anything else falling out of the lossy key fails.
+     *
+     * @param string $magentoField Magento address key, e.g. 'postcode'.
+     * @param string $loqateField Loqate request field it is mapped onto, e.g. 'PostalCode'.
+     */
+    #[DataProvider('fieldSentToLoqateProvider')]
+    public function testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess(
+        string $magentoField,
+        string $loqateField
+    ): void {
+        [$base, $edited] = $this->mappedFieldFixture($magentoField, $loqateField);
+        $isCounty = $loqateField === (string)$this->privateConstant('COUNTY_FIELD');
+
+        $this->assertEditChangesTheLoqateRequest($base, $edited, $loqateField);
+
+        $this->stubApiResponses([self::acceptedResponse()]);
+
+        $this->validator->verifyAddress($base);
+        $this->assertSame(1, $this->apiCallCount(), 'The first submission must reach the API.');
+
+        $this->validator->verifyAddress($edited);
+
+        if ($isCounty) {
+            $this->assertSame(
+                1,
+                $this->apiCallCount(),
+                sprintf(
+                    'The county (%s) is the ONE field the success key deliberately ignores, because '
+                    . 'capture.js and parseAddress() both rewrite it - re-billing that churn is the defect '
+                    . 'LOQ-16969 fixes. Tightening this is tracked as LOQ-16979.',
+                    $loqateField
+                )
+            );
+
+            return;
+        }
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            sprintf(
+                'Editing "%s" (sent to Loqate as %s) must be verified again: the LOSSY key must project '
+                . 'every field sent to Loqate except the county, or a genuinely different address is served '
+                . 'this address\'s "valid" and reaches checkout unverified.',
+                $magentoField,
+                $loqateField
+            )
+        );
+    }
+
+    /**
+     * One case per entry of Validator::ADDRESS_MAPPING, so the two tests above cover
+     * exactly the fields the production code sends - today's and tomorrow's.
+     */
+    public static function fieldSentToLoqateProvider(): array
+    {
+        $cases = [];
+        foreach (Validator::ADDRESS_MAPPING as $magentoField => $loqateField) {
+            $cases[$magentoField . ' => ' . $loqateField] = [(string)$magentoField, (string)$loqateField];
+        }
+
+        return $cases;
+    }
+
+    /**
      * The upper bound on how fine-grained the verify key needs to be: two street values
      * that produce the byte-identical Loqate REQUEST must share one verification.
      *
@@ -1156,8 +1461,8 @@ class ValidatorVerifyCacheTest extends TestCase
      * two:
      *  - the plain POST shape: street is a real ARRAY and the county is a 'region'
      *    NAME (self::ADDRESS, used by most tests here);
-     *  - the quote paths (CheckoutShippingInformation.php:29,
-     *    CheckoutBillingAddress.php:30, QuoteSubmitBefore.php:57/81) pass
+     *  - the quote paths (CheckoutShippingInformation.php:32,
+     *    CheckoutBillingAddress.php:34, QuoteSubmitBefore.php:60/:84) pass
      *    Quote\Address::getData(), and AbstractAddress::setData() has already run the
      *    multiline street attribute through trim(implode("\n", $value)), so street is
      *    a NEWLINE-SEPARATED STRING and the county is a 'region_id' that
@@ -1549,6 +1854,92 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
+     * The one observable effect of the "unset($store[$key]) before re-inserting" line in
+     * storeVerifyResult(): refreshing an entry that is ALREADY in a FULL cache must not
+     * evict an unrelated verdict, which would then have to be re-billed.
+     *
+     * A write only ever follows a cache MISS, so this is reachable in exactly one way: the
+     * key is present but unreadable (a truncated session payload, another module writing
+     * to the key, a serializer that rejects it), so the read missed and the verdict is
+     * re-fetched under a key that is already there.
+     *
+     * The corrupted entry has to be the SECOND oldest, not the oldest. array_shift()
+     * evicts from the front, so refreshing the FRONT entry evicts that same entry - which
+     * is then immediately re-inserted, harming nothing and making the unset
+     * indistinguishable. It is only when the refreshed key sits behind the front that the
+     * unset saves a different address's verdict, so that is the case pinned here: without
+     * the unset, refreshing #2 silently drops #1.
+     */
+    public function testRefreshingAnUnreadableEntryWhileFullDoesNotEvictAnUnrelatedVerdict(): void
+    {
+        $limit = $this->verifyCacheLimit();
+        $this->stubApiResponses([self::acceptedResponse()]);
+
+        // Fill the cache to exactly the limit: entries are in insertion order, #1 oldest.
+        for ($i = 1; $i <= $limit; $i++) {
+            $this->validator->verifyAddress($this->distinctAddress($i));
+        }
+        $this->assertSame($limit, $this->apiCallCount(), 'Each distinct address must be verified once.');
+        $this->assertCount($limit, $this->verdictStore(), 'The cache must be exactly full before the refresh.');
+
+        // Corrupt the SECOND oldest entry so its read misses while its key stays present.
+        $store = $this->verdictStore();
+        $keys = array_keys($store);
+        $secondOldestKey = (string)$keys[1];
+        $store[$secondOldestKey] = '{not json';
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        // Re-verify address #2: unreadable, so it is re-fetched and rewritten in place.
+        $refreshed = $this->validator->verifyAddress($this->distinctAddress(2));
+
+        $this->assertSame(
+            $limit + 1,
+            $this->apiCallCount(),
+            'An unreadable entry must be re-verified against the API.'
+        );
+        $this->assertSame(['error' => false], $refreshed, 'The live verdict must be returned.');
+        $this->assertCount(
+            $limit,
+            $this->verdictStore(),
+            'Refreshing an entry that is already present must leave the cache exactly full: it replaces one '
+            . 'entry, so it must not also evict another.'
+        );
+        $this->assertArrayHasKey(
+            $secondOldestKey,
+            $this->verdictStore(),
+            'The refreshed verdict must be readable again under its own key.'
+        );
+
+        // Address #1 is entirely unrelated to the refresh and was the OLDEST entry, so it
+        // is precisely what a stray eviction would have taken.
+        $unrelated = $this->validator->verifyAddress($this->distinctAddress(1));
+
+        $this->assertSame(
+            $limit + 1,
+            $this->apiCallCount(),
+            'Refreshing an unreadable entry in a full cache must not evict an UNRELATED verdict: that other '
+            . 'address would then be re-billed for no reason. This is what dropping the entry before '
+            . 're-inserting it prevents - without it, the eviction loop takes the front entry even though '
+            . 'the write replaces an entry that is already counted.'
+        );
+        $this->assertSame(['error' => false], $unrelated, 'The unrelated verdict must be replayed from cache.');
+
+        // The refreshed entry is also treated as the NEWEST, so it survives the next
+        // eviction and the entry it replaced does not keep its old age.
+        $this->validator->verifyAddress($this->distinctAddress($limit + 1));
+        $this->assertSame($limit + 2, $this->apiCallCount(), 'A brand new address must be verified.');
+
+        $stillCached = $this->validator->verifyAddress($this->distinctAddress(2));
+        $this->assertSame(
+            $limit + 2,
+            $this->apiCallCount(),
+            'The refreshed verdict must be the newest, not inherit the age of the entry it replaced, so the '
+            . 'next eviction does not take it.'
+        );
+        $this->assertSame(['error' => false], $stillCached);
+    }
+
+    /**
      * The signature is the dedup key, so its projection is load-bearing: the
      * region/county (Address4) must be excluded because capture.js rewrites it,
      * while the city (Address3) must be included because two different towns can
@@ -1779,8 +2170,10 @@ class ValidatorVerifyCacheTest extends TestCase
         $keys = array_keys($this->shopperStore($storeOne));
         $this->assertCount(2, $keys, 'Each store view must cache its own verdict for the same address.');
 
+        // Only the two namespace segments (store view, AVC threshold fingerprint) may
+        // differ; what follows them is the address signature itself.
         $signatures = array_map(
-            static fn (string $key): string => substr($key, (int)strpos($key, '|') + 1),
+            static fn (string $key): string => self::signatureSegment($key),
             $keys
         );
         $this->assertCount(
@@ -1829,6 +2222,367 @@ class ValidatorVerifyCacheTest extends TestCase
             1,
             $this->shopperStore($laterRequest),
             'The replay must reuse the existing entry, not add a second one under the same store view.'
+        );
+    }
+
+    /**
+     * The staleness the AVC-threshold fingerprint in the cache key exists to fix: a
+     * verdict is a function of the address AND of the thresholds it was judged against, so
+     * once a merchant changes an APPLIED threshold, verdicts computed under the old one
+     * must not be replayed.
+     *
+     * The reported symptom is an admin re-testing an address
+     * (Plugin\Admin\ValidateAddress.php:42) after tightening or loosening the thresholds
+     * and being handed the verdict from before the change, with no way to clear it short
+     * of ending the session.
+     */
+    public function testChangingAnAppliedAvcThresholdInvalidatesTheCachedVerdict(): void
+    {
+        // Advanced settings ON, so the configured thresholds are the ones actually applied.
+        $config = new ArrayObject(self::thresholdConfig(true, ['avc_matchscore' => '90']));
+        $shopper = $this->createShopper(null, 0, null, $config);
+        $this->stubShopperResponses($shopper, [self::acceptedResponse()]);
+
+        $first = $shopper['validator']->verifyAddress(self::ADDRESS);
+        $this->assertSame(1, $this->shopperCallCount($shopper), 'The first submission must reach the API.');
+        $this->assertSame(['error' => false], $first);
+        $keyBefore = (string)array_key_first($this->shopperStore($shopper));
+
+        // The merchant tightens the match score. The address is unchanged.
+        $config['loqate_settings/verify_threshold_settings/avc_matchscore'] = '80';
+
+        $second = $shopper['validator']->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->shopperCallCount($shopper),
+            'Changing an AVC threshold that is actually applied must invalidate the cached verdict: it was '
+            . 'judged against the old threshold, so replaying it reports a verdict the current '
+            . 'configuration never produced.'
+        );
+        $this->assertSame(['error' => false], $second, 'The re-verified address must get the live verdict.');
+
+        $store = $this->shopperStore($shopper);
+        $this->assertCount(2, $store, 'The two verdicts must be cached under their own threshold namespaces.');
+        $keys = array_keys($store);
+        $keyAfter = (string)$keys[1];
+        $this->assertNotSame(
+            self::fingerprintSegment($keyBefore),
+            self::fingerprintSegment($keyAfter),
+            'The threshold fingerprint segment of the key must change with the applied thresholds.'
+        );
+        $this->assertSame(
+            self::signatureSegment($keyBefore),
+            self::signatureSegment($keyAfter),
+            'The thresholds must NAMESPACE the key, not leak into the address signature: one address must '
+            . 'still project to one signature.'
+        );
+    }
+
+    /**
+     * The other half of that contract, and the reason the fingerprint is taken over the
+     * RESOLVED comparer string rather than the raw configuration: with
+     * "show_advanced_avc_settings" OFF the eight threshold fields are ignored entirely, so
+     * editing them changes nothing about how an address is judged and must invalidate
+     * nothing.
+     *
+     * Hashing raw config instead would throw away every live shopper's verdicts - and
+     * re-bill every address in every open checkout - on a change that had no effect at all.
+     */
+    public function testEditingIgnoredThresholdFieldsDoesNotInvalidateAnyVerdict(): void
+    {
+        // Advanced settings OFF, but the eight fields are populated (a merchant who
+        // configured them and then turned the toggle off).
+        $config = new ArrayObject(self::thresholdConfig(false, [
+            'avc_verification_status' => 'V',
+            'avc_post_match_level' => '5',
+            'avc_pre_match_level' => '5',
+            'avc_parsing_status' => 'I',
+            'avc_lexicon_identification_match_level' => '2',
+            'avc_context_identification_match_level' => '2',
+            'avc_postcode_status' => 'P9',
+            'avc_matchscore' => '99',
+        ]));
+        $shopper = $this->createShopper(null, 0, null, $config);
+        $this->stubShopperResponses($shopper, [self::acceptedResponse()]);
+
+        $shopper['validator']->verifyAddress(self::ADDRESS);
+        $this->assertSame(1, $this->shopperCallCount($shopper), 'The first submission must reach the API.');
+
+        // Every one of the eight ignored fields is edited.
+        foreach ([
+            'avc_verification_status' => 'U',
+            'avc_post_match_level' => '0',
+            'avc_pre_match_level' => '0',
+            'avc_parsing_status' => 'U',
+            'avc_lexicon_identification_match_level' => '0',
+            'avc_context_identification_match_level' => '0',
+            'avc_postcode_status' => 'P0',
+            'avc_matchscore' => '10',
+        ] as $field => $value) {
+            $config['loqate_settings/verify_threshold_settings/' . $field] = $value;
+        }
+
+        $result = $shopper['validator']->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            1,
+            $this->shopperCallCount($shopper),
+            'With advanced AVC settings OFF the eight threshold fields are not applied, so editing them must '
+            . 'not invalidate a single cached verdict: the fingerprint has to be taken over the RESOLVED '
+            . 'comparer values, never over the raw configuration.'
+        );
+        $this->assertSame(['error' => false], $result, 'The cached verdict must still be replayed.');
+        $this->assertCount(1, $this->shopperStore($shopper), 'No second namespace may appear.');
+    }
+
+    /**
+     * ...and the toggle itself. Flipping "show_advanced_avc_settings" is the change raw
+     * config hashing would MISS while over-reacting to the ignored fields: it changes
+     * every threshold at once without touching any of the eight values.
+     *
+     * Asserted in both directions, because it must invalidate when it changes the resolved
+     * thresholds and must NOT when it does not (a merchant who never filled the fields in
+     * resolves the same defaults either way).
+     */
+    public function testFlippingTheAdvancedAvcToggleInvalidatesOnlyWhenItChangesTheResolvedThresholds(): void
+    {
+        // (1) Thresholds configured away from the defaults, toggle OFF: the defaults apply.
+        $config = new ArrayObject(self::thresholdConfig(false, ['avc_matchscore' => '50']));
+        $shopper = $this->createShopper(null, 0, null, $config);
+        $this->stubShopperResponses($shopper, [self::acceptedResponse()]);
+
+        $shopper['validator']->verifyAddress(self::ADDRESS);
+        $this->assertSame(1, $this->shopperCallCount($shopper), 'The first submission must reach the API.');
+
+        // (2) Toggle ON: the configured match score now applies, so the resolved
+        // thresholds - and therefore every verdict judged against them - have changed.
+        $config['loqate_settings/verify_threshold_settings/show_advanced_avc_settings'] = '1';
+
+        $afterFlip = $shopper['validator']->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->shopperCallCount($shopper),
+            'Turning advanced AVC settings on changes the thresholds every cached verdict was judged '
+            . 'against, so it must invalidate them.'
+        );
+        $this->assertSame(['error' => false], $afterFlip);
+
+        // (3) A merchant who never configured the fields: the toggle resolves to the same
+        // defaults either way, so flipping it must invalidate nothing.
+        $emptyConfig = new ArrayObject(self::thresholdConfig(false, []));
+        $unconfigured = $this->createShopper(null, 0, null, $emptyConfig);
+        $this->stubShopperResponses($unconfigured, [self::acceptedResponse()]);
+
+        $unconfigured['validator']->verifyAddress(self::ADDRESS);
+        $emptyConfig['loqate_settings/verify_threshold_settings/show_advanced_avc_settings'] = '1';
+        $unchanged = $unconfigured['validator']->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            1,
+            $this->shopperCallCount($unconfigured),
+            'With no threshold values configured, the toggle resolves to the same baked-in defaults, so '
+            . 'flipping it must not re-bill anything: the fingerprint tracks what was APPLIED.'
+        );
+        $this->assertSame(['error' => false], $unchanged, 'The cached verdict must still be replayed.');
+        $this->assertCount(1, $this->shopperStore($unconfigured), 'No second namespace may appear.');
+    }
+
+    /**
+     * The fingerprint is a NAMESPACE, not a per-shopper salt: two shoppers whose resolved
+     * thresholds are identical must land on the identical fingerprint (and the identical
+     * signature), while a shopper on different applied thresholds must not.
+     *
+     * That is what keeps the segment doing exactly one job. A fingerprint that varied per
+     * shopper, per request or per address would make every key unique, quietly disabling
+     * the whole cache while every count-based test kept passing within one shopper.
+     */
+    public function testShoppersWithIdenticalThresholdsShareTheFingerprintSegment(): void
+    {
+        $thresholds = self::thresholdConfig(true, ['avc_matchscore' => '90']);
+        $shopperA = $this->createShopper(null, 0, null, new ArrayObject($thresholds));
+        $shopperB = $this->createShopper(null, 0, null, new ArrayObject($thresholds));
+        $stricter = $this->createShopper(
+            null,
+            0,
+            null,
+            new ArrayObject(self::thresholdConfig(true, ['avc_matchscore' => '80']))
+        );
+        foreach ([$shopperA, $shopperB, $stricter] as $shopper) {
+            $this->stubShopperResponses($shopper, [self::acceptedResponse()]);
+            $shopper['validator']->verifyAddress(self::ADDRESS);
+        }
+
+        $keyA = (string)array_key_first($this->shopperStore($shopperA));
+        $keyB = (string)array_key_first($this->shopperStore($shopperB));
+        $keyStricter = (string)array_key_first($this->shopperStore($stricter));
+
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{12}$/',
+            self::fingerprintSegment($keyA),
+            'The fingerprint must be 12 hex characters: hex so it can never contain the "|" the signature '
+            . 'parts are joined with, and truncated so the session payload does not carry 64 characters '
+            . 'per entry.'
+        );
+        $this->assertSame(
+            self::fingerprintSegment($keyA),
+            self::fingerprintSegment($keyB),
+            'Two shoppers judged against the same thresholds must share the fingerprint: it namespaces by '
+            . 'configuration, nothing else.'
+        );
+        $this->assertNotSame(
+            self::fingerprintSegment($keyA),
+            self::fingerprintSegment($keyStricter),
+            'Different applied thresholds must produce a different namespace.'
+        );
+        $this->assertSame(
+            self::signatureSegment($keyA),
+            self::signatureSegment($keyStricter),
+            'One address must project to one signature whatever the thresholds are: the fingerprint must '
+            . 'not leak into the signature.'
+        );
+    }
+
+    /**
+     * A PRIVACY assertion, not a formality: the cache instrumentation must never write a
+     * customer address to the log.
+     *
+     * A log file is not the customer session. It is readable by anyone with server access,
+     * it outlives the session, it is rotated into backups and shipped to aggregators, and
+     * under UK/EU data protection law a log full of shoppers' home addresses is a
+     * reportable problem. So the only things permitted on these lines are the outcome
+     * (hit/miss), the key family, and a truncated hash - enough to reconcile the drop in
+     * billable requests, and nothing that identifies anybody.
+     *
+     * Asserted as a WHITELIST (every debug record must match one exact shape) rather than
+     * as a blacklist of forbidden strings, because a blacklist only catches the leaks
+     * someone thought of. The explicit field-value checks are kept on top of it so a
+     * failure names the risk.
+     */
+    public function testCacheOutcomeLoggingNeverLeaksTheAddressOrTheSignature(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $rejectedAddress = [
+            'street' => ['12 Main Street'],
+            'city' => 'Navan',
+            'region' => 'Meath',
+            'postcode' => 'C15 XXXX',
+            'country_id' => 'IE',
+        ];
+
+        // A full realistic sequence: miss, lossy hit, miss, strict hit, and the unkeyed
+        // case (an address with nothing identifiable in it).
+        $this->validator->verifyAddress(self::ADDRESS);
+        $this->validator->verifyAddress(self::ADDRESS);
+        $this->validator->verifyAddress($rejectedAddress);
+        $this->validator->verifyAddress($rejectedAddress);
+        $this->validator->verifyAddress([]);
+
+        $records = $this->cacheLogRecords($this->shopper);
+        $this->assertSame(
+            [['miss', 'none'], ['hit', 'lossy'], ['miss', 'none'], ['hit', 'strict'], ['miss', 'none']],
+            array_map(static fn (array $r): array => [$r['outcome'], $r['family']], $records),
+            'Every cache lookup outcome must be logged exactly once, in order.'
+        );
+
+        // Nothing identifying may appear in ANY captured record, in any casing - the
+        // signature upper-cases its parts, so both forms are checked.
+        $forbidden = [
+            '1 High St', 'Flat 2', 'London', 'Greater London', 'SW1A 1AA', 'GB',
+            '12 Main Street', 'Navan', 'Meath', 'C15 XXXX', 'IE',
+        ];
+        foreach (array_keys($this->verdictStore()) as $key) {
+            // The namespaced key and the address signature inside it are PII too.
+            $forbidden[] = (string)$key;
+            $forbidden[] = self::signatureSegment((string)$key);
+        }
+
+        foreach ($this->logRecords($this->shopper) as $index => $record) {
+            $haystack = $record['message'] . ' ' . json_encode($record['context']);
+            foreach ($forbidden as $secret) {
+                $this->assertStringNotContainsStringIgnoringCase(
+                    $secret,
+                    $haystack,
+                    sprintf(
+                        'Log record #%d ("%s") contains "%s". The verify cache instrumentation must never '
+                        . 'write the address, any address field or the raw signature to the log: a log file '
+                        . 'outlives the session and is not the place for customer data.',
+                        $index,
+                        $record['message'],
+                        $secret
+                    )
+                );
+            }
+        }
+
+        // The hash is still useful: all events of ONE address share a token, and different
+        // addresses get different ones - which is the whole reconciliation the log is for.
+        $this->assertSame(
+            $records[0]['token'],
+            $records[1]['token'],
+            'The miss and the following hit for one address must share a token, or the log cannot be used '
+            . 'to reconcile hits against billable requests.'
+        );
+        $this->assertNotSame(
+            $records[0]['token'],
+            $records[2]['token'],
+            'Two different addresses must not share a token.'
+        );
+        $this->assertSame(
+            'unkeyed',
+            $records[4]['token'],
+            'An address with nothing identifiable in it has no cache key, and must be reported as unkeyed '
+            . 'rather than as a hash of an empty key.'
+        );
+    }
+
+    /**
+     * What makes the instrumentation meaningful rather than decorative:
+     *  - a MISS is logged before the billable request it accounts for, so misses and
+     *    invoice lines can be counted one-to-one;
+     *  - a HIT logs the family the verdict actually came from, which is only knowable
+     *    because the two cache reads are separate and the strict one runs first;
+     *  - a hit issues no request at all.
+     */
+    public function testCacheOutcomeLogsAreOrderedAndReportTheKeyFamilyTheVerdictCameFrom(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse()]);
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            ['log:miss', 'api', 'log:hit'],
+            $this->eventTimeline($this->shopper),
+            'A miss must be logged BEFORE the billable request it accounts for (so counting misses counts '
+            . 'the Loqate invoice), and a hit must issue no request at all.'
+        );
+
+        $records = $this->cacheLogRecords($this->shopper);
+        $this->assertSame(
+            [['miss', 'none'], ['hit', 'lossy']],
+            array_map(static fn (array $r): array => [$r['outcome'], $r['family']], $records),
+            'A miss has no key family yet; a success is cached under the LOSSY (county-blind) key, so the '
+            . 'hit must be reported as lossy.'
+        );
+
+        // A rejection is cached under the STRICT key, so its replay must say so - that is
+        // the distinction the split cache reads exist to make visible.
+        $rejecting = $this->createShopper();
+        $this->stubShopperResponses($rejecting, [self::rejectedResponse()]);
+        $rejecting['validator']->verifyAddress(self::ADDRESS);
+        $rejecting['validator']->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            [['miss', 'none'], ['hit', 'strict']],
+            array_map(
+                static fn (array $r): array => [$r['outcome'], $r['family']],
+                $this->cacheLogRecords($rejecting)
+            ),
+            'A replayed rejection must be reported as a STRICT hit: the family is what tells an operator '
+            . 'whether a hit came from the rejection key or the county-blind success key.'
         );
     }
 
@@ -1960,9 +2714,13 @@ class ValidatorVerifyCacheTest extends TestCase
     private function stubShopperResponses(array $shopper, array $responses): void
     {
         $requests = $shopper['requests'];
+        $events = $shopper['events'];
         $shopper['connector']->method('verifyAddress')->willReturnCallback(
-            static function ($params) use ($requests, $responses) {
+            static function ($params) use ($requests, $responses, $events) {
                 $requests[] = $params;
+                // Recorded on the same timeline as the log records, so their ORDER is
+                // assertable: a miss must be logged before the request it accounts for.
+                $events[] = ['type' => 'api', 'message' => '', 'context' => []];
 
                 return $responses[count($requests) - 1] ?? $responses[count($responses) - 1];
             }
@@ -2040,6 +2798,224 @@ class ValidatorVerifyCacheTest extends TestCase
     private function buildAddressSignature(array $address): string
     {
         return (string)$this->invokePrivate('buildAddressSignature', [$address]);
+    }
+
+    /**
+     * The [base address, edited address] pair pinning one entry of
+     * Validator::ADDRESS_MAPPING, failing loudly when a mapped field has no fixture.
+     *
+     * @param string $magentoField Magento address key from ADDRESS_MAPPING.
+     * @param string $loqateField Loqate request field it is mapped onto.
+     * @return array{0: array, 1: array}
+     */
+    private function mappedFieldFixture(string $magentoField, string $loqateField): array
+    {
+        $fixture = self::FIELD_EDIT_FIXTURES[$magentoField] ?? null;
+        if ($fixture === null) {
+            $this->fail(sprintf(
+                'Validator::ADDRESS_MAPPING maps "%s" onto the Loqate field %s, but no fixture in '
+                . 'self::FIELD_EDIT_FIXTURES pins it. Every field parseAddress() sends to Loqate must also '
+                . 'be projected into the verify cache keys: a field that reaches the request but not the '
+                . 'keys re-opens BOTH defects LOQ-16969 closed - the same address billed several times per '
+                . 'checkout, and a cached rejection the shopper can never clear by editing that field. Add '
+                . 'a base address plus an edit to "%s" here, then make sure both per-field tests pass.',
+                $magentoField,
+                $loqateField,
+                $magentoField
+            ));
+        }
+
+        return [$fixture['base'], array_merge($fixture['base'], $fixture['edit'])];
+    }
+
+    /**
+     * Precondition for the per-field tests: the edit must genuinely change the request
+     * Loqate is asked, otherwise "it must be verified again" would be asserting nothing.
+     *
+     * Established on two throwaway shoppers, one per address, so each issues its one
+     * billable call regardless of how the cache behaves - the assertion is about the
+     * payload only and cannot be satisfied or broken by the cache under test.
+     *
+     * @param array $base Address as first submitted.
+     * @param array $edited Same address with exactly one mapped field changed.
+     * @param string $loqateField Loqate field that change must show up in.
+     */
+    private function assertEditChangesTheLoqateRequest(array $base, array $edited, string $loqateField): void
+    {
+        $asBase = $this->createShopper();
+        $asEdited = $this->createShopper();
+        $this->stubShopperResponses($asBase, [self::acceptedResponse()]);
+        $this->stubShopperResponses($asEdited, [self::acceptedResponse()]);
+
+        $asBase['validator']->verifyAddress($base);
+        $asEdited['validator']->verifyAddress($edited);
+
+        $sentBase = (array)($asBase['requests'][0]['Addresses'][0] ?? []);
+        $sentEdited = (array)($asEdited['requests'][0]['Addresses'][0] ?? []);
+
+        $this->assertArrayHasKey(
+            $loqateField,
+            $sentBase,
+            sprintf('The fixture must actually populate %s in the Loqate request.', $loqateField)
+        );
+        $this->assertNotSame(
+            $sentBase[$loqateField] ?? null,
+            $sentEdited[$loqateField] ?? null,
+            sprintf(
+                'The fixture edit must change %s in the request sent to Loqate, or this test would pass '
+                . 'trivially for a field the cache legitimately cannot see.',
+                $loqateField
+            )
+        );
+    }
+
+    /**
+     * Read one of Validator's private constants, failing with an explanation when the
+     * production code no longer defines it.
+     *
+     * @param string $name Constant name, e.g. 'COUNTY_FIELD'.
+     * @return mixed
+     */
+    private function privateConstant(string $name)
+    {
+        $reflection = new ReflectionClass(Validator::class);
+        if (!$reflection->hasConstant($name)) {
+            $this->fail(sprintf(
+                'Validator::%s is not defined: the asymmetric cache keys must name the field they differ '
+                . 'by in exactly one place, so both key builders and these tests agree on it.',
+                $name
+            ));
+        }
+
+        return $reflection->getConstant($name);
+    }
+
+    /**
+     * Store configuration for the AVC threshold tests: the advanced-settings toggle plus
+     * whichever of the eight threshold fields the test cares about, under the real config
+     * paths the production code reads.
+     *
+     * @param bool $advanced Value of "show_advanced_avc_settings".
+     * @param array<string, string> $thresholds Threshold field name => value.
+     * @return array<string, string>
+     */
+    private static function thresholdConfig(bool $advanced, array $thresholds): array
+    {
+        $base = 'loqate_settings/verify_threshold_settings/';
+        $config = [$base . 'show_advanced_avc_settings' => $advanced ? '1' : '0'];
+        foreach ($thresholds as $field => $value) {
+            $config[$base . $field] = $value;
+        }
+
+        return $config;
+    }
+
+    /** The AVC-threshold fingerprint segment of a namespaced cache key. */
+    private static function fingerprintSegment(string $key): string
+    {
+        return explode('|', $key)[1] ?? '';
+    }
+
+    /** The address signature part of a namespaced cache key (store view and fingerprint stripped). */
+    private static function signatureSegment(string $key): string
+    {
+        return implode('|', array_slice(explode('|', $key), 2));
+    }
+
+    /**
+     * The ONE line shape the verify cache instrumentation may write: an outcome, a key
+     * family and a 12-hex hash (or "unkeyed"). Anything else - an address, a signature, a
+     * store id - fails to match, which is what makes this a whitelist rather than a
+     * guess at what a leak would look like.
+     */
+    private const CACHE_LOG_PATTERN =
+        '/^Loqate verify cache (hit|miss) \[family=(strict|lossy|none), key=([0-9a-f]{12}|unkeyed)\]$/';
+
+    /**
+     * The cache-outcome debug records of a shopper, parsed, asserting on the way that each
+     * one matches the whitelisted shape and carries no log context.
+     *
+     * @param array $shopper Shopper harness from createShopper().
+     * @return array<int, array{outcome: string, family: string, token: string}>
+     */
+    private function cacheLogRecords(array $shopper): array
+    {
+        $parsed = [];
+        foreach ($this->logRecords($shopper, 'debug') as $index => $record) {
+            $this->assertMatchesRegularExpression(
+                self::CACHE_LOG_PATTERN,
+                $record['message'],
+                sprintf(
+                    'Debug record #%d ("%s") is not one of the permitted cache-outcome lines. These records '
+                    . 'may contain the outcome, the key family and a truncated hash only - never the '
+                    . 'address and never the signature.',
+                    $index,
+                    $record['message']
+                )
+            );
+            $this->assertSame(
+                [],
+                $record['context'],
+                sprintf(
+                    'Debug record #%d carries a log context. The context is serialised into the log file '
+                    . 'like the message, so it must not become a side channel for customer data.',
+                    $index
+                )
+            );
+
+            preg_match(self::CACHE_LOG_PATTERN, $record['message'], $matches);
+            $parsed[] = ['outcome' => $matches[1], 'family' => $matches[2], 'token' => $matches[3]];
+        }
+
+        return $parsed;
+    }
+
+    /**
+     * Every log record the Validator emitted for a shopper, in order.
+     *
+     * @param array $shopper Shopper harness from createShopper().
+     * @param string|null $level Only records of this level ('debug', 'info'), or null for all.
+     * @return array<int, array{type: string, message: string, context: array}>
+     */
+    private function logRecords(array $shopper, ?string $level = null): array
+    {
+        $records = array_values(array_filter(
+            iterator_to_array($shopper['events']),
+            static fn (array $event): bool => $event['type'] !== 'api'
+                && ($level === null || $event['type'] === $level)
+        ));
+
+        return $records;
+    }
+
+    /**
+     * The ordered timeline of what the Validator emitted, as compact tokens: 'log:hit',
+     * 'log:miss' and 'api' for a billable request. Lets the tests assert that a miss is
+     * logged BEFORE the request it accounts for, which is what makes the log usable to
+     * reconcile the Loqate invoice.
+     *
+     * @param array $shopper Shopper harness from createShopper().
+     * @return string[]
+     */
+    private function eventTimeline(array $shopper): array
+    {
+        $timeline = [];
+        foreach ($shopper['events'] as $event) {
+            if ($event['type'] === 'api') {
+                $timeline[] = 'api';
+                continue;
+            }
+
+            if ($event['type'] !== 'debug') {
+                continue;
+            }
+
+            $timeline[] = preg_match('/cache (hit|miss) /', $event['message'], $matches)
+                ? 'log:' . $matches[1]
+                : 'log:' . $event['message'];
+        }
+
+        return $timeline;
     }
 
     /**
