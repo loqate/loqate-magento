@@ -26,7 +26,7 @@ use ReflectionProperty;
  * statements across five classes: Plugin\Frontend\CheckoutShippingInformation.php:32,
  * Plugin\Frontend\CheckoutBillingAddress.php:34 (which savePaymentInformation replays
  * at place order, so that one statement runs twice in a checkout),
- * Observer\QuoteSubmitBefore.php:60 and :84,
+ * Observer\QuoteSubmitBefore.php:85 and :109,
  * Plugin\Frontend\CustomerAccountAddress.php:37 and
  * Plugin\Admin\ValidateAddress.php:42. A single checkout of a single address therefore
  * invokes it 3-5 times depending on Magento version and checkout front-end, and
@@ -35,7 +35,7 @@ use ReflectionProperty;
  * "captured_addresses", matches solely addresses picked from the Loqate Capture
  * lookup, so a typed address is re-verified - and re-billed - on every one of those
  * paths. (The two verifyMultipleAddresses() sites, Plugin\Admin\OrderSave.php:49 and
- * Plugin\Admin\ValidateImportAddress.php:38, are deliberately NOT covered by this
+ * Plugin\Admin\ValidateImportAddress.php:53, are deliberately NOT covered by this
  * cache - LOQ-16976 - and so are not covered here either.)
  *
  * The contract asserted here: identical addresses are verified once per session
@@ -1462,7 +1462,7 @@ class ValidatorVerifyCacheTest extends TestCase
      *  - the plain POST shape: street is a real ARRAY and the county is a 'region'
      *    NAME (self::ADDRESS, used by most tests here);
      *  - the quote paths (CheckoutShippingInformation.php:32,
-     *    CheckoutBillingAddress.php:34, QuoteSubmitBefore.php:60/:84) pass
+     *    CheckoutBillingAddress.php:34, QuoteSubmitBefore.php:85/:109) pass
      *    Quote\Address::getData(), and AbstractAddress::setData() has already run the
      *    multiline street attribute through trim(implode("\n", $value)), so street is
      *    a NEWLINE-SEPARATED STRING and the county is a 'region_id' that
