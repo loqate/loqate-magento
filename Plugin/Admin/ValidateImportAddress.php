@@ -117,11 +117,11 @@ class ValidateImportAddress extends AbstractPlugin
                     }
                 }
             } catch (\InvalidArgumentException $exception) {
-                // Deliberately NOT swallowed. On this path an \InvalidArgumentException can
-                // only be ShopperScopedAddressStores::assertEnrolled() reporting that a
-                // session store was reached without being enrolled in the shopper-ownership
-                // flush - a programming error a developer has to fix, not a runtime failure
-                // to absorb.
+                // Deliberately NOT swallowed. The \InvalidArgumentException this is FOR is
+                // ShopperScopedAddressStores::assertEnrolled() reporting that a session store
+                // was reached without being enrolled in the shopper-ownership flush - a
+                // programming error a developer has to fix, not a runtime failure to absorb.
+                // It is not provably the only source; see the third paragraph.
                 //
                 // It cannot be one of this module's deserialisation failures: the serializer
                 // forwards to json_decode(), and every call site that unserialises a cache

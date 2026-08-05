@@ -1317,6 +1317,80 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
+     * A verdict with NO stamp at all is discarded too, not treated as current.
+     *
+     * The wrong-stamp case above is caught by any comparison; an ABSENT stamp is caught only
+     * because the default supplied for a missing key cannot equal the current version.
+     * Relaxing that default would silently admit every unstamped entry - exactly the set the
+     * deploy before the stamp wrote.
+     */
+    public function testACachedVerdictWithNoKeySchemeStampIsDiscardedRatherThanReplayed(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $store = $this->verdictStore();
+        $key = (string)array_key_first($store);
+        // Exactly what the deploy before the stamp wrote.
+        $store[$key] = json_encode(['error' => false]);
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $result = $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'An UNSTAMPED verdict must be re-verified: nothing establishes that the key it is filed under '
+            . 'still names this address under the current key scheme.'
+        );
+        $this->assertTrue($result['error'], 'And the live verdict must be the one returned.');
+    }
+
+    /**
+     * A BATCH-shaped entry must not be readable as a single-address verdict.
+     *
+     * The two caches live in separate session attributes, and this is the second, independent
+     * guard behind that separation: the payload shapes differ ("error" here, "valid" there), so
+     * a batch verdict degrades to a miss rather than answering an AVC lookup. It has to, because
+     * the two verdicts answer different questions - the AVC thresholds versus the address
+     * quality index - so replaying one for the other reports a verdict the merchant's
+     * configuration never produced.
+     *
+     * The plant carries the CURRENT key-scheme stamp on purpose. Stamp-less, the stamp check
+     * would reject it first and this test would pass whether or not the shape guard existed -
+     * the mistake that left the batch cache's equivalent test defending nothing once both
+     * caches gained a stamp. Stamped, the shape is the only thing left that can reject it.
+     */
+    public function testABatchShapedVerdictPlantedInTheSingleAddressStoreIsNotReadAsAVerdict(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $store = $this->verdictStore();
+        $key = (string)array_key_first($store);
+        $store[$key] = json_encode([
+            'valid' => true,
+            'schema' => $this->verifyKeySchemaVersion(),
+        ]);
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $result = $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'A verdict in the BATCH cache\'s shape must not satisfy a single-address lookup: it was judged '
+            . 'against the address quality index, not the AVC thresholds, so reading it here would let an '
+            . 'AQI verdict silently satisfy an AVC check the merchant configured.'
+        );
+        $this->assertTrue(
+            $result['error'],
+            'And the LIVE verdict must be returned, so the planted entry can be seen not to have answered '
+            . 'the lookup rather than merely to have agreed with it.'
+        );
+    }
+
+    /**
      * Two different region records on an otherwise identical address are two different
      * addresses: each must be verified, and each gets its own verdict.
      */

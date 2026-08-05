@@ -3,6 +3,7 @@
 namespace Loqate\ApiIntegration\Model\AdminNotification;
 
 use Loqate\ApiIntegration\Helper\Data;
+use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Framework\Notification\MessageInterface;
 use Magento\Store\Model\StoreManagerInterface;
 
@@ -51,14 +52,19 @@ class UnverifiedAdminOrderMessage implements MessageInterface
     /** @var StoreManagerInterface */
     private $storeManager;
 
+    /** @var Logger */
+    private $logger;
+
     /**
      * @param Data $helper
      * @param StoreManagerInterface $storeManager
+     * @param Logger $logger
      */
-    public function __construct(Data $helper, StoreManagerInterface $storeManager)
+    public function __construct(Data $helper, StoreManagerInterface $storeManager, Logger $logger)
     {
         $this->helper = $helper;
         $this->storeManager = $storeManager;
+        $this->logger = $logger;
     }
 
     /**
@@ -153,13 +159,24 @@ class UnverifiedAdminOrderMessage implements MessageInterface
     }
 
     /**
-     * Store views to evaluate, or [null] meaning "read at the current scope".
+     * ACTIVE store views to evaluate, or [null] meaning "read at the current scope".
      *
-     * Falls back to the current scope when the store list cannot be read. getStores() touches
-     * the database, and a system message is rendered on admin pages that must not be brought
-     * down by it - including, in the worst case, the very pages an admin would use to fix a
-     * broken store table. A missed notice is a far better failure than an unusable admin, and
-     * the fallback still catches the default-scope case, which is the common one.
+     * Only active stores. An INACTIVE store view cannot take an order, so warning that its
+     * orders go unverified is a warning about something that cannot happen - and this notice is
+     * MAJOR severity, so spurious entries are what teach an admin to dismiss it unread.
+     *
+     * Falls back to the current scope if the store list cannot be read at all. Not because that
+     * read is expensive - getStores() resolves the memoised 'scopes' app config, normally from
+     * the config cache, and is already loaded during bootstrap, so an install where it fails is
+     * an install whose admin cannot render anyway - but because a config NOTICE has no business
+     * being the thing that turns a degraded admin into an unusable one. The fallback still
+     * catches the default-scope case, which is the common one.
+     *
+     * Catches \Throwable, not \Exception: a TypeError or an Error from a third-party store
+     * implementation would otherwise escape, which is the same failure the narrower catch was
+     * written to avoid. Observer\QuoteSubmitBefore::isAdminArea() catches \Throwable for this
+     * same reason. Logged so a silent downgrade to the scope-blind read - the very thing this
+     * method exists to remove - cannot pass unnoticed.
      *
      * @return array<int|null>
      */
@@ -168,9 +185,19 @@ class UnverifiedAdminOrderMessage implements MessageInterface
         try {
             $storeIds = [];
             foreach ($this->storeManager->getStores() as $store) {
+                if (method_exists($store, 'getIsActive') && !$store->getIsActive()) {
+                    continue;
+                }
+
                 $storeIds[] = (int)$store->getId();
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            $this->logger->info(
+                'Loqate: could not read the store list to check whether admin order create is verified; '
+                . 'falling back to the current scope, so a per-store-view setting may go unreported. '
+                . $e->getMessage()
+            );
+
             return [null];
         }
 

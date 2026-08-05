@@ -45,9 +45,10 @@ use ReflectionProperty;
  * requests. Its design deliberately differs from verifyAddress()' cache in two ways, each
  * pinned below:
  *  - a PHYSICALLY SEPARATE session attribute (BATCH_VERIFY_CACHE_SESSION_KEY) with a
- *    different stored shape ({"valid":true} versus {"error":false}), because these verdicts
- *    come from the address quality index (checkQualityIndex()) and the other cache's from
- *    the AVC thresholds - one must never answer the other's lookup, see
+ *    different stored shape - the verdict field is "valid" here and "error" there, both
+ *    alongside the shared "schema" stamp - because these verdicts come from the address
+ *    quality index (checkQualityIndex()) and the other cache's from the AVC thresholds - one
+ *    must never answer the other's lookup, see
  *    testTheTwoVerdictCachesAreInvisibleToEachOtherInBothDirections();
  *  - only PASSING verdicts are stored, see testAFailingVerdictIsNeverCached().
  *
@@ -132,11 +133,18 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     private const BATCH_VERIFY_CACHE_SESSION_KEY = 'loqate_verified_batch_addresses';
 
     /**
-     * Key-scheme version the SINGLE-address cache stamps into every verdict it writes.
+     * Key-scheme version BOTH verdict caches stamp into every verdict they write.
      *
-     * Mirrors Validator::VERIFY_KEY_SCHEMA_VERSION. Asserted here rather than ignored so
-     * that stamping the batch cache too - which would make the two payload shapes differ
-     * only by their verdict field name - cannot happen without this test noticing.
+     * Mirrors Validator::VERIFY_KEY_SCHEMA_VERSION deliberately rather than reading it by
+     * reflection: a bump to the production constant must FAIL here, because bumping it
+     * invalidates every verdict in a live session and that is a decision to make on purpose,
+     * not one to have absorbed silently by a test that follows along.
+     *
+     * The two payload shapes now differ only by their verdict field name - 'valid' for the
+     * batch cache, 'error' for the single-address one - which remains sufficient, and is pinned
+     * from both sides by the two "planted in the other store" tests. Those tests stamp their
+     * plants for that reason: unstamped, the stamp check rejects them first and the shape guard
+     * they exist to defend is never reached.
      */
     private const VERIFY_KEY_SCHEMA_VERSION = 1;
 
@@ -1560,10 +1568,17 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     public function testASingleAddressVerdictPlantedInTheBatchStoreIsNotReadAsAVerdict(): void
     {
         // Earn a real batch cache key, then overwrite its value with the other cache's shape.
+        //
+        // The planted entry carries the CURRENT key-scheme stamp deliberately. Without it the
+        // stamp check rejects the entry first and this test passes whether or not the shape
+        // guard exists - which is exactly what happened when the batch cache gained a stamp:
+        // deleting the shape check left this test green, so the guard this test exists to
+        // defend was undefended. Stamping the plant leaves the shape as the ONLY thing that can
+        // reject it.
         $this->validator->verifyMultipleAddresses([self::ADDRESS], false);
         $store = $this->batchStore($this->shopper);
         $key = (string)array_key_first($store);
-        $store[$key] = json_encode(['error' => false]);
+        $store[$key] = json_encode(['error' => false, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION]);
         $this->sessionStore[self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
         $this->validator->verifyMultipleAddresses([self::ADDRESS], false);
@@ -2129,6 +2144,39 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'And the LIVE verdict must be returned, so the stale entry can be seen not to have answered '
             . 'the lookup rather than merely to have agreed with it.'
         );
+    }
+
+    /**
+     * A batch verdict with NO stamp at all is discarded too, not treated as current.
+     *
+     * Separate from the wrong-stamp case because they fail differently in code: the wrong-stamp
+     * case is caught by any comparison, while an ABSENT stamp is caught only because the default
+     * supplied for a missing key cannot equal the current version. Relaxing that default -
+     * '?? null' to '?? self::VERIFY_KEY_SCHEMA_VERSION' - would silently admit every unstamped
+     * entry, which is precisely the set written by the deploy before the stamp existed.
+     */
+    public function testABatchVerdictWithNoKeySchemeStampIsDiscardedRatherThanReplayed(): void
+    {
+        $address = $this->distinctAddress(1);
+
+        $this->validator->verifyMultipleAddresses([$address], false);
+
+        $store = $this->batchStore($this->shopper);
+        $key = (string)array_key_first($store);
+        // Exactly what the deploy before the stamp wrote: a bare pass.
+        $store[$key] = json_encode(['valid' => true]);
+        $this->shopper['session'][self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $verdicts = $this->validator->verifyMultipleAddresses([$address], false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'An UNSTAMPED batch verdict must be re-verified: it was written before the key scheme was '
+            . 'recorded, so nothing establishes that its key still names this address. Admitting it would '
+            . 'be a false ACCEPT, since this store holds nothing but passes.'
+        );
+        $this->assertSame([0 => true], $verdicts, 'And the live verdict must be the one returned.');
     }
 
     /**

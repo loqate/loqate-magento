@@ -32,6 +32,16 @@ predate it and are described by their git tags and commit history.
   admin field, so this only affects installs that wrote it via a data patch,
   `config:set`, or direct SQL.
 
+- **A customer import can now fail where it previously continued silently.** The
+  import plugin used to absorb every exception and hand back an untouched result,
+  which meant a misconfiguration inside the module surfaced as an import reporting
+  no address errors at all — indistinguishable from a clean file. It now lets
+  `\InvalidArgumentException` through. In practice that is the module reporting a
+  programming error, but a core or third-party `\InvalidArgumentException` raised
+  during verification will now fail the import rather than pass it silently. Genuine
+  runtime faults — transport, connector, unreadable source file — are still absorbed
+  as before.
+
 ### Fixed
 
 - Repeated billable `/Cleansing/International/Batch` requests for the same address
@@ -59,4 +69,4 @@ predate it and are described by their git tags and commit history.
   `loqate_billing_errors` are still unbounded session stores and are not covered by
   the shopper-change flush (LOQ-17149).
 - The shopper-change flush scopes by **customer** identity, so an admin-user swap
-  within one browser session is not covered.
+  within one browser session is not covered. Decided as part of LOQ-17149.

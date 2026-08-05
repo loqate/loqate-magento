@@ -11,13 +11,14 @@ if (!interface_exists(\Magento\Store\Model\StoreManagerInterface::class, false))
     interface StoreManagerInterface
     {
         /**
-         * Declared without a return type on purpose: the real interface returns
-         * StoreInterface[] and a narrower signature here would not be satisfiable by the
-         * lightweight doubles the unit tests use.
+         * Signature copied from the framework's, including the absence of a native return type
+         * and both default values. It is NOT loosened for the tests' benefit: a stub that
+         * diverges from the interface it stands in for lets a real incompatibility pass a green
+         * suite, which is the one thing a stub must never do.
          *
          * @param bool $withDefault
          * @param bool $codeKey
-         * @return array
+         * @return \Magento\Store\Api\Data\StoreInterface[]
          */
         public function getStores($withDefault = false, $codeKey = false);
     }

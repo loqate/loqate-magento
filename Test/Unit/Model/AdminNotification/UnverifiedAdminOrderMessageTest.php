@@ -3,6 +3,7 @@
 namespace Loqate\ApiIntegration\Test\Unit\Model\AdminNotification;
 
 use Loqate\ApiIntegration\Helper\Data;
+use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Model\AdminNotification\UnverifiedAdminOrderMessage;
 use Magento\Framework\Notification\MessageInterface;
 use Magento\Store\Model\StoreManagerInterface;
@@ -39,6 +40,9 @@ class UnverifiedAdminOrderMessageTest extends TestCase
      * @var array<int>|null
      */
     private ?array $storeIds = [1];
+
+    /** @var array<int> Store ids the store manager reports as inactive. */
+    private array $inactiveStoreIds = [];
 
     /**
      * Every combination of the two toggles, for both groups, with whether the notice must show.
@@ -250,6 +254,34 @@ class UnverifiedAdminOrderMessageTest extends TestCase
     }
 
     /**
+     * An INACTIVE store view in the combination must NOT raise the notice.
+     *
+     * A disabled store view cannot take an order, so there are no unverified orders to warn
+     * about. This notice is MAJOR severity, and a MAJOR notice about something that cannot
+     * happen is what teaches an admin to dismiss the next one unread.
+     */
+    public function testAnInactiveStoreViewInTheCombinationDoesNotRaiseTheNotice(): void
+    {
+        $this->config = [
+            'loqate_settings/address_settings/enable_create_order_admin' => '0',
+            'loqate_settings/address_settings/enable_checkout' => '0',
+        ];
+        $this->storeConfig = [
+            2 => ['loqate_settings/address_settings/enable_checkout' => '1'],
+        ];
+        $this->storeIds = [1, 2];
+        $this->inactiveStoreIds = [2];
+
+        $this->assertFalse(
+            $this->message()->isDisplayed(),
+            'Only the disabled store view is in the combination, and it cannot take an order, so there is '
+            . 'nothing to warn about. Compare '
+            . 'testAStoreViewOverrideRaisesTheNoticeEvenWhenTheDefaultScopeLooksFine(), which is the same '
+            . 'configuration with the store view enabled and MUST warn.'
+        );
+    }
+
+    /**
      * An unreadable store list falls back to the current scope rather than throwing.
      *
      * getStores() touches the database, and a system message renders on admin pages that must
@@ -297,18 +329,27 @@ class UnverifiedAdminOrderMessageTest extends TestCase
         } else {
             $stores = [];
             foreach ($this->storeIds as $storeId) {
-                $store = new class ($storeId) {
+                $store = new class ($storeId, !in_array($storeId, $this->inactiveStoreIds, true)) {
                     /** @var int */
                     private $id;
 
-                    public function __construct(int $id)
+                    /** @var bool */
+                    private $active;
+
+                    public function __construct(int $id, bool $active)
                     {
                         $this->id = $id;
+                        $this->active = $active;
                     }
 
                     public function getId(): int
                     {
                         return $this->id;
+                    }
+
+                    public function getIsActive(): bool
+                    {
+                        return $this->active;
                     }
                 };
                 $stores[] = $store;
@@ -316,6 +357,6 @@ class UnverifiedAdminOrderMessageTest extends TestCase
             $storeManager->method('getStores')->willReturn($stores);
         }
 
-        return new UnverifiedAdminOrderMessage($helper, $storeManager);
+        return new UnverifiedAdminOrderMessage($helper, $storeManager, $this->createMock(Logger::class));
     }
 }
