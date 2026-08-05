@@ -5,6 +5,7 @@ namespace Loqate\ApiIntegration\Test\Unit\Model\AdminNotification;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Model\AdminNotification\UnverifiedAdminOrderMessage;
 use Magento\Framework\Notification\MessageInterface;
+use Magento\Store\Model\StoreManagerInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -24,8 +25,20 @@ use PHPUnit\Framework\TestCase;
  */
 class UnverifiedAdminOrderMessageTest extends TestCase
 {
-    /** @var array<string, mixed> Config values keyed by path, read by the Data stub. */
+    /** @var array<string, mixed> Default-scope config values keyed by path, read by the Data stub. */
     private array $config = [];
+
+    /** @var array<int, array<string, mixed>> Per-store-view overrides, keyed by store id then path. */
+    private array $storeConfig = [];
+
+    /**
+     * Store view ids the store manager reports, or null to make getStores() throw.
+     *
+     * Defaults to a single store view so the combination tests read as "one ordinary store".
+     *
+     * @var array<int>|null
+     */
+    private ?array $storeIds = [1];
 
     /**
      * Every combination of the two toggles, for both groups, with whether the notice must show.
@@ -181,6 +194,85 @@ class UnverifiedAdminOrderMessageTest extends TestCase
     }
 
     /**
+     * A per-STORE-VIEW enable_checkout over a default of off must still raise the notice.
+     *
+     * This is the case a single read at the current scope cannot see. enable_checkout is
+     * showInStore, enable_create_order_admin is showInDefault only, and in the admin area a
+     * scope-less read resolves to the DEFAULT store - so a merchant who switched checkout
+     * verification on for one store view, with the admin toggle off, has orders going
+     * unverified and would have been told nothing.
+     */
+    public function testAStoreViewOverrideRaisesTheNoticeEvenWhenTheDefaultScopeLooksFine(): void
+    {
+        $this->config = [
+            // Default scope: checkout off, so the pair does NOT trip here.
+            'loqate_settings/address_settings/enable_create_order_admin' => '0',
+            'loqate_settings/address_settings/enable_checkout' => '0',
+        ];
+        // Store view 2 turns checkout verification on, which completes the combination.
+        $this->storeConfig = [
+            2 => ['loqate_settings/address_settings/enable_checkout' => '1'],
+        ];
+        $this->storeIds = [1, 2];
+
+        $this->assertTrue(
+            $this->message()->isDisplayed(),
+            'A store view in the unverified combination must raise the notice: one store view is one set '
+            . 'of orders going unverified. If this fails, the notice is blind to per-store-view '
+            . 'configuration and stays silent in a case it exists for.'
+        );
+        $this->assertStringContainsString(
+            'Address Settings',
+            (string)$this->message()->getText(),
+            'And the affected group must still be named.'
+        );
+    }
+
+    /**
+     * The group is named ONCE however many store views trip it.
+     *
+     * Without the early exit, three affected store views would produce "Address Settings,
+     * Address Settings, Address Settings".
+     */
+    public function testAGroupIsNamedOnceHoweverManyStoreViewsTripIt(): void
+    {
+        $this->config = [
+            'loqate_settings/address_settings/enable_create_order_admin' => '0',
+            'loqate_settings/address_settings/enable_checkout' => '1',
+        ];
+        $this->storeIds = [1, 2, 3];
+
+        $this->assertSame(
+            1,
+            substr_count((string)$this->message()->getText(), 'Address Settings'),
+            'One group, named once, however many store views are in the combination.'
+        );
+    }
+
+    /**
+     * An unreadable store list falls back to the current scope rather than throwing.
+     *
+     * getStores() touches the database, and a system message renders on admin pages that must
+     * stay usable - including the pages an admin would use to repair a broken store table. A
+     * missed notice beats an unusable admin, and the fallback still catches the default-scope
+     * case, which is the common one.
+     */
+    public function testAnUnreadableStoreListFallsBackToTheCurrentScope(): void
+    {
+        $this->config = [
+            'loqate_settings/address_settings/enable_create_order_admin' => '0',
+            'loqate_settings/address_settings/enable_checkout' => '1',
+        ];
+        $this->storeIds = null;
+
+        $this->assertTrue(
+            $this->message()->isDisplayed(),
+            'With the store list unreadable, the default-scope combination must still be detected and the '
+            . 'notice must not throw out of an admin page render.'
+        );
+    }
+
+    /**
      * The message under test, reading config through a stub of the module's own helper.
      *
      * @return UnverifiedAdminOrderMessage
@@ -191,7 +283,39 @@ class UnverifiedAdminOrderMessageTest extends TestCase
         $helper->method('getConfigValue')->willReturnCallback(
             fn ($configPath) => $this->config[$configPath] ?? null
         );
+        // Falls back to the default-scope value when a store has no override of its own, which
+        // is what Magento's config inheritance does.
+        $helper->method('getConfigValueForStore')->willReturnCallback(
+            fn ($configPath, $storeId) => $this->storeConfig[$storeId][$configPath]
+                ?? $this->config[$configPath]
+                ?? null
+        );
 
-        return new UnverifiedAdminOrderMessage($helper);
+        $storeManager = $this->createMock(StoreManagerInterface::class);
+        if ($this->storeIds === null) {
+            $storeManager->method('getStores')->willThrowException(new \RuntimeException('no store table'));
+        } else {
+            $stores = [];
+            foreach ($this->storeIds as $storeId) {
+                $store = new class ($storeId) {
+                    /** @var int */
+                    private $id;
+
+                    public function __construct(int $id)
+                    {
+                        $this->id = $id;
+                    }
+
+                    public function getId(): int
+                    {
+                        return $this->id;
+                    }
+                };
+                $stores[] = $store;
+            }
+            $storeManager->method('getStores')->willReturn($stores);
+        }
+
+        return new UnverifiedAdminOrderMessage($helper, $storeManager);
     }
 }

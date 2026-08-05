@@ -4,6 +4,7 @@ namespace Loqate\ApiIntegration\Model\AdminNotification;
 
 use Loqate\ApiIntegration\Helper\Data;
 use Magento\Framework\Notification\MessageInterface;
+use Magento\Store\Model\StoreManagerInterface;
 
 /**
  * Admin system message for the one toggle combination that verifies nothing.
@@ -47,12 +48,17 @@ class UnverifiedAdminOrderMessage implements MessageInterface
     /** @var Data */
     private $helper;
 
+    /** @var StoreManagerInterface */
+    private $storeManager;
+
     /**
      * @param Data $helper
+     * @param StoreManagerInterface $storeManager
      */
-    public function __construct(Data $helper)
+    public function __construct(Data $helper, StoreManagerInterface $storeManager)
     {
         $this->helper = $helper;
+        $this->storeManager = $storeManager;
     }
 
     /**
@@ -107,6 +113,15 @@ class UnverifiedAdminOrderMessage implements MessageInterface
     /**
      * Human-readable names of the groups currently in the unverified combination.
      *
+     * EVALUATED PER STORE VIEW, not once at the current scope, and that is not incidental.
+     * enable_checkout is showInStore="1" (etc/adminhtml/system.xml) so a merchant can switch
+     * it on for one store view over a default of off, while enable_create_order_admin is
+     * showInDefault only. Data::getConfigValue() reads SCOPE_STORE with no store, which in the
+     * admin area resolves to the DEFAULT store - so a single read would miss exactly the
+     * configuration that produces the gap, and the notice would stay silent in the case it
+     * exists for. One store view in the combination is one set of orders going unverified, so
+     * any store tripping it raises the notice.
+     *
      * @return string[]
      */
     private function affectedGroups(): array
@@ -114,20 +129,51 @@ class UnverifiedAdminOrderMessage implements MessageInterface
         $affected = [];
 
         foreach (self::AFFECTED_GROUPS as $group) {
-            $adminEnabled = $this->helper->getConfigValue(
-                'loqate_settings/' . $group . '/enable_create_order_admin'
-            );
-            $checkoutEnabled = $this->helper->getConfigValue(
-                'loqate_settings/' . $group . '/enable_checkout'
-            );
+            $adminPath = 'loqate_settings/' . $group . '/enable_create_order_admin';
+            $checkoutPath = 'loqate_settings/' . $group . '/enable_checkout';
 
-            // Compared as ints because these are Magento yes/no selects, which arrive as the
-            // strings '0' and '1' from core_config_data but as ints from a data patch.
-            if ((int)$adminEnabled === 0 && (int)$checkoutEnabled === 1) {
-                $affected[] = $group === 'address_settings' ? 'Address Settings' : 'Phone Settings';
+            foreach ($this->storeIds() as $storeId) {
+                $adminEnabled = $storeId === null
+                    ? $this->helper->getConfigValue($adminPath)
+                    : $this->helper->getConfigValueForStore($adminPath, $storeId);
+                $checkoutEnabled = $storeId === null
+                    ? $this->helper->getConfigValue($checkoutPath)
+                    : $this->helper->getConfigValueForStore($checkoutPath, $storeId);
+
+                // Compared as ints because these are Magento yes/no selects, which arrive as
+                // the strings '0' and '1' from core_config_data but as ints from a data patch.
+                if ((int)$adminEnabled === 0 && (int)$checkoutEnabled === 1) {
+                    $affected[] = $group === 'address_settings' ? 'Address Settings' : 'Phone Settings';
+                    break;
+                }
             }
         }
 
         return $affected;
+    }
+
+    /**
+     * Store views to evaluate, or [null] meaning "read at the current scope".
+     *
+     * Falls back to the current scope when the store list cannot be read. getStores() touches
+     * the database, and a system message is rendered on admin pages that must not be brought
+     * down by it - including, in the worst case, the very pages an admin would use to fix a
+     * broken store table. A missed notice is a far better failure than an unusable admin, and
+     * the fallback still catches the default-scope case, which is the common one.
+     *
+     * @return array<int|null>
+     */
+    private function storeIds(): array
+    {
+        try {
+            $storeIds = [];
+            foreach ($this->storeManager->getStores() as $store) {
+                $storeIds[] = (int)$store->getId();
+            }
+        } catch (\Exception $e) {
+            return [null];
+        }
+
+        return $storeIds === [] ? [null] : $storeIds;
     }
 }
