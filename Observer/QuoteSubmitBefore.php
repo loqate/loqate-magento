@@ -150,8 +150,7 @@ class QuoteSubmitBefore implements ObserverInterface
      * loqate_settings/*_settings/enable_create_order_admin toggles, and the AVC check no
      * longer applies on that path at all.
      *
-     * The sharp case, so nobody discovers it in production: with
-     * loqate_settings/address_settings/enable_create_order_admin OFF and
+     * The sharp case: with loqate_settings/address_settings/enable_create_order_admin OFF and
      * loqate_settings/address_settings/enable_checkout ON, this observer used to be the ONLY
      * thing verifying an admin-created order's addresses - and now NOTHING does. The same
      * holds for the matching pair of phone toggles. The blanket early return is nevertheless
@@ -159,6 +158,13 @@ class QuoteSubmitBefore implements ObserverInterface
      * order create not to be verified, and honouring it through one setting is the intended
      * reading of those toggles, whereas the previous behaviour made an admin-side feature
      * switch silently overridable by a checkout-side one.
+     *
+     * That case is NOT documented only here, because a merchant does not read docblocks and
+     * they are the only person who can act on it. Model\AdminNotification\
+     * UnverifiedAdminOrderMessage raises an admin system message naming the affected settings
+     * whenever it detects the combination, and CHANGELOG.md records it as an action-required
+     * behaviour change. If the toggles or this early return are reworked, those two have to
+     * move with it or the warning becomes a lie.
      *
      * HOW IT FAILS: State::getAreaCode() throws when no area code has been set yet, and
      * this method then answers "not admin", so verification RUNS. That direction is chosen
