@@ -123,12 +123,19 @@ class ValidateImportAddress extends AbstractPlugin
                 // flush - a programming error a developer has to fix, not a runtime failure
                 // to absorb.
                 //
-                // It cannot be a deserialisation failure: the serializer forwards to
-                // json_decode() and every call site that unserialises a cache entry
-                // (Validator::getCachedVerifyResult(), getCachedBatchVerifyResult(),
-                // checkForCapturedAddress() and Controller::storeCapturedAddress()) already
-                // catches \InvalidArgumentException itself and degrades to a cache miss, so
-                // a malformed entry never reaches this far.
+                // It cannot be one of this module's deserialisation failures: the serializer
+                // forwards to json_decode(), and every call site that unserialises a cache
+                // entry - Validator::getCachedVerifyResult(), getCachedBatchVerifyResult()
+                // and checkForCapturedAddress(), plus Controller::capturedEntrySignature() -
+                // already catches \InvalidArgumentException itself and degrades to a cache
+                // miss, so a malformed entry never reaches this far.
+                //
+                // It could still be a core or third-party \InvalidArgumentException raised
+                // inside the try, which this now turns into a failed import where it would
+                // previously have degraded silently. That is the safe direction - loud, not
+                // wrong - but the premise is worth removing rather than arguing: giving
+                // assertEnrolled() a module-specific exception subclass and catching THAT
+                // would make this narrowing exact instead of merely well-reasoned.
                 //
                 // This plugin has no logger - its base class serves ten plugins and does not
                 // carry one - so swallowing here would leave no trace anywhere and silently

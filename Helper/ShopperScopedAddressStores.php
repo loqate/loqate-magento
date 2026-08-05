@@ -109,7 +109,9 @@ use Magento\Customer\Model\Session;
  *
  * THE MODULE HAS OTHER SESSION ATTRIBUTES, and they are NOT enrolled here - named so the
  * next reader does not conclude there are only three. Out of scope for LOQ-16978, which is
- * about the ADDRESS stores; each needs its own assessment before it is added:
+ * about the ADDRESS stores. THIS IS TRACKED, NOT ACCEPTED: enrolling them is LOQ-17149,
+ * which also covers reducing the PII the first two hold and deciding the admin-identity gap
+ * below. Each needs its own assessment before it is added:
  *  - 'loqate_email' and 'loqate_phone', written by Plugin\AbstractPlugin::shouldVerify().
  *    Unbounded lists of raw email addresses and phone numbers that skip a billable
  *    verifyEmail()/verifyPhoneNumber(), so they are bypasses of the same kind AND hold PII;
@@ -270,18 +272,18 @@ class ShopperScopedAddressStores
      * an unenrolled key through these guards any more than this code can.) So the only way
      * to trip this is a NEW call inside this module passing an unenrolled key, which is a
      * programming error that must fail at the developer's first request rather than ship as
-     * a silent bypass. ONE PATH SOFTENS THAT, named so it is not read as a claim the code
-     * does not honour: Plugin\Admin\ValidateImportAddress::afterValidateData() wraps its
-     * work in catch (\Exception) and returns the result untouched, with no log - and that
-     * catch sits OUTSIDE the chunk loop, so the throw abandons the remaining chunks and the
-     * error-reporting loop with them. On that path the mistake therefore does not reach the
-     * developer as an exception; it surfaces as an import that reports no address errors at
-     * all. That is still a total failure of the import's address validation rather than an
-     * unguarded read - no store is reached and no row is granted a bypass - so the assertion
-     * is not a bypass anywhere, merely quieter here than the throw suggests. Logging and
-     * continuing was the alternative and was rejected: the continue path IS the unguarded
-     * access the assertion exists to prevent, so it would leave the defect in place and
-     * merely record it - and this class holds no logger to record it with.
+     * a silent bypass.
+     *
+     * Every path lets it out, including the import. Plugin\Admin\ValidateImportAddress::
+     * afterValidateData() used to wrap its work in a blanket catch (\Exception), which
+     * swallowed this throw and turned it into an import that silently reported no address
+     * errors at all; that plugin now catches \InvalidArgumentException separately and
+     * rethrows it, precisely so this assertion reaches a developer. Do not restore the broad
+     * catch on the strength of an older revision of this paragraph.
+     *
+     * Logging and continuing was the alternative and was rejected: the continue path IS the
+     * unguarded access the assertion exists to prevent, so it would leave the defect in place
+     * and merely record it - and this class holds no logger to record it with.
      *
      * @param string $key Attribute the caller is trying to reach.
      * @return void

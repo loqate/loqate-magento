@@ -63,20 +63,28 @@ class Validator
     private const VALID_QUALITY_INDEXES = ['A', 'B', 'C', 'D', 'E'];
 
     /**
-     * Version of the verify cache's KEY SCHEME. Stamped into every verdict
-     * storeVerifyResult() writes and required to match on every read
-     * (getCachedVerifyResult()); an entry stamped with anything else is discarded.
+     * Version of the verify caches' KEY SCHEME. Stamped into every verdict written by
+     * storeVerifyResult() AND storeBatchVerifyResult(), and required to match on every read
+     * (getCachedVerifyResult(), getCachedBatchVerifyResult()); an entry stamped with anything
+     * else is discarded.
      *
      * A session outlives a deploy, so without this a payload written under an older key
      * shape would be answered as though its key named the address the CURRENT shape derives
-     * from that key. Bump it whenever buildVerifyCacheSignature() or buildVerifyCacheKey()
-     * changes what a key means: stale entries are then re-verified once, which is the safe
-     * direction.
+     * from that key. Bump it whenever buildVerifyCacheSignature() or either cache's key
+     * builder changes what a key means: stale entries are then re-verified once, which is the
+     * safe direction.
      *
-     * Deliberately not carried on the BATCH cache: that store's payload is exactly
-     * ['valid' => true], and the shape being distinct from this one is itself the second
-     * guard against the two verdict caches being read for each other
-     * (getCachedBatchVerifyResult()), so it gets its own stamp only when its own key changes.
+     * ONE version covers BOTH caches because both key builders sit on the same signature -
+     * buildVerifyCacheSignature() - so any change to what a key means changes it for both at
+     * once. A second constant would be two things to bump and one of them would be forgotten.
+     *
+     * An earlier revision carried this on the single-address cache only, reasoning that the
+     * batch payload's distinct shape (['valid' => ...] against ['error' => ...]) already
+     * guards the two caches from being read for each other. True, and unrelated: that guard
+     * is about CROSS-CACHE conflation, while this stamp is about CROSS-DEPLOY staleness. The
+     * batch cache needed it more, not less - storeBatchVerifyResult() stores only PASSES, so
+     * every stale batch replay is a false ACCEPT, where the single-address cache stores
+     * rejections too and can at worst replay a stale refusal.
      */
     private const VERIFY_KEY_SCHEMA_VERSION = 1;
 
@@ -172,6 +180,12 @@ class Validator
      * and are therefore never cacheable in the first place. The practical dedupe on the
      * import path is consequently near nil, and raising this constant would not change that
      * - it is inherent to FIFO over a working set larger than the cache.
+     *
+     * THIS IS TRACKED, NOT ACCEPTED. LOQ-16976 was raised for admin order create AND customer
+     * import; this cache delivers the first. The import half is LOQ-17148, which is where the
+     * two fixable causes belong - caching failed verdicts on that path, where a failure costs
+     * a re-verify rather than a bypass, and exposing address_quality_index in
+     * etc/adminhtml/system.xml so the default cannot silently fail every row.
      *
      * Where this cache actually pays for itself is ADMIN ORDER CREATE: two addresses per
      * submission, re-submitted after a validation bounce or an unrelated form error, is
@@ -726,8 +740,8 @@ class Validator
             //
             // checkQualityIndex() now mirrors verifyAddress()'s AVC guard; see
             // checkQualityIndex()'s own docblock for why the test is on the value's shape
-            // rather than on truthiness, and for the deliberately-unchanged asymmetry on the
-            // threshold side of the comparison.
+            // rather than on truthiness, and for why an unrecognised THRESHOLD rejects rather
+            // than - as it once did - passing every address.
             $isValid = $this->checkQualityIndex($qualityIndex);
             $result[$sentItem['key']] = $isValid;
 
@@ -1593,6 +1607,13 @@ class Validator
             return null;
         }
 
+        // Written under an older key scheme, so the key no longer names the address it was
+        // derived from. Discarding re-verifies once; replaying would be a false ACCEPT,
+        // because this store holds only passes. Same check as getCachedVerifyResult().
+        if (($verdict['schema'] ?? null) !== self::VERIFY_KEY_SCHEMA_VERSION) {
+            return null;
+        }
+
         return true;
     }
 
@@ -1658,7 +1679,15 @@ class Validator
             array_shift($store);
         }
 
-        $store[$key] = $this->serializer->serialize(['valid' => true]);
+        // 'valid' rather than 'error' keeps the payload shape distinct from the single-address
+        // cache's, which is the second guard against the two caches answering each other's
+        // lookups. The schema stamp is a different guard, against a session that outlives a
+        // deploy; see self::VERIFY_KEY_SCHEMA_VERSION for why this store needs it MORE than
+        // the other one.
+        $store[$key] = $this->serializer->serialize([
+            'valid' => true,
+            'schema' => self::VERIFY_KEY_SCHEMA_VERSION,
+        ]);
         $this->shopperSession->setData(self::BATCH_VERIFY_CACHE_SESSION_KEY, $store);
     }
 

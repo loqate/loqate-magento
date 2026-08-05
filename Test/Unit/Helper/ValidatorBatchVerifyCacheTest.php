@@ -739,11 +739,13 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'verifyMultipleAddresses() must write NOTHING to the single-address cache.'
         );
         $this->assertSame(
-            ['valid' => true],
+            ['valid' => true, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION],
             json_decode((string)reset($batchStore), true),
-            'The batch cache stores a "valid" flag, not an "error" one: the differing shape is a second, '
-            . 'independent guard - an entry written by the other cache fails the shape check here and '
-            . 'degrades to a miss instead of being read as a verdict.'
+            'The batch cache stores a "valid" flag, not an "error" one: the differing VERDICT FIELD is a '
+            . 'second, independent guard - an entry written by the other cache fails the shape check here '
+            . 'and degrades to a miss instead of being read as a verdict. Both caches carry the same key-'
+            . 'scheme stamp, which is a guard against a different thing (a session outliving a deploy), so '
+            . 'sharing it does not weaken the shape guard: "valid" and "error" still differ.'
         );
     }
 
@@ -1539,9 +1541,11 @@ class ValidatorBatchVerifyCacheTest extends TestCase
 
         $this->assertSame(3, $this->apiCallCount(), 'A corrupted entry must be re-verified, not throw.');
         $this->assertSame(
-            ['valid' => true],
+            ['valid' => true, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION],
             json_decode((string)($this->batchStore($this->shopper)[$key] ?? ''), true),
-            'The re-verified verdict must overwrite the corrupted entry with a usable one.'
+            'The re-verified verdict must overwrite the corrupted entry with a usable one - carrying the '
+            . 'key-scheme stamp, so recovering from corruption cannot quietly write an entry the next read '
+            . 'would discard as stale.'
         );
     }
 
@@ -2069,6 +2073,61 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             $this->shopperCallCount($shopper),
             'One billable request in total: the second submission must be answered entirely from the '
             . 'cache.'
+        );
+    }
+
+    /**
+     * A batch verdict written under an OLDER key scheme is discarded, not replayed.
+     *
+     * This store needs the stamp MORE than the single-address one, which is why it is asserted
+     * here in its own right rather than left to that cache's test.
+     * storeBatchVerifyResult() caches only PASSES, so a stale entry replayed here is a false
+     * ACCEPT - an address approved on a key that no longer names it. The single-address cache
+     * holds rejections too, so its worst stale outcome is a refusal the shopper can clear.
+     *
+     * An earlier revision carried the stamp on the single-address cache only, reasoning that
+     * the batch payload's distinct shape already guarded the two caches from each other. That
+     * is a different guard: shape stops cross-CACHE conflation, the stamp stops cross-DEPLOY
+     * staleness, and both key builders share one signature so a key-meaning change hits both.
+     */
+    public function testABatchVerdictWrittenUnderAnEarlierKeySchemeIsDiscardedRatherThanReplayed(): void
+    {
+        $address = $this->distinctAddress(1);
+
+        $this->validator->verifyMultipleAddresses([$address], false);
+
+        $store = $this->batchStore($this->shopper);
+        $this->assertCount(1, $store, 'The verdict must be cached normally first.');
+
+        $key = (string)array_key_first($store);
+        $payload = json_decode((string)$store[$key], true);
+        $this->assertSame(
+            self::VERIFY_KEY_SCHEMA_VERSION,
+            $payload['schema'] ?? null,
+            'A cached batch verdict must record the key scheme it was written under, or a verdict from '
+            . 'before a key change cannot be told apart from one written by this deploy - and because only '
+            . 'passes are stored here, mistaking one for the other approves an address.'
+        );
+
+        // The same PASS as written by a deploy whose key scheme was one version older.
+        $payload['schema'] = self::VERIFY_KEY_SCHEMA_VERSION - 1;
+        $store[$key] = json_encode($payload);
+        $this->shopper['session'][self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $verdicts = $this->validator->verifyMultipleAddresses([$address], false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'A batch verdict stamped with another key scheme must be discarded and the address verified '
+            . 'again: the key it is filed under no longer names the same address. Replaying it would be a '
+            . 'false ACCEPT, since this store holds nothing but passes.'
+        );
+        $this->assertSame(
+            [0 => true],
+            $verdicts,
+            'And the LIVE verdict must be returned, so the stale entry can be seen not to have answered '
+            . 'the lookup rather than merely to have agreed with it.'
         );
     }
 
