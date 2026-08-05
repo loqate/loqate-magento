@@ -42,17 +42,24 @@ use ReflectionProperty;
  * verdict cache is consulted per address BEFORE the address is added to the payload: only
  * misses are sent, and the tests here count "addresses billed" as
  * count($payload['Addresses']) summed over every invocation, not merely the number of
- * requests. Its design deliberately differs from verifyAddress()' cache in three ways, each
+ * requests. Its design deliberately differs from verifyAddress()' cache in two ways, each
  * pinned below:
  *  - a PHYSICALLY SEPARATE session attribute (BATCH_VERIFY_CACHE_SESSION_KEY) with a
  *    different stored shape ({"valid":true} versus {"error":false}), because these verdicts
  *    come from the address quality index (checkQualityIndex()) and the other cache's from
  *    the AVC thresholds - one must never answer the other's lookup, see
  *    testTheTwoVerdictCachesAreInvisibleToEachOtherInBothDirections();
- *  - only PASSING verdicts are stored, see testAFailingVerdictIsNeverCached();
- *  - a single STRICT key with the county INCLUDED, not the asymmetric strict/lossy pair,
- *    which is safe precisely because no failure is ever cached, see
- *    testChangingOnlyTheCountyCostsASecondBillableAddressOnTheBatchPathOnly().
+ *  - only PASSING verdicts are stored, see testAFailingVerdictIsNeverCached().
+ *
+ * THE KEY ITSELF IS THE SAME RULE AS THE SINGLE-ADDRESS ONE: an address shares a verdict
+ * with another submission only when the two ask Loqate about the same address, the
+ * region/county included, on the read as well as on the write. So a county variant nobody
+ * has had verified simply misses here and is billed - see
+ * testAnUnverifiedCountyVariantIsNeverServedACachedBatchPass() and
+ * testChangingOnlyTheCountyCostsASecondBillableAddress(), which are guards rather than red
+ * tests: they fail if anything ever teaches the key that two differently-spelt regions name
+ * one place, which on this path would let an import or an admin order pass an address on a
+ * verdict earned for a different one, and whose AQI plausibly depends on the county.
  * Entries are namespaced per store view and per resolved AQI threshold - NOT per resolved
  * AVC comparer string - see testChangingTheQualityIndexThresholdInvalidatesCachedVerdicts()
  * and testEditingTheAvcThresholdsInvalidatesNoBatchVerdict().
@@ -123,6 +130,15 @@ class ValidatorBatchVerifyCacheTest extends TestCase
 
     /** Session data key the BATCH verdict cache must live under. */
     private const BATCH_VERIFY_CACHE_SESSION_KEY = 'loqate_verified_batch_addresses';
+
+    /**
+     * Key-scheme version the SINGLE-address cache stamps into every verdict it writes.
+     *
+     * Mirrors Validator::VERIFY_KEY_SCHEMA_VERSION. Asserted here rather than ignored so
+     * that stamping the batch cache too - which would make the two payload shapes differ
+     * only by their verdict field name - cannot happen without this test noticing.
+     */
+    private const VERIFY_KEY_SCHEMA_VERSION = 1;
 
     /** Config path of the threshold batch verdicts are judged against. */
     private const AQI_CONFIG_PATH = 'loqate_settings/address_settings/address_quality_index';
@@ -701,9 +717,10 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             . 'thresholds and would be read there as an AQI verdict.'
         );
         $this->assertSame(
-            ['error' => false],
+            ['error' => false, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION],
             json_decode((string)reset($singleStore), true),
-            'The single-address cache stores an "error" flag.'
+            'The single-address cache stores an "error" flag plus the key-scheme stamp it '
+            . 'requires to match on read.'
         );
 
         $batchOnly = $this->createShopper();
@@ -777,11 +794,10 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     /**
      * A FAILING verdict is never cached, and that is load-bearing rather than tidiness.
      *
-     * It is what makes the strict-only cache key safe: because no rejection is ever stored,
-     * an admin or an import can never be stranded on a replayed "invalid" that they cannot
-     * clear (the checkout dead-end the single-address cache needs its asymmetric key pair to
-     * avoid). The cost is stated and asserted here: a failing address is re-billed on every
-     * submission.
+     * Because no rejection is ever stored, an admin or an import can never be stranded on a
+     * replayed "invalid" they cannot clear - the checkout dead-end the single-address cache
+     * has to avoid by keying rejections on the exact address Loqate judged. The cost is
+     * stated and asserted here: a failing address is re-billed on every submission.
      */
     public function testAFailingVerdictIsNeverCached(): void
     {
@@ -795,8 +811,8 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $this->assertCount(
             1,
             $this->batchStore($this->shopper),
-            'Only the PASSING verdict may be cached: a stored rejection is what would force the cache '
-            . 'key to drop the county, widening the bypass for every address.'
+            'Only the PASSING verdict may be cached: a stored rejection is what would make it possible for '
+            . 'an admin or an import to be stranded on an "invalid" they cannot clear.'
         );
 
         $second = $this->validator->verifyMultipleAddresses([$good, $bad], false);
@@ -920,21 +936,25 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     }
 
     /**
-     * The batch cache key is STRICT - county INCLUDED - and this is where that differs
-     * observably from the single-address cache, whose SUCCESS key deliberately drops the
-     * county so capture.js rewriting "Meath" to "Co. Meath" cannot re-bill an address.
+     * The batch cache key carries the county as the address supplied it, so re-spelling the
+     * county of an address that has already passed costs one more billed address.
      *
-     * Both designs are asserted here, side by side and on the same address, because the
-     * difference is intentional and each half is only defensible in the light of the other:
-     * the batch path can afford a strict key precisely because it never caches a rejection,
-     * so it has no dead-end to avoid, and an AQI plausibly depends on the county - a
-     * county-blind success cache here would be a WIDER bypass than the one the single-address
-     * cache already accepts. The stated cost: one extra billed address per county rewrite.
+     * The accepted limit, stated and asserted rather than assumed: one extra billed address
+     * per rewrite, on a path (admin order create, import) where the county is largely
+     * re-derived from region_id and so churns far less than in checkout. The other direction
+     * is what may not be done - teaching the key that two spellings name one place buys that
+     * one address back only while the guess is right, and whenever it is wrong an import row
+     * or an admin order passes on a verdict Loqate gave a different address, on a path whose
+     * AQI plausibly depends on the county.
+     *
+     * The pair here is "Meath" and "Co. Meath" on an IE address because that is exactly the
+     * pair a label-collapsing rule merges, so this test is a tripwire for one being
+     * introduced.
      */
-    public function testChangingOnlyTheCountyCostsASecondBillableAddressOnTheBatchPathOnly(): void
+    public function testChangingOnlyTheCountyCostsASecondBillableAddress(): void
     {
-        $address = self::ADDRESS;
-        $countyRewritten = array_merge($address, ['region' => 'Co. London']);
+        $address = self::addressInCounty('IE', 'Meath');
+        $countyRewritten = self::addressInCounty('IE', 'Co. Meath');
 
         $this->validator->verifyMultipleAddresses([$address], false);
         $this->validator->verifyMultipleAddresses([$countyRewritten], false);
@@ -942,27 +962,67 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $this->assertSame(
             2,
             $this->addressesBilled(),
-            'The batch cache key includes the county, so rewriting it is a MISS and the address is '
-            . 'verified again. That is the accepted cost of a strict key on a path that never caches '
-            . 'a rejection and therefore needs no county-blind escape hatch.'
+            'The two submissions ask Loqate about different county text, so each must be verified and '
+            . 'billed in its own right: answering the second from the first pass would let an import row '
+            . 'or an admin order through on a verdict Loqate gave a different address.'
         );
         $this->assertCount(
             2,
             $this->batchStore($this->shopper),
             'The two county spellings must occupy their own cache entries.'
         );
+    }
 
-        // The single-address cache, same address, same rewrite: no second call, because its
-        // SUCCESS key drops the county. Two designs, deliberately different.
-        $single = $this->createShopper();
-        $single['validator']->verifyAddress($address);
-        $single['validator']->verifyAddress($countyRewritten);
+    /**
+     * A county variant nobody has had verified is never served an earlier pass: the county
+     * is in the key on the read as well as on the write, so it simply misses and is billed.
+     *
+     * Pinned as a real cache exchange rather than as a claim about a key: the identical
+     * submission is asserted to HIT first, so the misses that follow are the county's doing
+     * and not a cache that has stopped working. The variants are deliberately the ones a
+     * label-collapsing rule folds together ("Co. Meath" and "County Meath" with "Meath";
+     * "Dublin 1" with "Dublin") - if such a rule is ever introduced anywhere between the
+     * address and this key, those stop missing and this test fails.
+     */
+    public function testAnUnverifiedCountyVariantIsNeverServedACachedBatchPass(): void
+    {
+        $verified = self::addressInCounty('IE', 'Meath');
 
+        $this->validator->verifyMultipleAddresses([$verified], false);
+        $this->assertSame(1, $this->addressesBilled(), 'The first submission must be billed.');
+        $this->assertCount(1, $this->batchStore($this->shopper), 'Its passing verdict must be cached.');
+
+        $replayed = $this->validator->verifyMultipleAddresses([$verified], false);
         $this->assertSame(
             1,
-            $this->shopperCallCount($single),
-            'The single-address cache must still absorb a county rewrite: that is the LOQ-16969 fix, and '
-            . 'the two caches really do key differently - they are not interchangeable.'
+            $this->addressesBilled(),
+            'The IDENTICAL address must be served from the cache, or the misses asserted below would '
+            . 'prove nothing about the county.'
+        );
+        $this->assertSame([0 => true], $replayed, 'And it must be answered with its cached pass.');
+
+        $billed = 1;
+        foreach (['Co. Meath', 'County Meath', 'Kildare', 'Dublin', 'Dublin 1'] as $variant) {
+            $billed++;
+            $result = $this->validator->verifyMultipleAddresses([self::addressInCounty('IE', $variant)], false);
+
+            $this->assertSame(
+                $billed,
+                $this->addressesBilled(),
+                sprintf(
+                    'The county "%s" has never been verified on this path, so it must be BILLED, not '
+                    . 'answered from the pass earned by another county: an import row or an admin order '
+                    . 'would otherwise pass on a verdict Loqate gave a different address.',
+                    $variant
+                )
+            );
+            $this->assertSame([0 => true], $result, 'Each variant must carry its own live verdict.');
+        }
+
+        $this->assertCount(
+            6,
+            $this->batchStore($this->shopper),
+            'One cache entry per county actually verified: six counties, six entries.'
         );
     }
 
@@ -2241,6 +2301,29 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'AQI' => $verdict === 'fail' ? self::FAILING_AQI : self::PASSING_AQI,
             'AVC' => self::PASSING_AVC,
         ]];
+    }
+
+    /**
+     * One fixed address in $countryId carrying $county, so a pair of these differs in the
+     * county alone and any extra billed address can only be the county's doing.
+     *
+     * Mirrors ValidatorVerifyCacheTest::addressInCounty(), because the two caches' county
+     * handling is compared against each other here and the comparison is only meaningful
+     * on the same address.
+     *
+     * @param string $countryId Magento country code.
+     * @param string $county Region/county name.
+     * @return array Magento-shaped address.
+     */
+    private static function addressInCounty(string $countryId, string $county): array
+    {
+        return [
+            'street' => ['12 Main Street'],
+            'city' => 'Navan',
+            'region' => $county,
+            'postcode' => 'C15 XXXX',
+            'country_id' => $countryId,
+        ];
     }
 
     /** A unique, fully-formed address per index. */

@@ -1090,7 +1090,7 @@ class ShopperScopedSessionTest extends TestCase
      * The batch cache was previously covered only at the guard level - "the attribute named
      * BATCH_VERIFY_CACHE_SESSION_KEY is in the flush list and is set to null" - which proves
      * the list, not the wiring. verifyMultipleAddresses() reaches the attribute through its
-     * own key builder (buildBatchVerifySignature(), county INCLUDED) and its own accessors
+     * own cache key (namespaced by the resolved AQI threshold) and its own accessors
      * (getCachedBatchVerifyResult()/storeBatchVerifyResult()), none of which the single-address
      * tests exercise; either of those reading the raw session would leave this store shared
      * with every other test in this file green.
