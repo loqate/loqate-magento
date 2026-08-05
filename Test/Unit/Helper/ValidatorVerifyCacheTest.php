@@ -524,10 +524,19 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * A verdict may not outlive the session that earned it. After a logout or a
-     * session regeneration the session data is gone, so the address has to be
-     * verified against the API again - proving the cache is session state and not
-     * hidden anywhere with a longer lifetime.
+     * A verdict may not outlive the session that earned it. In a BRAND-NEW browser session
+     * - a different visitor, a cleared cookie, a session garbage-collected between visits -
+     * there is no backing data to read, so the address has to be verified against the API
+     * again. That proves the cache is session state and is not hidden anywhere with a
+     * longer lifetime (a static, the registry, a cache backend, the customer entity).
+     *
+     * IT DOES NOT MODEL A LOGOUT OR A SESSION-ID REGENERATION, and must not be read as
+     * doing so - that is the belief LOQ-16978 exists to correct. Magento calls
+     * session_regenerate_id() on login and on logout, which changes the session ID while
+     * PRESERVING every value in $_SESSION, so the cache emphatically DOES survive both.
+     * What clears it there is Helper\ShopperScopedSession, not PHP; the logout and login
+     * cases are covered by ShopperScopedSessionTest::testACachedVerdictDoesNotSurviveALogin()
+     * and its siblings.
      */
     public function testCachedVerdictDoesNotSurviveASessionReset(): void
     {
@@ -536,12 +545,12 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->validator->verifyAddress(self::ADDRESS);
         $this->assertCount(1, $this->verdictStore(), 'The verdict must be written to the session.');
 
-        $this->endSession($this->shopper);
+        $this->startBrandNewSession($this->shopper);
 
         $this->assertSame(
             [],
             $this->verdictStore(),
-            'Clearing the session must clear the verdict cache: it may not be held anywhere else.'
+            'A brand-new session must start with an empty verdict cache: it may not be held anywhere else.'
         );
 
         $result = $this->validator->verifyAddress(self::ADDRESS);
@@ -549,7 +558,7 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'After a session reset the address must be verified against the API again.'
+            'In a brand-new session the address must be verified against the API again.'
         );
         $this->assertSame(['error' => false], $result);
         $this->assertCount(
@@ -2774,12 +2783,18 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * Model the end of a browser session (logout, or Magento regenerating the
-     * session id): the session's backing data is dropped, which is precisely how
-     * this harness represents session state, so nothing the previous session
+     * Model a BRAND-NEW browser session: a different visitor, a cleared cookie, or a
+     * session PHP has garbage-collected between visits. The backing data is empty, which is
+     * precisely how this harness represents session state, so nothing an earlier session
      * cached can be read back.
+     *
+     * NOT a logout and NOT a session-id regeneration. Magento regenerates the session id on
+     * both login and logout and the DATA survives that (see Helper\ShopperScopedSession);
+     * emptying the store here would be the wrong model of either. The identity-change cases
+     * are ShopperScopedSessionTest's subject - testACachedVerdictDoesNotSurviveALogin()
+     * covers the logout/login hand-off, where the guard does the clearing that PHP does not.
      */
-    private function endSession(array $shopper): void
+    private function startBrandNewSession(array $shopper): void
     {
         $shopper['session']->exchangeArray([]);
     }

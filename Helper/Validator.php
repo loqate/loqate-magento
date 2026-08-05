@@ -72,16 +72,30 @@ class Validator
      * process- or install-wide and would serve one shopper's verdict to another.
      * Entries are additionally namespaced per store view and per resolved AVC threshold,
      * see buildVerifyCacheKey().
+     *
+     * "Per-shopper" is enforced, not merely assumed: a PHP session survives a login
+     * (session_regenerate_id() changes the ID and keeps the data), so this attribute is
+     * reached through ShopperScopedSession, which flushes it whenever the logged-in
+     * customer changes (LOQ-16978).
+     *
+     * An ALIAS of ShopperScopedSession::VERIFY_CACHE_SESSION_KEY, kept so every existing
+     * reference to Validator::VERIFY_CACHE_SESSION_KEY still resolves. The literal lives on
+     * the guard because the guard is what enforces this attribute's lifetime, and holding
+     * it here made the dependency circular - the guard's flush list pointed at this class
+     * while this class constructs the guard.
      */
-    const VERIFY_CACHE_SESSION_KEY = 'loqate_verified_addresses';
+    const VERIFY_CACHE_SESSION_KEY = ShopperScopedSession::VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of verdicts kept per session, oldest evicted first.
      *
-     * Bounded so the cache cannot inflate the session payload the way the pre-existing
-     * "captured_addresses" store does: that one grows without limit for the whole
-     * session (Helper/Controller.php:179-194), which is tracked as LOQ-16978 and is
-     * deliberately not replicated here.
+     * Bounded so the cache cannot inflate the session payload, and small because this is
+     * the INTERACTIVE path: one shopper checking out replays a handful of addresses across
+     * the call paths listed on verifyAddress(), so 50 distinct addresses is already far
+     * beyond a realistic session. Helper\Controller::CAPTURED_ADDRESSES_LIMIT now bounds
+     * the older captured-address store at the same figure and for the same reasons
+     * (LOQ-16978); self::BATCH_VERIFY_CACHE_LIMIT is the one that is deliberately larger,
+     * because only that path has to hold a 100-row import chunk.
      */
     const VERIFY_CACHE_LIMIT = 50;
 
@@ -101,9 +115,17 @@ class Validator
      * structurally impossible rather than merely unlikely, and cost one extra session key.
      *
      * Same lifetime rules as the single-address cache: a verdict is customer data, so it
-     * lives in the per-shopper customer session and nowhere process- or install-wide.
+     * lives in the per-shopper customer session and nowhere process- or install-wide, and
+     * it is reached through ShopperScopedSession so that it is flushed when the logged-in
+     * customer changes (LOQ-16978) - subject to the ACCEPTED LIMITS on that class, which
+     * name THIS attribute specifically: it is written only from adminhtml, where the
+     * customer session carries no customer id, so the guard's flush is a no-op for it and
+     * an admin-user swap inside one browser session is not covered.
+     *
+     * An ALIAS of ShopperScopedSession::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
+     * dependency-direction reason as self::VERIFY_CACHE_SESSION_KEY above.
      */
-    const BATCH_VERIFY_CACHE_SESSION_KEY = 'loqate_verified_batch_addresses';
+    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedSession::BATCH_VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of batch verdicts kept per session, oldest evicted first.
@@ -114,7 +136,9 @@ class Validator
      * even one chunk - the eviction would discard a chunk's earliest rows before the
      * chunk finished, and re-running a file that FITS WITHIN THIS LIMIT would re-bill them.
      * 200 holds two full chunks while still bounding the session payload, which is the whole
-     * point of having a limit at all (see self::VERIFY_CACHE_LIMIT and LOQ-16978).
+     * point of having a limit at all (see self::VERIFY_CACHE_LIMIT and
+     * Helper\Controller::CAPTURED_ADDRESSES_LIMIT, both 50 because no import writes to
+     * them).
      *
      * READ THAT PARAGRAPH AS A FLOOR ON THE CONSTANT, NOT AS A SAVING ON THE IMPORT PATH.
      * It is why >= 100 is asserted, and it holds only for a file whose whole working set
@@ -146,8 +170,13 @@ class Validator
     /** @var Logger $logger */
     private $logger;
 
-    /** @var Session $session */
-    private $session;
+    /**
+     * @var ShopperScopedSession The captured-address store and the two verdict caches,
+     *      behind the shopper-ownership guard. The raw customer session is deliberately
+     *      NOT kept as well: keeping it would leave a way to reach those stores without
+     *      the guard - see ShopperScopedSession.
+     */
+    private ShopperScopedSession $shopperSession;
 
     /** @var RegionFactory */
     private $regionFactory;
@@ -162,7 +191,9 @@ class Validator
      * Validator construct
      *
      * @param Logger $logger
-     * @param Session $session
+     * @param Session $session Wrapped in a ShopperScopedSession and not kept raw, so the
+     *                         captured-address store and both verdict caches can only be
+     *                         reached through the shopper-ownership guard.
      * @param RegionFactory $regionFactory
      * @param ModuleListInterface $moduleList
      * @param Data $helper
@@ -177,7 +208,7 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        $this->session = $session;
+        $this->shopperSession = new ShopperScopedSession($session);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
@@ -297,7 +328,8 @@ class Validator
         }
 
         $requestArray = $this->parseAddress($address);
-        if ($checkForCaptured && ($storedAddresses = $this->session->getData('captured_addresses'))) {
+        $capturedKey = Controller::CAPTURED_ADDRESSES_SESSION_KEY;
+        if ($checkForCaptured && ($storedAddresses = $this->shopperSession->getData($capturedKey))) {
             if ($this->checkForCapturedAddress($requestArray, $storedAddresses)) {
                 return ['error' => false];
             }
@@ -407,14 +439,13 @@ class Validator
         //
         // It is NOT the status quo, and must not be justified as parity with the
         // pre-existing captured_addresses guard: that guard is written only by
-        // Helper\Controller::retrieve() -> storeCapturedAddress()
-        // (Helper/Controller.php:179-194), so it only ever applied to addresses picked
-        // from the Loqate lookup - addresses Loqate itself authored. Caching successes
-        // county-blind extends that county-blindness to TYPED addresses, which is a
-        // widening of the bypass. Tightening it (for instance by keying successes
-        // strictly and canonicalising the county instead) is tracked as LOQ-16979,
-        // "tighten county-blind verify verdict cache so unverified county variants
-        // cannot pass".
+        // Helper\Controller::retrieve() -> storeCapturedAddress(), so it only ever applied
+        // to addresses picked from the Loqate lookup - addresses Loqate itself authored.
+        // Caching successes county-blind extends that county-blindness to TYPED addresses,
+        // which is a widening of the bypass. Tightening it (for instance by keying
+        // successes strictly and canonicalising the county instead) is tracked as
+        // LOQ-16979, "tighten county-blind verify verdict cache so unverified county
+        // variants cannot pass".
         $this->storeVerifyResult($verifySignature, false);
 
         return ['error' => false];
@@ -561,7 +592,9 @@ class Validator
             return ['noKeyFound' => true];
         }
 
-        $storedAddresses = $checkForCaptured ? $this->session->getData('captured_addresses') : null;
+        $storedAddresses = $checkForCaptured
+            ? $this->shopperSession->getData(Controller::CAPTURED_ADDRESSES_SESSION_KEY)
+            : null;
 
         $result = [];
         $requestArray = [];
@@ -975,8 +1008,22 @@ class Validator
 
     /**
      * Check for captured addresses, so they should not be verified if already captured
+     *
+     * DEFENSIVE ABOUT THE STORE'S SHAPE, AT BOTH LEVELS (LOQ-16978). The store is read
+     * from the bare Controller::CAPTURED_ADDRESSES_SESSION_KEY session attribute, which
+     * this module does not own exclusively: another module, an older release or a
+     * truncated session payload can leave a non-array THERE, or a non-string element
+     * INSIDE it. Both are checked here rather than at the two call sites (verifyAddress()
+     * and verifyMultipleAddresses()) so the single relation that grants the verify bypass
+     * carries the single guard, and neither caller can be the one that forgot it.
+     *
+     * Neither shape may cost more than a missed bypass. This runs mid-checkout, so a
+     * malformed store must fall through to a normal verify - never a fatal, and never a
+     * warning either: under developer mode Magento's ErrorHandler promotes E_WARNING to
+     * an exception, so "degrades to a skipped loop" is not a safe resting place here.
+     *
      * @param $address
-     * @param $storedAddresses
+     * @param $storedAddresses Normally a list of serialised addresses, but see above.
      * @return bool
      */
     private function checkForCapturedAddress($address, $storedAddresses): bool
@@ -986,7 +1033,26 @@ class Validator
             return false;
         }
 
+        if (!is_array($storedAddresses)) {
+            // A truthy non-array whole attribute - both call sites only test the value for
+            // truthiness before handing it over. foreach over a scalar is an E_WARNING and
+            // an exception in developer mode, so it is rejected before the loop, not by it.
+            return false;
+        }
+
         foreach ($storedAddresses as $stored) {
+            if (!is_string($stored)) {
+                // Not something Controller::storeCapturedAddress() wrote. Skipped rather
+                // than unserialised: the production serializer
+                // (Magento\Framework\Serialize\Serializer\Json) hands its argument straight
+                // to json_decode(), whose first parameter is declared `string $json`, so an
+                // array or object element raises a TypeError - which is an \Error, not the
+                // \InvalidArgumentException caught below. This is the mirror of the guard in
+                // Helper\Controller::isSameCapturedAddress() (LOQ-16978); the two read the
+                // same store and must survive the same values.
+                continue;
+            }
+
             try {
                 $storedData = $this->serializer->unserialize($stored);
             } catch (\InvalidArgumentException $e) {
@@ -1003,6 +1069,57 @@ class Validator
         }
 
         return false;
+    }
+
+    /**
+     * The captured-address equality relation, exposed so the STORE and the MATCHER agree.
+     *
+     * WHY THIS IS PUBLIC AND STATIC (LOQ-16978 review). Two addresses are "the same
+     * captured address" if and only if they project onto the same signature - that is the
+     * relation checkForCapturedAddress() grants the verify bypass on. The store's writer,
+     * Helper\Controller::storeCapturedAddress(), has to de-duplicate on the SAME relation,
+     * or the two drift apart: it used to compare the exact serialised bytes of the six
+     * ADDRESS_CAPTURE_MAPPING fields, so two captures differing only in letter case, in
+     * whitespace, in ProvinceName (which this signature excludes entirely) or in ''-versus-
+     * missing Line2 were ONE address for bypass purposes but TWO slots in a bounded store -
+     * which is exactly the "cycling one address through the lookup fills every slot"
+     * failure the de-duplication exists to prevent.
+     *
+     * Static because the projection is pure - it reads only self::CAPTURED_SIGNATURE_FIELDS
+     * and normalises - so Controller can call it without constructing a Validator (which
+     * would need five more collaborators and would build a billable API connector).
+     *
+     * NO PARAMETER TYPE DECLARATION, deliberately (LOQ-16978 review). The intended input is
+     * an array in the Loqate field shape (ADDRESS_CAPTURE_MAPPING's keys, or
+     * parseAddress()'s output - they overlap on the fields this projects), but the internal
+     * callers reach here through buildAddressSignature() with whatever
+     * checkForCapturedAddress()/buildBatchVerifySignature() were handed, which is typed
+     * `mixed`, and Helper\Controller guards its own call with is_array() only on the
+     * deserialised path. Declaring `array` would convert today's graceful degradation into
+     * a TypeError raised mid-checkout, which is the opposite of what every other reader in
+     * this class does. Anything that is not an array degrades to '': `$address[$key] ?? null`
+     * yields null for a scalar or null $address (a string index with a non-numeric key
+     * likewise), null normalises to '', and an all-'' projection returns the ''
+     * "nothing identifiable" sentinel - so an unusable input is simply kept out of every
+     * comparison instead of matching something.
+     *
+     * @param mixed $address Normally an array in the Loqate field shape; any other value
+     *                       degrades to the '' sentinel as described above.
+     * @return string '' when the address carries nothing identifiable, which keeps it out
+     *                of every comparison rather than matching other empty addresses.
+     */
+    public static function capturedAddressSignature($address): string
+    {
+        $parts = [];
+        foreach (self::CAPTURED_SIGNATURE_FIELDS as $key) {
+            $parts[] = self::normaliseSignatureValue($address[$key] ?? null);
+        }
+
+        if (trim(implode('', $parts)) === '') {
+            return '';
+        }
+
+        return implode('|', $parts);
     }
 
     /**
@@ -1026,21 +1143,17 @@ class Validator
      * buildStrictAddressSignature(). '' means "nothing identifiable" and keeps an address
      * out of both comparisons.
      *
+     * The body lives on self::capturedAddressSignature(), which
+     * Helper\Controller::storeCapturedAddress() also calls so that the store de-duplicates
+     * on the very relation this comparison grants the bypass on. This remains the name the
+     * rest of this class - and the tests - use.
+     *
      * @param $address
      * @return string
      */
     private function buildAddressSignature($address): string
     {
-        $parts = [];
-        foreach (self::CAPTURED_SIGNATURE_FIELDS as $key) {
-            $parts[] = $this->normaliseSignatureValue($address[$key] ?? null);
-        }
-
-        if (trim(implode('', $parts)) === '') {
-            return '';
-        }
-
-        return implode('|', $parts);
+        return self::capturedAddressSignature($address);
     }
 
     /**
@@ -1160,7 +1273,7 @@ class Validator
 
         $parts = [$signature];
         foreach ($fields as $field) {
-            $parts[] = $this->normaliseSignatureValue($address[$field] ?? null);
+            $parts[] = self::normaliseSignatureValue($address[$field] ?? null);
         }
 
         return implode('|', $parts);
@@ -1172,10 +1285,14 @@ class Validator
      * the signature. Non-scalars (Magento's street array, objects) and missing
      * values normalise to '' rather than throwing.
      *
+     * Static so that self::capturedAddressSignature() - the projection Helper\Controller
+     * shares - can be static too. Every call site inside this class uses self:: rather
+     * than $this->: both resolve, but $this-> on a static method reads as an oversight.
+     *
      * @param $value
      * @return string
      */
-    private function normaliseSignatureValue($value): string
+    private static function normaliseSignatureValue($value): string
     {
         if (!is_scalar($value)) {
             return '';
@@ -1214,7 +1331,7 @@ class Validator
             return null;
         }
 
-        $store = $this->session->getData(self::VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store) || !isset($store[$key]) || !is_string($store[$key])) {
             return null;
         }
@@ -1257,7 +1374,7 @@ class Validator
             return;
         }
 
-        $store = $this->session->getData(self::VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store)) {
             $store = [];
         }
@@ -1287,7 +1404,7 @@ class Validator
         }
 
         $store[$key] = $this->serializer->serialize(['error' => $error]);
-        $this->session->setData(self::VERIFY_CACHE_SESSION_KEY, $store);
+        $this->shopperSession->setData(self::VERIFY_CACHE_SESSION_KEY, $store);
     }
 
     /**
@@ -1433,7 +1550,7 @@ class Validator
             return null;
         }
 
-        $store = $this->session->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store) || !isset($store[$key]) || !is_string($store[$key])) {
             return null;
         }
@@ -1493,7 +1610,7 @@ class Validator
             return;
         }
 
-        $store = $this->session->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store)) {
             $store = [];
         }
@@ -1515,7 +1632,7 @@ class Validator
         }
 
         $store[$key] = $this->serializer->serialize(['valid' => true]);
-        $this->session->setData(self::BATCH_VERIFY_CACHE_SESSION_KEY, $store);
+        $this->shopperSession->setData(self::BATCH_VERIFY_CACHE_SESSION_KEY, $store);
     }
 
     /**
