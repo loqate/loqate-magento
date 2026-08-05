@@ -53,6 +53,16 @@ class Validator
     private const COUNTY_FIELD = 'Address4';
 
     /**
+     * Every value address_quality_index is allowed to hold, worst ('E') to best ('A').
+     *
+     * checkQualityIndex() compares the response AQI against the threshold with <=, which is
+     * a STRING comparison, so an unrecognised threshold does not fail closed - anything
+     * sorting above 'E' passes every address. This list is what makes that comparison
+     * meaningful; see checkQualityIndex() for the failure it prevents.
+     */
+    private const VALID_QUALITY_INDEXES = ['A', 'B', 'C', 'D', 'E'];
+
+    /**
      * Version of the verify cache's KEY SCHEME. Stamped into every verdict
      * storeVerifyResult() writes and required to match on every read
      * (getCachedVerifyResult()); an entry stamped with anything else is discarded.
@@ -81,16 +91,16 @@ class Validator
      *
      * "Per-shopper" is enforced, not merely assumed: a PHP session survives a login
      * (session_regenerate_id() changes the ID and keeps the data), so this attribute is
-     * reached through ShopperScopedSession, which flushes it whenever the logged-in
+     * reached through ShopperScopedAddressStores, which flushes it whenever the logged-in
      * customer changes (LOQ-16978).
      *
-     * An ALIAS of ShopperScopedSession::VERIFY_CACHE_SESSION_KEY, kept so every existing
+     * An ALIAS of ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY, kept so every existing
      * reference to Validator::VERIFY_CACHE_SESSION_KEY still resolves. The literal lives on
      * the guard because the guard is what enforces this attribute's lifetime, and holding
      * it here made the dependency circular - the guard's flush list pointed at this class
      * while this class constructs the guard.
      */
-    const VERIFY_CACHE_SESSION_KEY = ShopperScopedSession::VERIFY_CACHE_SESSION_KEY;
+    const VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of verdicts kept per session, oldest evicted first.
@@ -122,16 +132,16 @@ class Validator
      *
      * Same lifetime rules as the single-address cache: a verdict is customer data, so it
      * lives in the per-shopper customer session and nowhere process- or install-wide, and
-     * it is reached through ShopperScopedSession so that it is flushed when the logged-in
+     * it is reached through ShopperScopedAddressStores so that it is flushed when the logged-in
      * customer changes (LOQ-16978) - subject to the ACCEPTED LIMITS on that class, which
      * name THIS attribute specifically: it is written only from adminhtml, where the
      * customer session carries no customer id, so the guard's flush is a no-op for it and
      * an admin-user swap inside one browser session is not covered.
      *
-     * An ALIAS of ShopperScopedSession::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
+     * An ALIAS of ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
      * dependency-direction reason as self::VERIFY_CACHE_SESSION_KEY above.
      */
-    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedSession::BATCH_VERIFY_CACHE_SESSION_KEY;
+    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of batch verdicts kept per session, oldest evicted first.
@@ -177,12 +187,12 @@ class Validator
     private $logger;
 
     /**
-     * @var ShopperScopedSession The captured-address store and the two verdict caches,
+     * @var ShopperScopedAddressStores The captured-address store and the two verdict caches,
      *      behind the shopper-ownership guard. The raw customer session is deliberately
      *      NOT kept as well: keeping it would leave a way to reach those stores without
-     *      the guard - see ShopperScopedSession.
+     *      the guard - see ShopperScopedAddressStores.
      */
-    private ShopperScopedSession $shopperSession;
+    private ShopperScopedAddressStores $shopperSession;
 
     /** @var RegionFactory */
     private $regionFactory;
@@ -197,7 +207,7 @@ class Validator
      * Validator construct
      *
      * @param Logger $logger
-     * @param Session $session Wrapped in a ShopperScopedSession and not kept raw, so the
+     * @param Session $session Wrapped in a ShopperScopedAddressStores and not kept raw, so the
      *                         captured-address store and both verdict caches can only be
      *                         reached through the shopper-ownership guard.
      * @param RegionFactory $regionFactory
@@ -214,7 +224,7 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedSession($session);
+        $this->shopperSession = new ShopperScopedAddressStores($session);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
@@ -837,22 +847,35 @@ class Validator
      * This mirrors verifyAddress()'s AVC guard, so both verify paths now draw the
      * "readable verdict" line in exactly the same place.
      *
-     * KNOWN ASYMMETRY, documented rather than changed. The two halves of this comparison
-     * fail closed for different reasons and with different strength:
-     *  - the AQI side (this guard) fails closed DELIBERATELY, by explicit shape test;
-     *  - the THRESHOLD side fails closed only INCIDENTALLY, out of comparison semantics:
-     *    'A' <= null and 'A' <= '' are both false (verified on 8.3), so were
-     *    address_quality_index ever unset, EVERY address would be rejected. That is left
-     *    exactly as it is. It is not reachable in practice - etc/config.xml:20 supplies the
-     *    default and the field is not exposed in etc/adminhtml/system.xml, so it cannot be
-     *    blanked from the admin UI - and "fixing" it by treating an absent threshold as
-     *    permissive would re-open a fail-open on the config side to close a hole that does
-     *    not exist. resolveQualityIndexThreshold() also returns the value RAW and uncast on
-     *    purpose; see its docblock before touching either side.
+     * BOTH SIDES ARE NOW GUARDED EXPLICITLY, and the threshold side had to be.
+     *
+     * An earlier revision guarded only the AQI side and reasoned about the threshold side
+     * being unset: 'A' <= null and 'A' <= '' are both false on 8.3, so a blank threshold
+     * rejects every address. True, and the safe direction - but it is the wrong case. The
+     * dangerous value is not a blank threshold, it is an UNREADABLE one. Under the same
+     * string comparison, 'A' <= 'zzz' and 'E' <= 'zzz' are both TRUE (verified on 8.3), so a
+     * threshold of any text sorting above 'E' passes EVERY address, including the worst AQI
+     * Loqate can return. That is a total bypass of the merchant's configured quality bar,
+     * arrived at silently, and no amount of guarding the response side detects it.
+     *
+     * So the threshold is required to be one of self::VALID_QUALITY_INDEXES and anything
+     * else fails closed and is logged. Rejecting is the only safe answer: the whole point of
+     * the setting is to bar addresses, and a threshold nobody can read cannot be said to
+     * admit any of them.
+     *
+     * Not reachable from the admin UI today - etc/config.xml:20 supplies the default and
+     * etc/adminhtml/system.xml exposes no field for it - but "unreachable" here rests on the
+     * absence of a form field, and the value is a plain core_config_data row that a data
+     * patch, a CLI config:set, or an admin field added later can put anything into. The
+     * guard costs one in_array() per verdict.
+     *
+     * resolveQualityIndexThreshold() still returns the value RAW and uncast, so the batch
+     * cache key keeps fingerprinting exactly what was compared; see its docblock.
      *
      * @param $qualityIndex The AQI from the response row, of any type - it is unvalidated
      *                      connector output, so this method must not assume a string.
-     * @return bool True only when the AQI is readable AND meets the configured threshold.
+     * @return bool True only when the AQI is readable, the threshold is readable, AND the
+     *              AQI meets it.
      */
     private function checkQualityIndex($qualityIndex): bool
     {
@@ -861,6 +884,18 @@ class Validator
         }
 
         $configIndex = $this->resolveQualityIndexThreshold();
+
+        if (!is_string($configIndex) || !in_array($configIndex, self::VALID_QUALITY_INDEXES, true)) {
+            $this->logger->info(sprintf(
+                'Loqate: address_quality_index is not a recognised quality index (%s of type %s); '
+                . 'rejecting the address. Set it to one of %s.',
+                var_export($configIndex, true),
+                gettype($configIndex),
+                implode(', ', self::VALID_QUALITY_INDEXES)
+            ));
+
+            return false;
+        }
 
         return $qualityIndex <= $configIndex;
     }

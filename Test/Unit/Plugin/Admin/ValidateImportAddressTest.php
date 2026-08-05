@@ -457,6 +457,42 @@ class ValidateImportAddressTest extends TestCase
     }
 
     /**
+     * ...and the ONE exception that must NOT be absorbed, which is the contrast that gives the
+     * test above its meaning.
+     *
+     * An \InvalidArgumentException on this path is not a runtime fault. It is
+     * ShopperScopedAddressStores::assertEnrolled() reporting that a session store was reached
+     * without being enrolled in the shopper-ownership flush - a bug a developer has to fix,
+     * and the single signal that a store is escaping the guard that stops one shopper
+     * inheriting another's verify bypass.
+     *
+     * Swallowing it would be worse than a silent failure. This plugin has no logger, so the
+     * report would go nowhere at all, and the assertion that exists specifically to be
+     * impossible to ignore would become impossible to notice. So it propagates, and the
+     * import fails loudly.
+     *
+     * Safe to propagate because it cannot be a deserialisation failure: every call site that
+     * unserialises a cache entry catches \InvalidArgumentException itself and degrades to a
+     * miss, so a malformed session entry never reaches this catch. If that stops being true,
+     * this test is the one that should be revisited - not the narrowing.
+     */
+    public function testAnEnrolmentFailurePropagatesRatherThanBeingSwallowed(): void
+    {
+        $subject = $this->createMock(Address::class);
+        $subject->method('getBehavior')->willReturn(Import::BEHAVIOR_ADD_UPDATE);
+        $subject->method('getSource')->willThrowException(
+            new \InvalidArgumentException(
+                'Session key "loqate_email" is not enrolled in the shopper-ownership flush.'
+            )
+        );
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('is not enrolled in the shopper-ownership flush');
+
+        $this->createPlugin()->afterValidateData($subject, self::errorAggregator());
+    }
+
+    /**
      * Run the plugin over a file of $rowCount rows, answering each chunk from
      * $this->batchResults.
      *

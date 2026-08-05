@@ -5,7 +5,7 @@ namespace Loqate\ApiIntegration\Test\Unit\Helper;
 use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Helper\Controller;
 use Loqate\ApiIntegration\Helper\Data;
-use Loqate\ApiIntegration\Helper\ShopperScopedSession;
+use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
@@ -23,7 +23,7 @@ use ReflectionProperty;
 use stdClass;
 
 /**
- * Unit tests for Helper\ShopperScopedSession: the one seam through which this module
+ * Unit tests for Helper\ShopperScopedAddressStores: the one seam through which this module
  * reaches the three session attributes that can make an address SKIP a billable Loqate
  * verify, and the guard that keeps them belonging to ONE shopper (LOQ-16978).
  *
@@ -90,7 +90,7 @@ use stdClass;
  * testOnTheAdminhtmlPathTheBatchCacheIsOwnedByTheGuestAndTheFlushIsANoOp(), which pins that
  * ACCEPTED LIMIT as documented behaviour so it cannot change silently in either direction.
  */
-class ShopperScopedSessionTest extends TestCase
+class ShopperScopedAddressStoresTest extends TestCase
 {
     /** Any non-empty key lets both helpers build their API connectors. */
     private const API_KEY = 'TEST-API-KEY-0000';
@@ -114,7 +114,7 @@ class ShopperScopedSessionTest extends TestCase
     private const BATCH_VERIFY_CACHE_SESSION_KEY = 'loqate_verified_batch_addresses';
 
     /**
-     * The second identity source ShopperScopedSession deliberately does NOT read.
+     * The second identity source ShopperScopedAddressStores deliberately does NOT read.
      *
      * Held as a STRING and never imported: this class is a backend one, it is not among the
      * handful stubbed under Test/stubs, and the harness runs without Magento installed - so a
@@ -133,7 +133,7 @@ class ShopperScopedSessionTest extends TestCase
     ];
 
     /**
-     * Build a ShopperScopedSession over a customer session double whose data persists and
+     * Build a ShopperScopedAddressStores over a customer session double whose data persists and
      * whose logged-in identity can be changed between calls, exactly as a login or a logout
      * changes it between two requests.
      *
@@ -143,7 +143,7 @@ class ShopperScopedSessionTest extends TestCase
      *
      * @param array<string, mixed> $data Session attributes present before the first access.
      * @param int|string|null $customerId Logged-in customer, null for a guest.
-     * @return array{guard: ShopperScopedSession, session: ArrayObject, identity: ArrayObject,
+     * @return array{guard: ShopperScopedAddressStores, session: ArrayObject, identity: ArrayObject,
      *     writes: ArrayObject}
      */
     private function createGuard(array $data = [], $customerId = null): array
@@ -155,7 +155,7 @@ class ShopperScopedSessionTest extends TestCase
         $sessionMock = $this->createSessionDouble($sessionStore, $identity, $writes);
 
         return [
-            'guard' => new ShopperScopedSession($sessionMock),
+            'guard' => new ShopperScopedAddressStores($sessionMock),
             'session' => $sessionStore,
             'identity' => $identity,
             'writes' => $writes,
@@ -349,7 +349,7 @@ class ShopperScopedSessionTest extends TestCase
      * that grant a verify bypass, reached through the names Controller and Validator publish.
      *
      * This is the one thing the behavioural tests cannot see. Reading or writing an attribute
-     * through ShopperScopedSession does NOT enrol it in the flush - only this list does - so
+     * through ShopperScopedAddressStores does NOT enrol it in the flush - only this list does - so
      * a fourth store could be added, reached through the guard, and still be inherited by the
      * next shopper with every other test in this file green.
      *
@@ -388,16 +388,16 @@ class ShopperScopedSessionTest extends TestCase
                 Validator::VERIFY_CACHE_SESSION_KEY,
                 Validator::BATCH_VERIFY_CACHE_SESSION_KEY,
             ],
-            'The three attribute NAMES are unchanged by the constants moving onto ShopperScopedSession. They '
+            'The three attribute NAMES are unchanged by the constants moving onto ShopperScopedAddressStores. They '
             . 'are the keys of live customer sessions: renaming one silently empties that store for every '
             . 'shopper mid-checkout at deploy time, which re-bills every address they have already had '
             . 'verified.'
         );
         $this->assertSame(
             [
-                ShopperScopedSession::CAPTURED_ADDRESSES_SESSION_KEY,
-                ShopperScopedSession::VERIFY_CACHE_SESSION_KEY,
-                ShopperScopedSession::BATCH_VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY,
+                ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY,
             ],
             [
                 Controller::CAPTURED_ADDRESSES_SESSION_KEY,
@@ -878,8 +878,8 @@ class ShopperScopedSessionTest extends TestCase
     public function testAnUnenrolledAttributeIsRejectedByBothGetDataAndSetData(string $key): void
     {
         $calls = [
-            'getData()' => static fn (ShopperScopedSession $guard) => $guard->getData($key),
-            'setData()' => static fn (ShopperScopedSession $guard) => $guard->setData($key, 'a new value'),
+            'getData()' => static fn (ShopperScopedAddressStores $guard) => $guard->getData($key),
+            'setData()' => static fn (ShopperScopedAddressStores $guard) => $guard->setData($key, 'a new value'),
         ];
 
         foreach ($calls as $label => $call) {
@@ -937,7 +937,7 @@ class ShopperScopedSessionTest extends TestCase
      * Attributes that must NOT be reachable through the guard.
      *
      * The first four are the module's real un-enrolled session attributes, named in the
-     * ShopperScopedSession class docblock as deliberately out of scope for LOQ-16978. They
+     * ShopperScopedAddressStores class docblock as deliberately out of scope for LOQ-16978. They
      * are the ones a future edit is most likely to route through this class by analogy, which
      * is exactly the mistake the throw exists to catch: they would gain the guard's
      * appearance without ever being added to the flush.
@@ -1172,7 +1172,7 @@ class ShopperScopedSessionTest extends TestCase
      * whichever admin submitted first.
      *
      * THIS IS NOT A FAILING TEST AND IT IS NOT A WORKAROUND. It is the documented limit on
-     * ShopperScopedSession, asserted so it cannot change in either direction unnoticed - if
+     * ShopperScopedAddressStores, asserted so it cannot change in either direction unnoticed - if
      * someone injects the backend auth session and closes it, this test fails and says so; if
      * someone assumes it is already closed, this test is the counter-example. It is
      * deliberately accepted upstream: the admin panel is a trusted, authenticated, non-shared
@@ -1206,7 +1206,7 @@ class ShopperScopedSessionTest extends TestCase
             $this->ownerConstant('GUEST_OWNER_ID'),
             $shopper['session'][$this->ownerKey()] ?? null,
             'On the adminhtml path the customer session carries no customer id, so the batch cache is owned '
-            . 'by the GUEST. This is the documented ACCEPTED LIMIT on ShopperScopedSession: the guard scopes '
+            . 'by the GUEST. This is the documented ACCEPTED LIMIT on ShopperScopedAddressStores: the guard scopes '
             . 'by customer identity only, and there is no customer identity here to scope by.'
         );
 
@@ -1226,7 +1226,7 @@ class ShopperScopedSessionTest extends TestCase
             . 'view and AQI threshold and only passes are stored, so it is the same verdict the second admin '
             . 'would have earned. Accepted upstream (the admin panel is trusted, authenticated and not '
             . 'shared); if this assertion ever fails because the backend auth session was injected, that is an '
-            . 'improvement - update this test and the ACCEPTED LIMITS note on ShopperScopedSession together.'
+            . 'improvement - update this test and the ACCEPTED LIMITS note on ShopperScopedAddressStores together.'
         );
 
         // The structural half of the same limit, and the reason the behavioural half above
@@ -1241,10 +1241,10 @@ class ShopperScopedSessionTest extends TestCase
             1,
             $identitySources,
             sprintf(
-                'ShopperScopedSession must read exactly ONE identity source. Holding a %s alongside the '
+                'ShopperScopedAddressStores must read exactly ONE identity source. Holding a %s alongside the '
                 . 'customer session would mean the admin-swap limit asserted above has been closed, which is '
                 . 'an improvement but makes the assertion above wrong: change both together, and the ACCEPTED '
-                . 'LIMITS note on ShopperScopedSession with them. Note that this counts SESSIONS only - the '
+                . 'LIMITS note on ShopperScopedAddressStores with them. Note that this counts SESSIONS only - the '
                 . 'guard is free to acquire other collaborators (a logger is the standing candidate, named on '
                 . 'assertEnrolled()) without touching what it can see about identity. Found: %s.',
                 self::BACKEND_AUTH_SESSION,
@@ -1317,7 +1317,7 @@ class ShopperScopedSessionTest extends TestCase
      * quietly bypassed: neither helper may keep a reference to the raw customer session.
      *
      * Both are handed a Magento\Customer\Model\Session by DI and wrap it in a
-     * ShopperScopedSession. If either also retained the raw object, a future edit could read
+     * ShopperScopedAddressStores. If either also retained the raw object, a future edit could read
      * or write any of the three attributes directly - no flush, no marker, and every
      * behavioural test in this file still green, because they only exercise the paths that DO
      * go through the guard.
@@ -1333,7 +1333,7 @@ class ShopperScopedSessionTest extends TestCase
                     $value,
                     sprintf(
                         '%s::$%s holds the raw customer session. The captured-address store and both verdict '
-                        . 'caches must be reachable only through ShopperScopedSession, or one direct '
+                        . 'caches must be reachable only through ShopperScopedAddressStores, or one direct '
                         . 'getData() re-opens LOQ-16978 with the whole suite green.',
                         $label,
                         $name
@@ -1341,11 +1341,11 @@ class ShopperScopedSessionTest extends TestCase
                 );
             }
 
-            $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedSession);
+            $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedAddressStores);
             $this->assertCount(
                 1,
                 $guards,
-                sprintf('%s must hold exactly one ShopperScopedSession to reach its session stores.', $label)
+                sprintf('%s must hold exactly one ShopperScopedAddressStores to reach its session stores.', $label)
             );
         }
     }
@@ -1519,7 +1519,7 @@ class ShopperScopedSessionTest extends TestCase
         $keys = self::readManagedKeys();
         if ($keys === []) {
             $this->fail(
-                'ShopperScopedSession::SHOPPER_SCOPED_SESSION_KEYS is missing or empty: that list IS the '
+                'ShopperScopedAddressStores::SHOPPER_SCOPED_SESSION_KEYS is missing or empty: that list IS the '
                 . 'flush, so an empty one means no store is ever cleared when the shopper changes.'
             );
         }
@@ -1534,7 +1534,7 @@ class ShopperScopedSessionTest extends TestCase
      */
     private static function readManagedKeys(): array
     {
-        $reflection = new ReflectionClass(ShopperScopedSession::class);
+        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
         if (!$reflection->hasConstant('SHOPPER_SCOPED_SESSION_KEYS')) {
             return [];
         }
@@ -1551,7 +1551,7 @@ class ShopperScopedSessionTest extends TestCase
         $key = self::readOwnerKey();
         if ($key === '') {
             $this->fail(
-                'ShopperScopedSession::SESSION_OWNER_KEY is not defined: the identity the shopper-scoped '
+                'ShopperScopedAddressStores::SESSION_OWNER_KEY is not defined: the identity the shopper-scoped '
                 . 'stores belong to has to be recorded somewhere, or no identity change can be detected.'
             );
         }
@@ -1564,7 +1564,7 @@ class ShopperScopedSessionTest extends TestCase
      */
     private static function readOwnerKey(): string
     {
-        $reflection = new ReflectionClass(ShopperScopedSession::class);
+        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
 
         return $reflection->hasConstant('SESSION_OWNER_KEY')
             ? (string)$reflection->getConstant('SESSION_OWNER_KEY')
@@ -1584,10 +1584,10 @@ class ShopperScopedSessionTest extends TestCase
      */
     private function ownerConstant(string $name): int
     {
-        $reflection = new ReflectionClass(ShopperScopedSession::class);
+        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
         if (!$reflection->hasConstant($name)) {
             $this->fail(sprintf(
-                'ShopperScopedSession::%s is not defined. The guard needs three DISJOINT owner classes - a '
+                'ShopperScopedAddressStores::%s is not defined. The guard needs three DISJOINT owner classes - a '
                 . 'positive customer id, the guest, and "the session answered an id we cannot read" - or two '
                 . 'different identities compare equal and the stores are not flushed between them.',
                 $name

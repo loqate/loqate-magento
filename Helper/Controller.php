@@ -24,15 +24,15 @@ class Controller
     /**
      * Session attribute holding the addresses picked from the Loqate Capture lookup.
      *
-     * An ALIAS of ShopperScopedSession::CAPTURED_ADDRESSES_SESSION_KEY, kept so that every
+     * An ALIAS of ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY, kept so that every
      * existing reference to Controller::CAPTURED_ADDRESSES_SESSION_KEY still resolves. The
-     * name itself lives on ShopperScopedSession because that class is what ENFORCES the
+     * name itself lives on ShopperScopedAddressStores because that class is what ENFORCES the
      * attribute's lifetime, and holding the name here instead made the dependency circular:
      * the guard's flush list pointed at this class while this class constructs the guard
      * (LOQ-16978 review). This class remains the store's only WRITER
      * (storeCapturedAddress()); Helper\Validator is its only reader.
      */
-    const CAPTURED_ADDRESSES_SESSION_KEY = ShopperScopedSession::CAPTURED_ADDRESSES_SESSION_KEY;
+    const CAPTURED_ADDRESSES_SESSION_KEY = ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY;
 
     /**
      * Maximum number of captured addresses kept per session, oldest evicted first.
@@ -67,12 +67,12 @@ class Controller
     private $logger;
 
     /**
-     * @var ShopperScopedSession The captured-address store, behind the shopper-ownership
+     * @var ShopperScopedAddressStores The captured-address store, behind the shopper-ownership
      *      guard. The raw customer session is deliberately NOT kept as well: keeping it
      *      would leave a way to reach the store without the guard - see
-     *      ShopperScopedSession.
+     *      ShopperScopedAddressStores.
      */
-    private ShopperScopedSession $shopperSession;
+    private ShopperScopedAddressStores $shopperSession;
 
     /** @var string */
     private $version = null;
@@ -89,7 +89,7 @@ class Controller
      * @param ResultFactory $resultJsonFactory
      * @param RequestInterface $request
      * @param Logger $logger
-     * @param Session $session Wrapped in a ShopperScopedSession and not kept raw, so the
+     * @param Session $session Wrapped in a ShopperScopedAddressStores and not kept raw, so the
      *                         captured-address store can only be reached through the
      *                         shopper-ownership guard.
      * @param ModuleListInterface $moduleList
@@ -108,7 +108,7 @@ class Controller
         $this->resultJsonFactory = $resultJsonFactory;
         $this->request = $request;
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedSession($session);
+        $this->shopperSession = new ShopperScopedAddressStores($session);
         $this->helper = $helper;
         $this->serializer = $serializer;
 
@@ -232,7 +232,7 @@ class Controller
      *    lookup, and it dies with the session;
      *  - FLUSHED when the logged-in customer changes, in either direction (login, logout,
      *    or one login straight after another): the store is reached through
-     *    ShopperScopedSession, so shopper B on a shared browser cannot inherit the
+     *    ShopperScopedAddressStores, so shopper B on a shared browser cannot inherit the
      *    verify bypass shopper A earned. Read that class before adding a fourth store.
      *
      * @param $result

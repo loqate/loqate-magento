@@ -116,7 +116,30 @@ class ValidateImportAddress extends AbstractPlugin
                         }
                     }
                 }
+            } catch (\InvalidArgumentException $exception) {
+                // Deliberately NOT swallowed. On this path an \InvalidArgumentException can
+                // only be ShopperScopedAddressStores::assertEnrolled() reporting that a
+                // session store was reached without being enrolled in the shopper-ownership
+                // flush - a programming error a developer has to fix, not a runtime failure
+                // to absorb.
+                //
+                // It cannot be a deserialisation failure: the serializer forwards to
+                // json_decode() and every call site that unserialises a cache entry
+                // (Validator::getCachedVerifyResult(), getCachedBatchVerifyResult(),
+                // checkForCapturedAddress() and Controller::storeCapturedAddress()) already
+                // catches \InvalidArgumentException itself and degrades to a cache miss, so
+                // a malformed entry never reaches this far.
+                //
+                // This plugin has no logger - its base class serves ten plugins and does not
+                // carry one - so swallowing here would leave no trace anywhere and silently
+                // defeat the one assertion that exists to catch an unguarded store. Letting
+                // it out is the only way it reaches anybody.
+                throw $exception;
             } catch (\Exception $exception) {
+                // Everything else is a runtime failure - transport, connector, source file -
+                // and must not hard-fail the merchant's import. Rows already checked keep
+                // their verdicts; the rest go unverified, which the chunk handling above
+                // reports to the merchant.
                 return $result;
             }
         }

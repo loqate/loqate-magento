@@ -5,7 +5,7 @@ namespace Loqate\ApiIntegration\Test\Unit\Helper;
 use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Helper\Controller;
 use Loqate\ApiIntegration\Helper\Data;
-use Loqate\ApiIntegration\Helper\ShopperScopedSession;
+use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
@@ -76,7 +76,7 @@ use stdClass;
  * against.
  *
  * WHAT A MALFORMED STORE MAY COST, and why that is asserted on BOTH READERS. This is a bare
- * session key shared with every other module on the installation, ShopperScopedSession flushes
+ * session key shared with every other module on the installation, ShopperScopedAddressStores flushes
  * it by writing null, and sessions come back from storage that truncates - so "not a list of
  * entries this module wrote" is a routine state, not a hypothetical one. The contract is
  * therefore a DEGRADATION, stated as such: a store that cannot be read costs a MISSED BYPASS -
@@ -96,7 +96,7 @@ use stdClass;
  *
  * The OWNERSHIP half of LOQ-16978 - that this store is flushed when the logged-in shopper
  * changes - is not repeated here: it belongs to the seam that enforces it and is covered by
- * ShopperScopedSessionTest, together with the two verdict caches that share the rule. What
+ * ShopperScopedAddressStoresTest, together with the two verdict caches that share the rule. What
  * IS pinned here is that this class cannot reach the store any other way, see
  * testTheStoreIsReachedOnlyThroughTheShopperOwnershipGuard().
  */
@@ -217,8 +217,8 @@ class CapturedAddressStoreTest extends TestCase
             }
         );
         // One shopper, one identity, for the whole of this file: the store belongs to the
-        // same customer throughout, so ShopperScopedSession adopts it and never flushes.
-        // The identity-change behaviour is ShopperScopedSessionTest's subject, and leaving it
+        // same customer throughout, so ShopperScopedAddressStores adopts it and never flushes.
+        // The identity-change behaviour is ShopperScopedAddressStoresTest's subject, and leaving it
         // out here is what keeps a failure in these tests attributable to the bound itself.
         $sessionMock->method('getCustomerId')->willReturn(7);
 
@@ -871,7 +871,7 @@ class CapturedAddressStoreTest extends TestCase
      * that is not a list of addresses.
      *
      * Reachable in more ways than a corrupted payload: this attribute is a bare session key
-     * shared with every other module on the installation, ShopperScopedSession deliberately
+     * shared with every other module on the installation, ShopperScopedAddressStores deliberately
      * FLUSHES it by writing null (see that class for why null rather than an unset), and
      * sessions are restored from storage that can truncate. A fatal here would happen inside
      * a Capture retrieve request, i.e. while the shopper is picking their address, so the
@@ -911,7 +911,7 @@ class CapturedAddressStoreTest extends TestCase
     public static function corruptStoreValueProvider(): array
     {
         return [
-            // What ShopperScopedSession itself writes when it flushes the store, so this case
+            // What ShopperScopedAddressStores itself writes when it flushes the store, so this case
             // is not hypothetical: it is reached on the first capture after a login.
             'null left by a shopper-ownership flush' => [null],
             'a truncated string payload' => ['a:1:{i:0;s:5:"parti'],
@@ -1211,7 +1211,7 @@ class CapturedAddressStoreTest extends TestCase
      * verifyThrough().
      *
      * WHY THE ATTRIBUTE IS NOT A LIST, in practice: it is a bare session key shared with every
-     * other module on the installation, ShopperScopedSession deliberately writes null into it
+     * other module on the installation, ShopperScopedAddressStores deliberately writes null into it
      * to flush it, and sessions are restored from storage that can truncate - the same reasons
      * spelled out on corruptStoreValueProvider(), which pins the WRITER against this same set.
      * Only truthy values appear here, because a falsy one never reaches the reader at all.
@@ -1281,7 +1281,7 @@ class CapturedAddressStoreTest extends TestCase
      * The store must not be reachable except through the shopper-ownership guard.
      *
      * Helper\Controller is handed the raw Magento\Customer\Model\Session by DI and wraps it
-     * in a ShopperScopedSession; if it ALSO kept the raw session in a property, a later edit
+     * in a ShopperScopedAddressStores; if it ALSO kept the raw session in a property, a later edit
      * could read or write captured_addresses directly and silently skip the identity check
      * that stops shopper B inheriting shopper A's verify bypasses (LOQ-16978). Asserted on
      * the constructed object rather than by reading the source, so it holds however the
@@ -1298,18 +1298,18 @@ class CapturedAddressStoreTest extends TestCase
                 $value,
                 sprintf(
                     'Helper\Controller::$%s holds the raw customer session. The captured-address store must '
-                    . 'be reachable only through ShopperScopedSession, or a future edit can read and write it '
+                    . 'be reachable only through ShopperScopedAddressStores, or a future edit can read and write it '
                     . 'without the shopper-ownership check that flushes it on a login or a logout.',
                     $name
                 )
             );
         }
 
-        $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedSession);
+        $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedAddressStores);
         $this->assertCount(
             1,
             $guards,
-            'Helper\Controller must hold exactly one ShopperScopedSession: that is the seam every access to '
+            'Helper\Controller must hold exactly one ShopperScopedAddressStores: that is the seam every access to '
             . 'the captured-address store has to go through.'
         );
     }

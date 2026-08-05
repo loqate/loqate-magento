@@ -51,7 +51,7 @@ use Magento\Customer\Model\Session;
  * Controller::CAPTURED_ADDRESSES_SESSION_KEY, Validator::VERIFY_CACHE_SESSION_KEY and
  * Validator::BATCH_VERIFY_CACHE_SESSION_KEY are kept as ALIASES of the constants below, so
  * every existing reference to them still resolves - including
- * ShopperScopedSessionTest's assertion on the flush list - and the attribute VALUES are
+ * ShopperScopedAddressStoresTest's assertion on the flush list - and the attribute VALUES are
  * unchanged, so the four test files that pin these names as literals keep passing and no
  * live session loses its stores at deploy time.
  *
@@ -118,7 +118,7 @@ use Magento\Customer\Model\Session;
  *  - 'loqate_billing_errors' (Plugin\Frontend\CheckoutBillingAddress, read by
  *    Plugin\Frontend\PlaceOrder and PlaceOrderGuest) - a boolean gate on placing an order.
  */
-class ShopperScopedSession
+class ShopperScopedAddressStores
 {
     /**
      * Session attribute holding the addresses picked from the Loqate Capture lookup.
@@ -294,7 +294,7 @@ class ShopperScopedSession
         }
 
         throw new \InvalidArgumentException(sprintf(
-            'Session attribute "%s" is not enrolled in ShopperScopedSession::'
+            'Session attribute "%s" is not enrolled in ShopperScopedAddressStores::'
             . 'SHOPPER_SCOPED_SESSION_KEYS, so it would be reached through the shopper-ownership guard '
             . 'without ever being flushed when the shopper changes (LOQ-16978). Add it to that list, or '
             . 'use the raw customer session if the attribute genuinely is not shopper-scoped.',

@@ -2073,6 +2073,105 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     }
 
     /**
+     * An UNREADABLE THRESHOLD rejects every address, including the worst grade Loqate returns.
+     *
+     * The direction here is the opposite of the response-side guard above, and it is the one
+     * that was missing. checkQualityIndex() compares with <=, a string comparison, so a
+     * threshold of text sorting above 'E' does not fail closed - 'E' <= 'zzz' is TRUE on 8.3,
+     * and so is every other grade. A single unreadable config value therefore passed EVERY
+     * address at admin order create and on EVERY import row, silently, no matter what the
+     * merchant believed they had configured. That is a total bypass of the quality bar, not a
+     * degraded one.
+     *
+     * 'E' is the AQI under test on purpose: it is the worst grade, so it is the value that
+     * must never pass a threshold nobody can read. A test using 'A' would still pass if the
+     * guard regressed to comparing against the shipped default.
+     *
+     * Asserted alongside "nothing is cached", because a bogus pass that got stored would
+     * outlive the bad config for the rest of the session.
+     *
+     */
+    #[DataProvider('unreadableThresholdProvider')]
+    public function testAnUnreadableThresholdRejectsEveryAddressAndCachesNothing(
+        $threshold,
+        string $why
+    ): void {
+        $shopper = $this->createShopper(
+            null,
+            0,
+            new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => $threshold])),
+            static fn ($payload): array => array_map(
+                static fn (): array => [['AQI' => 'E', 'AVC' => self::PASSING_AVC]],
+                (array)$payload['Addresses']
+            )
+        );
+
+        $verdicts = $shopper['validator']->verifyMultipleAddresses([$this->distinctAddress(1)], false);
+
+        $this->assertSame(
+            [0 => false],
+            $verdicts,
+            sprintf(
+                'The worst AQI Loqate returns must NOT pass when the threshold is unreadable; this case '
+                . 'pins that %s. If this fails, an unreadable address_quality_index has become a blanket '
+                . 'approval of every address on the batch paths.',
+                $why
+            )
+        );
+        $this->assertSame(
+            [],
+            $this->batchStore($shopper),
+            'A verdict reached because the threshold could not be read is not a verdict and must never be '
+            . 'cached: cached, it would keep approving addresses after the config was corrected.'
+        );
+    }
+
+    /**
+     * Threshold values checkQualityIndex() must refuse to judge against, and why each matters.
+     *
+     * The three fail-OPEN cases are the point of the guard: each sorts above 'E' under the
+     * string comparison, so each passed every address before it existed. The remaining cases
+     * already failed closed incidentally, and are pinned so that stays true by rule rather
+     * than by accident of comparison semantics.
+     *
+     * @return array<string, array{0: mixed, 1: string}>
+     */
+    public static function unreadableThresholdProvider(): array
+    {
+        return [
+            "the fail-open case 'zzz'" => [
+                'zzz',
+                "'zzz' sorts above every grade, so 'E' <= 'zzz' was true and EVERY address passed",
+            ],
+            "a lowercase grade 'c'" => [
+                'c',
+                'lowercase sorts above uppercase in ASCII, so a plausible-looking typo in a data patch '
+                . 'passed every address rather than tightening anything',
+            ],
+            "a multi-character grade 'C+'" => [
+                'C+',
+                'a value that looks like a grade but is not one: it sorts above "C", so it silently '
+                . 'loosened the bar instead of being rejected',
+            ],
+            'an unset threshold' => [
+                null,
+                "null already failed closed via 'E' <= null being false; pinned so the guard, not "
+                . 'PHP comparison semantics, is what guarantees it',
+            ],
+            'a blank threshold' => [
+                '',
+                "the empty string already failed closed the same incidental way; pinned for the same "
+                . 'reason',
+            ],
+            'a numeric threshold' => [
+                3,
+                'an int is not a grade at all, and comparing a grade letter with an int is not a '
+                . 'comparison anyone reasoned about',
+            ],
+        ];
+    }
+
+    /**
      * Legitimate (threshold, AQI) pairs that must keep passing the fail-closed guard, with what
      * each one protects.
      *
