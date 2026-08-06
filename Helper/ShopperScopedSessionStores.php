@@ -201,6 +201,31 @@ use Magento\Customer\Model\Session;
  *    a frontend hot path - or it becomes an optional one that is null exactly where it would
  *    be needed. Neither buys anything but a second bill for a verdict that is identical by
  *    construction.
+ *  - GUEST TO GUEST ON ONE BROWSER IS NOT COVERED EITHER, and it is recorded here rather than
+ *    left to be discovered because it is the case this class's own opening paragraph names.
+ *    The marker holds an IDENTITY, and two successive people who never sign in present the
+ *    same one: both resolve to self::GUEST_OWNER_ID, the marker matches, and nothing is
+ *    flushed. So on the public terminal and the click-and-collect kiosk - where nobody logs in
+ *    at all - every one of the seven stores carries over from one person to the next, INCLUDING
+ *    the bypass this class exists to stop: the second guest's first submission of a value the
+ *    first was warned about is accepted with no verification and no warning. This is the same
+ *    residual as the admin one above but WITHOUT its consolation, because
+ *    self::PENDING_EMAIL_SESSION_KEY is the one enrolled store that stays RAW (a digest cannot
+ *    be put on the wire), so the second guest can also inherit a stranger's actual email
+ *    address. That matters MORE after LOQ-17149 than before it, not less: this ticket is what
+ *    enrolled that attribute, and enrolling it is what makes the login case safe while leaving
+ *    this one exactly as it was.
+ *    WHY IT IS NOT CLOSED HERE: there is no signal to close it with. "A different person is at
+ *    this browser now" is not an event the application can observe when neither of them
+ *    authenticates - it is the same session, the same cookie and the same identity - so no
+ *    check inside this class can tell the two apart, and the only behaviour that would be safe
+ *    against it is flushing on every request, which is the same as having no stores at all.
+ *    What actually bounds it is outside this class and is worth knowing: the session cookie's
+ *    lifetime and Magento's session lifetime end the shared session, and each store is bounded
+ *    (self::VERIFIED_CONTACT_LIMIT, Helper\Controller::CAPTURED_ADDRESSES_LIMIT,
+ *    Validator::VERIFY_CACHE_LIMIT, Validator::BATCH_VERIFY_CACHE_LIMIT) so nothing accumulates
+ *    without limit while it lasts. A merchant running a genuinely shared terminal should shorten
+ *    that lifetime; the module cannot decide it for them.
  *  - ALL UNREADABLE CUSTOMER IDS COLLAPSE ONTO ONE OWNER, see resolveOwnerId(). Two
  *    successive identities that both present an unreadable id would share the stores. It
  *    cannot collide with a guest or with a real customer, which is the collision that

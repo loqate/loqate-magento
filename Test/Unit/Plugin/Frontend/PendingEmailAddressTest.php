@@ -143,6 +143,65 @@ class PendingEmailAddressTest extends TestCase
     }
 
     /**
+     * THE ACCEPTED LIMIT, pinned as documented behaviour rather than left to be discovered: two
+     * successive GUESTS on one browser are one identity, so nothing is flushed between them and
+     * the abandoned address survives.
+     *
+     * WHY THIS IS THE CASE WORTH RECORDING. The guard scopes by
+     * Magento\Customer\Model\Session::getCustomerId(), and two people who never sign in both
+     * answer null - the same owner, so the marker matches and no flush is due. The test above
+     * covers the transition the flush DOES see; this one covers the shared terminal and the
+     * click-and-collect kiosk, which are the examples ShopperScopedSessionStores' own class
+     * docblock opens with and are precisely where nobody logs in. It matters more for THIS
+     * attribute than for the two contact lists, because this one holds the address itself: a
+     * digest cannot be put on the wire, and this value exists to be verified.
+     *
+     * There is no signal to close it with - "a different person is at this browser" is not
+     * something the application can observe when neither of them authenticates - so what bounds
+     * it is the session lifetime, outside this module. Asserted in both directions: if it ever
+     * starts flushing, this test fails and says so; if somebody assumes it already does, this
+     * test is the counter-example.
+     */
+    public function testTwoSuccessiveGuestsAreOneIdentityAndTheAbandonedAddressIsNotFlushed(): void
+    {
+        // Neither guest ever signs in: 'customerId' stays null for the whole test, which IS the
+        // shared-terminal situation. Nothing about the session changes between them.
+        $harness = $this->createCheckout(['emailPasses' => false, 'customerId' => null]);
+
+        $this->offerEmailAddress($harness, self::SHOPPER_A_EMAIL);
+        $this->assertSame(
+            self::SHOPPER_A_EMAIL,
+            $harness['session'][self::PENDING_EMAIL_SESSION_KEY] ?? null,
+            'Fixture guard: guest A\'s address must really be left pending, or there is nothing for the next '
+            . 'person at this browser to inherit.'
+        );
+
+        $blocked = null;
+        try {
+            $this->saveShippingInformation($harness);
+        } catch (StateException $e) {
+            $blocked = $e;
+        }
+
+        $this->assertInstanceOf(
+            StateException::class,
+            $blocked,
+            'DOCUMENTED LIMIT, asserted so it cannot drift in either direction: guest-to-guest is invisible to '
+            . 'a guard that scopes by customer identity, so the second guest IS stopped at the shipping step '
+            . 'by an address the first one abandoned. If this ever stops throwing because the guard learned to '
+            . 'tell two guests apart, that is an improvement - update this test and the ACCEPTED LIMITS note '
+            . 'on ShopperScopedSessionStores together.'
+        );
+        $this->assertSame(
+            [self::SHOPPER_A_EMAIL],
+            iterator_to_array($harness['emailRequests']),
+            'And the second guest is billed for a Cleansing request on a stranger\'s address, which is the '
+            . 'same harm the login case is defended against. The residual is bounded by the session lifetime, '
+            . 'not by anything this module can decide.'
+        );
+    }
+
+    /**
      * The two plugins that own the pending address, sharing ONE customer session, built through
      * their real constructors.
      *

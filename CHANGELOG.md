@@ -105,6 +105,15 @@ predate it and are described by their git tags and commit history.
   - sessions that were already open when this release was deployed are warned once
     more about each value they had remembered, because the stored form changed.
 
+  This applies wherever the module raises "Submit again to use this email address /
+  phone number", which is every path through `Plugin\AbstractPlugin` — checkout, the
+  customer account forms and admin order create. It does **not** apply to the phone
+  check in `Observer\QuoteSubmitBefore`, which runs on quote submit (the Hyvä and
+  GraphQL place-order path): that observer verifies the number directly and consults
+  no "already warned" list at all, so it neither reads nor writes these lists, it
+  bills every quote submit, and an invalid number blocks the order there whatever
+  "Prevent Submit" is set to.
+
 - **Two phone numbers that differ only by a leading `0`, `00` or `+` are now
   treated as different numbers.** They were compared with PHP's loose comparison,
   which compares two numeric strings as NUMBERS — so `0123456789` and `123456789`,
@@ -278,3 +287,13 @@ predate it and are described by their git tags and commit history.
   which is unchanged by this release. Closing the swap itself would mean either a
   backend dependency in a helper built on every storefront checkout request or a
   second bill for a verdict that is identical by construction.
+- For the same reason, **two successive guests on one browser are not covered
+  either**: the flush needs an identity change to see, and two people who never sign
+  in are the same identity. On a shared terminal or a click-and-collect kiosk the
+  second person can therefore inherit the first's "already warned about" entries — so
+  a value of theirs goes through unverified and unwarned — and can inherit an email
+  address the first left pending at the checkout email step, which is the one store
+  that has to hold the value rather than a digest. There is no signal to close this
+  with: nothing tells the application that a different person is at the browser when
+  neither of them authenticates. What bounds it is the **session lifetime**, which a
+  merchant running a shared terminal should shorten (LOQ-17149).
