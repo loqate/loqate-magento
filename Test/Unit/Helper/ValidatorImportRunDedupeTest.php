@@ -7,10 +7,10 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Model\Config\Source\AddressQualityIndex;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\Module\ModuleListInterface;
-use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -53,19 +53,38 @@ use ReflectionProperty;
  * the threshold. testARejectionIsNeverReplayedToALaterRequest() is that half.
  *
  * THE ONE RULE THAT GOVERNS ALL OF IT: NEVER REMEMBER A VERDICT WE COULD NOT READ. An AQI that
- * could not be read, or a threshold that could not be read, produces a rejection that is a
- * FAULT REPORT rather than a verdict - so it is remembered nowhere, not even for the identical
- * address in the same run, and the row is billed again. One connector fault or one bad
- * credential must not brand every matching row in the file invalid for the rest of the run.
- * That is what testAnUnreadableQualityIndexIsRememberedNowhereSoTheRowIsBilledAgain() and
- * testAnUnreadableThresholdRejectsEveryRowAndIsRememberedNowhere() hold, and it is the
- * assertion to look at first if a dedupe change ever makes the headline test cheaper.
+ * could not be read, or a threshold that could not be read, produces a rejection that is a FAULT
+ * REPORT rather than a verdict - so it is remembered nowhere, not even for the identical address
+ * in the same run. One connector fault or one bad credential must not brand every matching row
+ * in the file invalid for the rest of the run. That is what
+ * testAnUnreadableQualityIndexIsRememberedNowhereSoTheRowIsBilledAgain() and
+ * testAnUnreadableThresholdRejectsEveryRowAndIsRememberedNowhere() hold, and it is the assertion
+ * to look at first if a dedupe change ever makes the headline test cheaper.
  *
- * Every count asserted here is ADDRESSES BILLED - count($payload['Addresses']) summed over
- * every connector invocation - and not requests, because that is what the invoice is.
+ * THE TWO FAULTS COST DIFFERENT AMOUNTS, and the difference is the point rather than an
+ * inconsistency. An unreadable RESPONSE is re-billed on the repeat, because only Loqate can
+ * settle that row and asking again is the cheaper mistake. An unreadable THRESHOLD is billed
+ * NOTHING, ever, because nothing Loqate could answer would change the outcome: the bar cannot be
+ * read, so every row is refused before the request is composed. "Remembered nowhere" is the
+ * same rule in both cases; what differs is whether buying an answer could tell us anything.
+ *
+ * Most counts asserted here are ADDRESSES BILLED - count($payload['Addresses']) summed over every
+ * connector invocation - and not requests, because that is what the invoice is. The pre-flight
+ * tests also assert the REQUEST count, which is a stronger claim than zero billed addresses: an
+ * empty 'Addresses' payload sent to a billable endpoint bills nothing and is still a round trip
+ * paid for and discarded.
  */
 class ValidatorImportRunDedupeTest extends TestCase
 {
+    /**
+     * The serializer double, shared with every other harness that reads a serialised payload
+     * back. What it buys THIS class: the session verdict store is read through it on every
+     * lookup, so a lenient double would make getCachedBatchVerifyResult()'s catch block
+     * unreachable from here and an import meeting a truncated payload would fatal in production
+     * while this file stayed green.
+     */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key makes the batch path reach the billable call. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -95,6 +114,9 @@ class ValidatorImportRunDedupeTest extends TestCase
 
     /** Session data key the SINGLE-address verdict cache lives under. */
     private const VERIFY_CACHE_SESSION_KEY = 'loqate_verified_addresses';
+
+    /** Session data key the captured-address store lives under. */
+    private const CAPTURED_ADDRESSES_SESSION_KEY = 'captured_addresses';
 
     /** Config path of the threshold batch verdicts are judged against. */
     private const AQI_CONFIG_PATH = 'loqate_settings/address_settings/address_quality_index';
@@ -188,11 +210,13 @@ class ValidatorImportRunDedupeTest extends TestCase
      * cache that was already there.
      *
      * WHAT THE FIXTURE DELIBERATELY DOES NOT CONTAIN, asserted rather than promised: no address
-     * appears twice inside ONE chunk. Two copies of an address in a single batch are both sent,
+     * appears twice inside ONE chunk. All k copies of an address in a single batch are sent,
      * because nothing is written until the response comes back - that is LOQ-17015, a separate
      * ticket with its own arithmetic (the row-count guard in verifyMultipleAddresses() depends
      * on one response row per sent item), and pulling it into this measurement would make the
-     * headline number unmeetable for a reason this ticket is not about.
+     * headline number unmeetable for a reason this ticket is not about. That bound is measured
+     * on its own fixture by
+     * testEveryCopyInTheChunkAnAddressFirstAppearsInIsBilledAndEveryLaterChunkIsFree().
      */
     public function testAnImportRunLargerThanTheCacheLimitBillsEachDistinctAddressOnce(): void
     {
@@ -433,19 +457,36 @@ class ValidatorImportRunDedupeTest extends TestCase
     }
 
     /**
-     * An UNREADABLE THRESHOLD rejects every row, and is remembered nowhere - so a repeated row
-     * is billed again.
+     * An UNREADABLE THRESHOLD rejects every row, is remembered nowhere - and is NOT PAID FOR.
      *
-     * The threshold side of the same rule, and the one that is easier to get wrong, because the
-     * rejection LOOKS like a verdict: the response was perfectly readable, and the only
-     * unreadable thing is the merchant's own configuration. It is still not a verdict. A value
-     * nobody can read cannot be said to admit or refuse any address, so remembering the
-     * refusal would keep refusing rows after the configuration was corrected - within the run
-     * for the run-scoped memory, and for the whole session had it been stored there.
+     * The threshold side of the "never remember a verdict we could not read" rule, and the one
+     * that is easier to get wrong, because the rejection LOOKS like a verdict: the response was
+     * perfectly readable, and the only unreadable thing is the merchant's own configuration. It
+     * is still not a verdict. A value nobody can read cannot be said to admit or refuse any
+     * address, so remembering the refusal would keep refusing rows after the configuration was
+     * corrected - within the run for the run-scoped memory, and for the whole session had it
+     * been stored there.
+     *
+     * THE BILLED COUNT IS ZERO, AND THAT IS THE CORRECTION LOQ-17148 MAKES HERE. This test used
+     * to assert FOUR - two rows, sent again in the repeat chunk - on the reasoning that a
+     * rejection nobody could read must be re-earned rather than replayed. That reasoning is
+     * sound for an unreadable RESPONSE, where only Loqate can settle the row (see
+     * testAnUnreadableQualityIndexIsRememberedNowhereSoTheRowIsBilledAgain(), which still bills
+     * twice). It is wrong for an unreadable THRESHOLD, because nothing Loqate could answer would
+     * change the outcome: the bar cannot be read, so EVERY row is refused whatever comes back,
+     * and the answer is settled by the configuration before the request is composed. Paying per
+     * address for it is paying for a guaranteed refusal - on every row of the file, on every
+     * "Check Data" click, for as long as the setting stays broken. So the threshold is read once
+     * before payload assembly and the whole file is answered without a request.
+     *
+     * The other three assertions are unchanged, and they are what stops "spend nothing" being
+     * implemented as "remember the refusal": both chunks still reject both rows, and the session
+     * store is still empty.
      *
      * 'E' is the AQI under test on purpose: the worst grade Loqate returns is the value that
      * must never pass a threshold nobody can read, and a test using 'A' would still pass if the
-     * guard regressed to comparing against the shipped default.
+     * guard regressed to comparing against the shipped default. It is now also the grade that is
+     * never asked for.
      *
      * @param mixed $threshold Configured address_quality_index that cannot be read as a grade.
      * @param string $why What this case protects, quoted into the failure message.
@@ -483,17 +524,29 @@ class ValidatorImportRunDedupeTest extends TestCase
             'The repeated rows must be rejected on their own answer, not on a remembered one.'
         );
         $this->assertSame(
-            4,
+            0,
             $this->addressesBilled($request),
-            'Both rows must be BILLED AGAIN in the later chunk. A rejection produced by a threshold we '
-            . 'could not read is a configuration fault report, not a verdict: remembered, it would keep '
-            . 'rejecting rows after the merchant corrected the setting, and it would do so for a whole '
-            . 'import run with no request made and nothing in the log for the rows after the first.'
+            'NOT ONE address may be billed. The answer is decided by the CONFIGURATION before the request '
+            . 'is composed - a threshold nobody can read refuses every row whatever Loqate replies - so '
+            . 'buying the reply is paying, per address and per "Check Data" click, for a refusal that was '
+            . 'already made. Contrast an unreadable RESPONSE, which IS re-billed on its repeat '
+            . '(testAnUnreadableQualityIndexIsRememberedNowhereSoTheRowIsBilledAgain()): there only Loqate '
+            . 'can settle the row, so paying to ask again is the cheaper mistake. Here nobody can.'
         );
         $this->assertSame(
             [],
             $this->batchStore($request),
             'And nothing may be written to the session store, where it would outlive the request entirely.'
+        );
+        $this->assertSame(
+            [],
+            $this->runScopedVerdicts($request),
+            'NOR to the run-scoped map, read here DIRECTLY and not inferred. That directness is the point: '
+            . 'while this test asserted four billed addresses, the re-billing was itself the evidence that '
+            . 'nothing had been remembered. At zero there is no such evidence left - a refusal that HAD '
+            . 'been remembered would produce the same zero and the same [false, false] - so the memory is '
+            . 'read instead. It has to stay empty, or a merchant who corrects the setting mid-run keeps '
+            . 'being refused by a rule that no longer applies.'
         );
     }
 
@@ -528,6 +581,286 @@ class ValidatorImportRunDedupeTest extends TestCase
                 . 'comparison anyone reasoned about',
             ],
         ];
+    }
+
+    /**
+     * An unreadable threshold issues NO REQUEST AT ALL, and says so EXACTLY ONCE PER BATCH.
+     *
+     * The wire-and-diagnostic half of the test above, which measures verdicts and memories. Two
+     * separate guarantees are pinned here and both are new in LOQ-17148:
+     *
+     * NO REQUEST, not merely no billed addresses. The distinction is not academic: an
+     * implementation that assembled the payload and then answered every slot false before
+     * sending would satisfy a per-address count of zero taken from the payloads while still
+     * making a call, and the endpoint is billable per address it carries - an empty
+     * 'Addresses' list to a billable endpoint is the worst version of that, since it pays for a
+     * round trip and discards the answer. The threshold is therefore read BEFORE payload
+     * assembly, and this asserts the request count itself.
+     *
+     * EXACTLY ONE LINE PER BATCH, which is a frequency and not just a presence. Zero would leave
+     * the merchant with a whole file of "Invalid address at row #N" and nothing anywhere saying
+     * their own setting refused it - the failure this line exists to prevent. One per ROW would
+     * bury it: a 100-row chunk would write 100 identical lines and a 10,000-row file 10,000, so
+     * the signal is lost in its own volume and the log costs real money to ship. The line is
+     * asserted BYTE FOR BYTE, because it is a merchant-facing artefact that support reads out of
+     * a log file: rewording it is a decision to make deliberately, which means updating this
+     * expectation, not one to have absorbed by a test matching a fragment.
+     *
+     * @param mixed $threshold Configured address_quality_index that cannot be read as a grade.
+     * @param string $why What this case protects, quoted into the failure message.
+     */
+    #[DataProvider('unreadableThresholdProvider')]
+    public function testAnUnreadableThresholdIssuesNoRequestAndSaysSoOncePerBatch($threshold, string $why): void
+    {
+        $request = $this->createRequest(
+            null,
+            new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => $threshold])),
+            static fn ($payload): array => array_map(
+                static fn (): array => [['AQI' => 'E', 'AVC' => self::CARRIED_AVC]],
+                (array)$payload['Addresses']
+            )
+        );
+        $rows = [$this->distinctAddress(1), $this->distinctAddress(2)];
+
+        $firstChunk = $request['validator']->verifyMultipleAddresses($rows, false);
+
+        $this->assertSame(
+            0,
+            $this->apiCallCount($request),
+            sprintf(
+                'A batch under a threshold nobody can read must issue NO REQUEST - not an empty '
+                . '\'Addresses\' payload to a billable endpoint, and not one carrying rows whose verdict '
+                . 'the configuration has already settled. This case pins that %s.',
+                $why
+            )
+        );
+        $this->assertSame(
+            [false, false],
+            array_values($firstChunk),
+            'And every row is still answered, and still answered false: spending nothing may not become '
+            . 'reporting nothing. A row with no verdict at all would be dropped from the merchant\'s '
+            . 'report entirely, or - on the admin order path - accepted unverified.'
+        );
+        $this->assertSame(
+            [$this->expectedBrokenThresholdLine($threshold)],
+            $this->thresholdLogLines($request),
+            'ONE line, and this exact line. It is the only signal a merchant has that their own quality '
+            . 'bar - not their data - is what refused the file, so it must name the offending value and '
+            . 'its type and say what the accepted values are. Zero lines is the defect this replaces; one '
+            . 'per ROW would bury the signal under a line per import row.'
+        );
+
+        $request['validator']->verifyMultipleAddresses($rows, false);
+
+        $this->assertSame(
+            0,
+            $this->apiCallCount($request),
+            'The repeat chunk must not buy the answer either. Nothing was remembered - there is nothing a '
+            . 'broken threshold could legitimately remember - so this has to be re-decided each time, and '
+            . 're-deciding it costs nothing.'
+        );
+        $this->assertSame(
+            2,
+            count($this->thresholdLogLines($request)),
+            'Once per BATCH: the second chunk gets its own line, because the merchant\'s bar is still '
+            . 'broken and each verified batch is an occasion on which it mattered. Two chunks, two lines - '
+            . 'not four (one per row) and not one (a per-instance latch that would go quiet on the very '
+            . 'file that needed the warning most).'
+        );
+    }
+
+    /**
+     * ...and the line still fires on a file Loqate answers with NO MATCHES AT ALL.
+     *
+     * THE SECOND DEFECT LOQ-17148 CLOSES, and it is easy to miss because it looks like the same
+     * test as the one above. It is not: the old code read the threshold only from
+     * checkQualityIndex(), on the RESPONSE side, and that method returns on an unreadable AQI
+     * BEFORE it ever looks at the threshold. "Matches":[] is Loqate's ordinary answer for an
+     * address it could not match, and on a poor file that is most of the file - so a merchant
+     * whose threshold was broken AND whose file matched badly got every row rejected and NOT ONE
+     * line telling them why. The two faults hid each other, and the worse-configured the install,
+     * the quieter it was.
+     *
+     * The response stub below is now never consulted, which is the point rather than a
+     * redundancy: the guarantee is that the diagnostic no longer depends on what comes back,
+     * because nothing comes back. If the pre-flight is ever narrowed or moved after the request,
+     * this fixture is the one that goes quiet again.
+     */
+    public function testAnUnreadableThresholdStillReportsItselfOnAFileLoqateMatchesNowhere(): void
+    {
+        $request = $this->createRequest(
+            null,
+            new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => 'zzz'])),
+            // "Matches":[] for every address - the shape that survives the connector's
+            // array_column() with the row count preserved, so it reaches the attribution loop
+            // as an AQI of null and used to return from checkQualityIndex() before the
+            // threshold was read.
+            static fn ($payload): array => array_map(
+                static fn (): array => [],
+                (array)$payload['Addresses']
+            )
+        );
+        $rows = [$this->distinctAddress(1), $this->distinctAddress(2)];
+
+        $verdicts = $request['validator']->verifyMultipleAddresses($rows, false);
+
+        $this->assertSame(
+            [$this->expectedBrokenThresholdLine('zzz')],
+            $this->thresholdLogLines($request),
+            'A file Loqate matches nowhere must STILL produce the broken-threshold line. It used to '
+            . 'produce none: the unreadable AQI returned from checkQualityIndex() before the threshold '
+            . 'was ever read, so the one diagnostic that would have told the merchant their setting was '
+            . 'the problem was suppressed by exactly the kind of file that makes it hardest to guess.'
+        );
+        $this->assertSame([false, false], array_values($verdicts), 'Every row is still rejected.');
+        $this->assertSame(
+            0,
+            $this->apiCallCount($request),
+            'And it is reported without asking Loqate anything, so the diagnostic no longer depends on '
+            . 'the answer at all.'
+        );
+    }
+
+    /**
+     * A CAPTURED address still passes under an unreadable threshold, and still costs no request.
+     *
+     * A DELIBERATE DEVIATION, pinned so it is a decision rather than an accident of where the
+     * guard was pasted. The pre-flight sits AFTER the captured-address short-circuit and not
+     * before it, so an address the Loqate lookup itself authored is answered true even while the
+     * merchant's quality bar is unreadable. Two reasons, both about not making things worse: a
+     * captured address never consults the AQI at all - it is trusted because Loqate produced it,
+     * not because it was graded - so refusing it would be a NEW refusal on a batch that passes
+     * today, on the one path where the module is most confident; and the alternative reading,
+     * "the configuration is broken so refuse everything", would turn a mis-set dropdown into a
+     * total block of admin order create for addresses picked from the lookup.
+     *
+     * The mixed batch is what makes it a deviation rather than a special case: the captured row
+     * passes and the typed row beside it is refused, in ONE call, so the guard demonstrably runs
+     * per row and after the short-circuit rather than as a whole-batch bail-out.
+     */
+    public function testACapturedAddressStillPassesUnderAnUnreadableThresholdAndStillCostsNoRequest(): void
+    {
+        $captured = $this->distinctAddress(1);
+        $typed = $this->distinctAddress(2);
+
+        $request = $this->createRequest(
+            null,
+            new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => 'zzz'])),
+            static fn ($payload): array => array_map(
+                static fn (): array => [['AQI' => 'E', 'AVC' => self::CARRIED_AVC]],
+                (array)$payload['Addresses']
+            )
+        );
+        $request['session'][self::CAPTURED_ADDRESSES_SESSION_KEY] = [self::capturedEntry($captured)];
+
+        $verdicts = $request['validator']->verifyMultipleAddresses(
+            ['captured' => $captured, 'typed' => $typed],
+            true
+        );
+
+        $this->assertSame(
+            ['captured' => true, 'typed' => false],
+            $verdicts,
+            'The captured address must still PASS. The pre-flight threshold guard is deliberately placed '
+            . 'AFTER the captured-address short-circuit: a captured address never consults the AQI, so '
+            . 'refusing it would be a brand-new refusal on a batch that passes today, and a mis-set '
+            . 'dropdown would become a total block of every address picked from the Loqate lookup. The '
+            . 'typed row beside it is still refused, which is what shows the guard runs per row rather '
+            . 'than bailing the batch out.'
+        );
+        $this->assertSame(
+            0,
+            $this->apiCallCount($request),
+            'And nothing is bought either way: the captured row needs no verification and the typed row\'s '
+            . 'answer is already settled.'
+        );
+        $this->assertSame(
+            [],
+            $this->batchStore($request),
+            'Nor is the captured pass written to the verdict store: it is not a verdict, it is a bypass, '
+            . 'and it is keyed under a threshold nobody can read.'
+        );
+    }
+
+    /**
+     * THE LOQ-17015 RESIDUE BOUND, both halves, pinned so it cannot drift back into prose.
+     *
+     * WHAT THE BOUND IS. An address appearing k times in the chunk where it FIRST appears is
+     * billed k TIMES, up to the chunk size; every appearance in any LATER chunk is free. The
+     * pre-flight loop runs to completion over the whole chunk before the request is issued, and
+     * the only writer to either memory is rememberBatchVerdict(), which runs AFTER the response
+     * - so all k copies miss, and all k go on the wire.
+     *
+     * WHY IT IS PINNED RATHER THAN DESCRIBED. The bound published with the first half of this
+     * work said the residue was "ONE duplicate charge per distinct address per run", and
+     * labelled that verified. It was not: the two-copy case had been probed and generalised to
+     * all n without being run. Two reviewers then disproved it independently BY EXECUTION. A
+     * claim about a billing bound that nothing executes is a claim that will be wrong again, so
+     * both halves now have a test - three copies, not two, because three is the smallest count
+     * that tells "k copies cost k" from "the first copy plus one".
+     *
+     * BOTH POLARITIES IN ONE FIXTURE, deliberately. A rejected address is remembered only in the
+     * RUN map and a passing one in both memories, so an implementation that de-duplicated
+     * intra-chunk copies for one polarity and not the other would still satisfy a single-polarity
+     * test. Six rows, two distinct addresses, one accepted and one rejected.
+     *
+     * IF THIS TEST EVER GOES RED BECAUSE THE COUNT DROPPED, that is LOQ-17015 being fixed and it
+     * is good news - but read verifyMultipleAddresses()' ACCEPTED LIMITS first: collapsing
+     * duplicates into a single payload slot changes the row arithmetic the row-count guard and
+     * the positional attribution both depend on, so the dedupe and that guard have to change
+     * TOGETHER.
+     */
+    public function testEveryCopyInTheChunkAnAddressFirstAppearsInIsBilledAndEveryLaterChunkIsFree(): void
+    {
+        $accepted = $this->distinctAddress(1);
+        $rejected = $this->distinctAddress(2);
+        $this->apiVerdicts[$rejected['street'][0]] = 'fail';
+
+        $chunk = array_merge(array_fill(0, 3, $accepted), array_fill(0, 3, $rejected));
+
+        $firstChunk = $this->request['validator']->verifyMultipleAddresses($chunk, false);
+
+        $this->assertSame(
+            array_merge(
+                array_fill(0, 3, $accepted['street'][0]),
+                array_fill(0, 3, $rejected['street'][0])
+            ),
+            $this->streetsBilled($this->request),
+            'Read off the WIRE: all THREE copies of each address really were sent, in row order. Nothing '
+            . 'is written to either memory until the response comes back, and the pre-flight loop runs to '
+            . 'completion over the whole chunk before the request is issued, so every copy misses. That is '
+            . 'LOQ-17015, and its bound is the CHUNK SIZE - 100 identical rows in one chunk bill 100 - not '
+            . 'one charge per distinct address, which is what an earlier revision of this claim said.'
+        );
+        $this->assertSame(
+            [true, true, true, false, false, false],
+            array_values($firstChunk),
+            'And every copy is answered under its own row, with the verdict of the address on that row: '
+            . 'the row-count guard and the positional attribution both depend on ONE RESPONSE ROW PER SENT '
+            . 'ITEM, which is exactly what makes the copies cost what they cost.'
+        );
+
+        $laterChunk = $this->request['validator']->verifyMultipleAddresses($chunk, false);
+
+        $this->assertSame(
+            6,
+            $this->addressesBilled($this->request),
+            'THE OTHER HALF: an identical LATER chunk bills NOTHING. By then both memories hold both '
+            . 'addresses - the pass in the session store and the run map, the rejection in the run map '
+            . 'alone - so all six rows are answered from memory. Six billed addresses in total, not '
+            . 'twelve, and the residue is bounded by the chunk an address first appears in.'
+        );
+        $this->assertSame(
+            1,
+            $this->apiCallCount($this->request),
+            'And it issues no request at all, not even an empty one.'
+        );
+        $this->assertSame(
+            [true, true, true, false, false, false],
+            array_values($laterChunk),
+            'The replayed chunk must report the same verdicts under its own keys, including the rejections: '
+            . 'a de-duplicated row that loses its slot renumbers every import row after it.'
+        );
     }
 
     /**
@@ -792,7 +1125,7 @@ class ValidatorImportRunDedupeTest extends TestCase
                 count($chunk),
                 count(array_unique($chunk)),
                 sprintf(
-                    'Chunk #%d must not repeat an address WITHIN itself. Two copies in one batch are both '
+                    'Chunk #%d must not repeat an address WITHIN itself. ALL k copies in one batch are '
                     . 'sent - nothing is written until the response comes back - which is LOQ-17015 and its '
                     . 'own arithmetic, so including one here would make this measurement unmeetable for a '
                     . 'reason LOQ-17148 is not about.',
@@ -839,7 +1172,7 @@ class ValidatorImportRunDedupeTest extends TestCase
      * @param ArrayObject|null $config Live store configuration, config path => value.
      * @param callable|null $respond Replacement connector response builder, given the payload.
      * @return array{validator: Validator, connector: Verify&MockObject, requests: ArrayObject,
-     *     session: ArrayObject, config: ArrayObject}
+     *     session: ArrayObject, config: ArrayObject, logs: ArrayObject}
      */
     private function createRequest(
         ?ArrayObject $session = null,
@@ -850,7 +1183,17 @@ class ValidatorImportRunDedupeTest extends TestCase
         $requests = new ArrayObject();
         $configStore = $config ?? new ArrayObject(self::configWith([]));
 
+        // Every INFO record the Validator wrote, in order. Needed by the pre-flight tests: the
+        // "your quality bar is broken" line is the ONLY signal a merchant has that their
+        // configuration - and not their file - is what rejected every row, and its FREQUENCY is
+        // part of the guarantee (once per verified batch, not once per row and not never).
+        $logs = new ArrayObject();
         $logger = $this->createMock(Logger::class);
+        $logger->method('info')->willReturnCallback(
+            static function ($message, array $context = []) use ($logs) {
+                $logs[] = (string)$message;
+            }
+        );
 
         // The shared Test/stubs Session is a no-op (getData() returns null, setData() stores
         // nothing), so nothing could ever survive between calls and every "is this remembered"
@@ -922,30 +1265,8 @@ class ValidatorImportRunDedupeTest extends TestCase
         // mock returns 0 anyway, but relying on that hides which scope a key was built for.
         $helper->method('getCurrentStore')->willReturn(0);
 
-        // Fails the way the PRODUCTION serializer fails.
-        // Magento\Framework\Serialize\Serializer\Json::unserialize() THROWS
-        // \InvalidArgumentException on anything it cannot decode - the empty string and null
-        // included - rather than answering null. A lenient `fn ($v) => json_decode($v, true)`
-        // double makes getCachedBatchVerifyResult()'s catch block unreachable from the harness,
-        // so an import meeting a truncated session payload would fatal in production while this
-        // file stayed green. Mirrors CapturedAddressStoreTest::createSerializerDouble() and
-        // ValidatorBatchVerifyCacheTest::createSerializerDouble().
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(
-            static function ($value) {
-                if ($value === false || $value === null || $value === '') {
-                    throw new \InvalidArgumentException('Unable to unserialize value.');
-                }
-
-                $decoded = json_decode($value, true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    throw new \InvalidArgumentException('Unable to unserialize value, string is corrupted.');
-                }
-
-                return $decoded;
-            }
-        );
+        // Fails the way the PRODUCTION serializer fails - see the trait for why that matters.
+        $serializer = $this->createSerializerDouble();
 
         $validator = new Validator($logger, $sessionMock, $regionFactory, $moduleList, $helper, $serializer);
 
@@ -981,6 +1302,7 @@ class ValidatorImportRunDedupeTest extends TestCase
             'requests' => $requests,
             'session' => $sessionStore,
             'config' => $configStore,
+            'logs' => $logs,
         ];
     }
 
@@ -1098,6 +1420,66 @@ class ValidatorImportRunDedupeTest extends TestCase
         return count($request['requests']);
     }
 
+    /**
+     * The broken-quality-bar INFO records a request emitted, in order.
+     *
+     * Filtered rather than taken whole, because the same logger carries unrelated INFO records
+     * (a missing API key, a response whose row count could not be attributed) and this file's
+     * subject is only the one line a merchant needs to see when their own setting is what
+     * refused the file.
+     *
+     * @param array $request Request harness from createRequest().
+     * @return string[]
+     */
+    private function thresholdLogLines(array $request): array
+    {
+        return array_values(array_filter(
+            iterator_to_array($request['logs']),
+            static fn (string $line): bool => str_contains($line, 'address_quality_index')
+        ));
+    }
+
+    /**
+     * The exact line Validator must write for a threshold it cannot read.
+     *
+     * The accepted grades come from Validator::VALID_QUALITY_INDEXES rather than being spelled
+     * out, so a grade added to the module is offered to the merchant in this message without
+     * anybody having to remember this file - the WORDING is what is pinned here, not the list.
+     *
+     * @param mixed $threshold The unreadable configured value.
+     * @return string
+     */
+    private function expectedBrokenThresholdLine($threshold): string
+    {
+        return sprintf(
+            'Loqate: address_quality_index is not a recognised quality index (%s of type %s); '
+            . 'rejecting the address. Set it to one of %s.',
+            var_export($threshold, true),
+            gettype($threshold),
+            implode(', ', Validator::VALID_QUALITY_INDEXES)
+        );
+    }
+
+    /**
+     * A captured-address store entry for a Magento-shaped address, as
+     * Helper\Controller::storeCapturedAddress() writes it: the ADDRESS_CAPTURE_MAPPING keys,
+     * serialised. Mirrors ValidatorBatchVerifyCacheTest::capturedEntry().
+     *
+     * @param array $address Magento-shaped address.
+     * @return string
+     */
+    private static function capturedEntry(array $address): string
+    {
+        return (string)json_encode([
+            'Address1' => $address['street'][0] ?? '',
+            'Address2' => $address['street'][1] ?? '',
+            'Address3' => $address['city'] ?? '',
+            'Address4' => $address['region'] ?? '',
+            'PostalCode' => $address['postcode'] ?? '',
+            'Country' => $address['country_id'] ?? '',
+        ]);
+    }
+
     /** The BATCH verdict cache as currently held in a request's session. */
     private function batchStore(array $request): array
     {
@@ -1112,6 +1494,28 @@ class ValidatorImportRunDedupeTest extends TestCase
         $store = $request['session'][self::VERIFY_CACHE_SESSION_KEY] ?? [];
 
         return is_array($store) ? $store : [];
+    }
+
+    /**
+     * The RUN-scoped verdict map of a request's Validator, read straight off the instance.
+     *
+     * The other memory, and the only way to see it. It is never serialised and never written to
+     * the session - that mortality is the feature - so unlike the session stores there is no
+     * artefact to inspect and no second request that could report on it: a fresh Validator
+     * simply has an empty one. Reflection is therefore not a shortcut past a public route, it is
+     * the only route. Used where "remembered nowhere" has to be asserted rather than inferred
+     * from a billed count, which stopped being evidence once the count under a broken threshold
+     * became zero.
+     *
+     * @param array $request Request harness from createRequest().
+     * @return array<string, bool> Batch cache key => remembered verdict.
+     */
+    private function runScopedVerdicts(array $request): array
+    {
+        $map = new ReflectionProperty(Validator::class, 'runScopedBatchVerdicts');
+        $map->setAccessible(true);
+
+        return (array)$map->getValue($request['validator']);
     }
 
     /**

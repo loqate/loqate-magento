@@ -34,11 +34,13 @@ use SimpleXMLElement;
  * from Validator's own list by reflection. A test that spelled out A-E would agree with itself
  * forever while the shipped XML said something else.
  *
- * FIRST TEST IN THIS SUITE TO PARSE etc/*.xml, so it is kept to the two questions that cannot be
- * answered any other way - is the field there, and is it a select over the right source - rather
- * than becoming a schema validator. Everything behavioural about the threshold is asserted where
- * behaviour belongs: Test\Unit\Helper\ValidatorImportRunDedupeTest verifies an address at every
- * selectable grade, and ValidatorBatchVerifyCacheTest pins what an unreadable one does.
+ * FIRST TEST IN THIS SUITE TO PARSE etc/*.xml, so it is kept to the questions that cannot be
+ * answered any other way rather than becoming a schema validator. There are four: is the field
+ * there, is it a select over the right source, do its section/group/field ids compose the path
+ * the verifier reads, and is it offered at the scope the readers can actually honour. Everything
+ * behavioural about the threshold is asserted where behaviour belongs:
+ * Test\Unit\Helper\ValidatorImportRunDedupeTest verifies an address at every selectable grade,
+ * and ValidatorBatchVerifyCacheTest pins what an unreadable one does.
  */
 class AddressQualityIndexTest extends TestCase
 {
@@ -46,6 +48,36 @@ class AddressQualityIndexTest extends TestCase
     private const SECTION_ID = 'loqate_settings';
     private const GROUP_ID = 'address_settings';
     private const FIELD_ID = 'address_quality_index';
+
+    /**
+     * The config path Validator::resolveQualityIndexThreshold() actually reads, spelled out as
+     * the literal it is in the production source.
+     *
+     * SHARED, ON PURPOSE, with Test\Unit\Helper\ValidatorImportRunDedupeTest::AQI_CONFIG_PATH -
+     * the two are the same string and are meant to be. That class's behavioural half writes this
+     * path into a live configuration double and shows the verifier's verdict change, so it is
+     * evidence that this literal is the one the verifier reads; this class then ties the admin
+     * SECTION/GROUP/FIELD to it. Neither half is worth much alone: without the tie, renaming the
+     * group in both the XML and this file's constants leaves the field writing to a path nothing
+     * reads and the suite green; without the behavioural half, this is a string compared with
+     * itself.
+     */
+    private const VERIFIER_CONFIG_PATH = 'loqate_settings/address_settings/address_quality_index';
+
+    /**
+     * The scope attributes the field must ship with, and etc/adminhtml/system.xml's own reason
+     * for each: both callers of the threshold are adminhtml plugins reading it through
+     * Helper\Data::getConfigValue(), a SCOPE_STORE read with NO STORE NAMED, so a per-website or
+     * per-store-view override would be a knob that either does nothing or silently applies to a
+     * different store view than the merchant set it against.
+     *
+     * @var array<string, string>
+     */
+    private const REQUIRED_FIELD_SCOPE = [
+        'showInDefault' => '1',
+        'showInWebsite' => '0',
+        'showInStore' => '0',
+    ];
 
     /**
      * The admin field must be a SELECT over a source model.
@@ -56,25 +88,23 @@ class AddressQualityIndexTest extends TestCase
      * feedback anywhere. A select whose options come from a source model can only ever hold a
      * value that list contains.
      *
-     * The group matters as well as the section: the threshold belongs beside the other
-     * address-verification settings a merchant is looking at when they change it, and the config
-     * path the verifier reads
-     * (loqate_settings/address_settings/address_quality_index, via
-     * Validator::resolveQualityIndexThreshold()) is composed of section/group/field - so a field
-     * in the right section but the wrong group writes to a path nothing reads.
+     * The group matters as well as the section, and the third assertion is what makes that
+     * matter TESTABLE. Magento composes the config path a field writes to as
+     * section/group/field, and Validator::resolveQualityIndexThreshold() reads one literal
+     * path - so a field in the right section but the wrong group writes somewhere nothing reads,
+     * and the merchant's chosen quality bar has no effect at all. Until that third assertion
+     * existed, renaming the group in BOTH the XML and this file's constants left the suite
+     * entirely green while doing exactly that; the field's coordinates were only ever compared
+     * with themselves. See self::VERIFIER_CONFIG_PATH for the other half of the argument - why
+     * that literal is known to be the one the verifier reads.
      */
     public function testTheThresholdIsAdminSelectableRatherThanFreeText(): void
     {
-        $fields = $this->systemXml()->xpath(sprintf(
-            '/config/system/section[@id="%s"]/group[@id="%s"]/field[@id="%s"]',
-            self::SECTION_ID,
-            self::GROUP_ID,
-            self::FIELD_ID
-        ));
+        $fields = $this->thresholdField();
 
         $this->assertCount(
             1,
-            (array)$fields,
+            $fields,
             sprintf(
                 'etc/adminhtml/system.xml must expose exactly one "%s" field in the "%s" group of the "%s" '
                 . 'section. With no field at all the threshold is reachable only by data patch or CLI, so a '
@@ -105,6 +135,69 @@ class AddressQualityIndexTest extends TestCase
             . 'That is what ties what the merchant is OFFERED to what the verifier ACCEPTS; a hand-written '
             . 'option list in the XML would be a second copy of that list, free to drift.'
         );
+        $this->assertSame(
+            self::VERIFIER_CONFIG_PATH,
+            implode('/', [self::SECTION_ID, self::GROUP_ID, self::FIELD_ID]),
+            'The field\'s section/group/field coordinates must COMPOSE the path the verifier reads. '
+            . 'Magento derives a field\'s config path from exactly those three ids, and '
+            . 'Validator::resolveQualityIndexThreshold() reads one literal path, so a field placed in '
+            . 'another group is a form control that writes to a row nothing ever loads: the merchant '
+            . 'chooses a quality bar, saves, sees no error and gets no change - the shipped default keeps '
+            . 'deciding every import row. Without this assertion the three ids above were only ever '
+            . 'compared with the XML they were copied from, so renaming the group in both places was '
+            . 'silently green.'
+        );
+    }
+
+    /**
+     * The field is DEFAULT SCOPE ONLY: showInDefault="1", showInWebsite="0", showInStore="0".
+     *
+     * THE ONLY MERCHANT-VISIBLE DECISION THIS TICKET MAKES, and until now the only one with no
+     * test: mutating both zeros to "1" left the whole suite green. etc/adminhtml/system.xml
+     * calls the choice "a deliberate choice rather than a copied line" and gives its reason at
+     * length, so it is exactly the kind of decision that must fail loudly when reversed rather
+     * than be reversed by someone copying the 1/1/1 of the AVC thresholds directly below it.
+     *
+     * WHY IT IS THIS AND NOT 1/1/1. Both callers of the threshold are adminhtml plugins -
+     * Plugin\Admin\OrderSave and Plugin\Admin\ValidateImportAddress - and both read it through
+     * Helper\Data::getConfigValue(), which is a SCOPE_STORE read with NO STORE NAMED. Neither
+     * names the store view of the order it is judging or of the customers being imported, so
+     * whatever store the admin area resolves as current decides the value. Offering a per-website
+     * or per-store-view override would therefore be a control that either does nothing or
+     * silently applies to a different store view than the merchant set it against - the same
+     * class of defect, a setting whose effect cannot be predicted from the form, that LOQ-17148
+     * exists to close.
+     *
+     * IF YOU ARE HERE BECAUSE THIS FAILED: widening the scope needs the READERS changed first,
+     * to name the store they are judging (Helper\Data::getConfigValueForStore() exists for
+     * precisely that). The cache key already namespaces per store view and does not need
+     * touching. Widening the field alone ships the knob without the behaviour.
+     */
+    public function testTheThresholdIsConfigurableAtDefaultScopeOnly(): void
+    {
+        $field = $this->thresholdField()[0];
+
+        $scope = [];
+        foreach (array_keys(self::REQUIRED_FIELD_SCOPE) as $attribute) {
+            $scope[$attribute] = (string)($field[$attribute] ?? '');
+        }
+
+        $this->assertSame(
+            self::REQUIRED_FIELD_SCOPE,
+            $scope,
+            'The threshold field must be shown at DEFAULT scope only. showInWebsite="1" or showInStore="1" '
+            . 'offers the merchant an override that cannot work: both readers resolve the value through a '
+            . 'SCOPE_STORE read with no store named, so a per-view value applies to whichever store view '
+            . 'the admin area happens to resolve as current - not to the one the merchant set it against, '
+            . 'and not to the order or the import being judged.'
+        );
+        $this->assertSame(
+            ['showInDefault' => '1', 'showInWebsite' => '0', 'showInStore' => '0'],
+            self::REQUIRED_FIELD_SCOPE,
+            'Guard on the expectation itself, spelled out rather than referenced: this test is worth '
+            . 'nothing if the constant it compares against is edited to match a widened field. Changing '
+            . 'BOTH lines is the deliberate act the XML comment asks for.'
+        );
     }
 
     /**
@@ -113,6 +206,18 @@ class AddressQualityIndexTest extends TestCase
      * This is the direction that produces the silent total block: a selectable value outside the
      * verifier's accepted list makes checkQualityIndex() refuse to judge at all, so EVERY address
      * is rejected - reported to the merchant as an invalid row rather than as a bad setting.
+     *
+     * WHAT THIS PAIR OF TESTS ACTUALLY IS, said plainly because the name suggests more. It is a
+     * DRIFT GUARD ON A DERIVATION, not a comparison of two independent artefacts.
+     * AddressQualityIndex::toOptionArray() derives its values FROM Validator::VALID_QUALITY_INDEXES,
+     * so as long as the derivation is a straight projection both directions hold by construction
+     * and this one in particular cannot fail. It is kept for what it catches when that stops
+     * being true: the day the source model is hand-written, filtered, re-ordered into a
+     * hard-coded list, or given a placeholder option, the two sides stop being one artefact and
+     * these become real comparisons. Direction 2 -
+     * testEveryThresholdTheVerifierAcceptsIsSelectable() - has teeth sooner, because a FILTERED
+     * derivation (a "Not recommended" grade quietly dropped from the dropdown) still satisfies
+     * this direction while hiding a value the verifier honours.
      */
     public function testEverySelectableThresholdIsOneTheVerifierAccepts(): void
     {
@@ -142,6 +247,13 @@ class AddressQualityIndexTest extends TestCase
      * form does not offer is a setting only whoever knows the config path can reach, which is the
      * state this ticket found the threshold in. Keeping the two lists equal is also what makes
      * the source model's list DERIVED from the verifier's rather than a copy of it.
+     *
+     * THIS IS THE HALF WITH TEETH, for the reason set out on the test above: both sides derive
+     * from Validator::VALID_QUALITY_INDEXES, so a straight projection satisfies both directions
+     * by construction - but a FILTERED derivation does not. A source model that dropped a grade
+     * from the dropdown ("Poor" hidden as not recommended) would still offer only values the
+     * verifier accepts, and only this direction would notice that a threshold the verifier
+     * honours had become unreachable from the form.
      */
     public function testEveryThresholdTheVerifierAcceptsIsSelectable(): void
     {
@@ -168,7 +280,7 @@ class AddressQualityIndexTest extends TestCase
      */
     public function testTheShippedDefaultThresholdIsSelectable(): void
     {
-        $defaults = $this->configXml()->xpath(sprintf(
+        $defaults = self::xpathMatches($this->configXml(), sprintf(
             '/config/default/%s/%s/%s',
             self::SECTION_ID,
             self::GROUP_ID,
@@ -177,7 +289,7 @@ class AddressQualityIndexTest extends TestCase
 
         $this->assertCount(
             1,
-            (array)$defaults,
+            $defaults,
             'etc/config.xml must ship exactly one default for the threshold: with none, a fresh install '
             . 'reads it as null, which the verifier cannot judge against and which therefore rejects every '
             . 'address on the batch paths.'
@@ -270,6 +382,42 @@ class AddressQualityIndexTest extends TestCase
         return array_map(static fn ($value): string => (string)$value, $accepted);
     }
 
+    /**
+     * The shipped threshold field, as a list of matching elements.
+     *
+     * @return SimpleXMLElement[] Empty when the field is absent, which the callers report.
+     */
+    private function thresholdField(): array
+    {
+        return self::xpathMatches($this->systemXml(), sprintf(
+            '/config/system/section[@id="%s"]/group[@id="%s"]/field[@id="%s"]',
+            self::SECTION_ID,
+            self::GROUP_ID,
+            self::FIELD_ID
+        ));
+    }
+
+    /**
+     * Evaluate an xpath and answer a real list of elements.
+     *
+     * SimpleXMLElement::xpath() answers FALSE on a malformed expression, and `(array) false` is
+     * `[false]` - a one-element array. So `assertCount(1, (array)$xml->xpath(...))` PASSES for a
+     * query that never ran, which is the assertion this replaces at both of its call sites: a
+     * typo'd expression, or a query against a document whose structure changed under it, read as
+     * "exactly one match found". Normalising to [] here means the count assertions count
+     * matches.
+     *
+     * @param SimpleXMLElement $xml Parsed document.
+     * @param string $expression Xpath expression.
+     * @return SimpleXMLElement[]
+     */
+    private static function xpathMatches(SimpleXMLElement $xml, string $expression): array
+    {
+        $matched = $xml->xpath($expression);
+
+        return is_array($matched) ? $matched : [];
+    }
+
     /** etc/adminhtml/system.xml, parsed. */
     private function systemXml(): SimpleXMLElement
     {
@@ -287,6 +435,16 @@ class AddressQualityIndexTest extends TestCase
      * it is missing or malformed - a malformed one would break the admin form itself, so it is
      * worth its own message.
      *
+     * THE libxml SUPPRESSION IS WHAT MAKES THE fail() BELOW REACHABLE. simplexml_load_string()
+     * reports a parse error by RAISING E_WARNING as well as by returning false, and this suite
+     * runs with failOnWarning="true" - so on a malformed file PHPUnit would fail the test on the
+     * warning before the false was ever examined, and the message explaining that Magento cannot
+     * read the file either would never be printed. libxml_use_internal_errors() diverts the
+     * warning into libxml's own buffer, which this then clears and does not read: the message
+     * below is the diagnostic worth having, and leaving the buffer dirty would leak parse errors
+     * into whatever ran next. The previous state is restored rather than assumed, because it is
+     * process-global.
+     *
      * @param string $path Absolute path to the file.
      * @return SimpleXMLElement
      */
@@ -294,7 +452,11 @@ class AddressQualityIndexTest extends TestCase
     {
         $this->assertFileExists($path, sprintf('%s is part of the module\'s shipped configuration.', $path));
 
+        $previous = libxml_use_internal_errors(true);
         $xml = simplexml_load_string((string)file_get_contents($path));
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+
         if ($xml === false) {
             $this->fail(sprintf('%s is not parseable XML, so Magento cannot read it either.', $path));
         }

@@ -8,6 +8,7 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\App\RequestInterface;
@@ -106,6 +107,9 @@ use stdClass;
  */
 class ShopperScopedAddressStoresTest extends TestCase
 {
+    /** The serializer double, shared with every other harness that reads a payload back. */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key lets both helpers build their API connectors. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -1760,9 +1764,11 @@ class ShopperScopedAddressStoresTest extends TestCase
         );
         $helper->method('getCurrentStore')->willReturn(0);
 
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(static fn ($value) => json_decode($value, true));
+        // Fails the way the PRODUCTION serializer fails - see the trait. It matters here because
+        // the flush this class exists to perform writes null over the three stores, and null is
+        // one of the values the production serializer REJECTS outright rather than decoding: a
+        // lenient double would let a reader that lost its guard look safe.
+        $serializer = $this->createSerializerDouble();
 
         $validator = new Validator(
             $this->createMock(Logger::class),

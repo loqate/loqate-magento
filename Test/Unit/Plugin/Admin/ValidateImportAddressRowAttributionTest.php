@@ -7,11 +7,11 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Plugin\Admin\ValidateImportAddress;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\CustomerImportExport\Model\Import\Address;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\Module\ModuleListInterface;
-use Magento\Framework\Serialize\SerializerInterface;
 use Magento\ImportExport\Model\Import;
 use Magento\ImportExport\Model\Import\ErrorProcessing\ProcessingError;
 use Magento\ImportExport\Model\Import\ErrorProcessing\ProcessingErrorAggregator;
@@ -60,6 +60,14 @@ use ReflectionProperty;
  */
 class ValidateImportAddressRowAttributionTest extends TestCase
 {
+    /**
+     * The serializer double, shared with every other harness that reads a serialised payload
+     * back - see the trait. This class is the one that most needs it: it is the only end-to-end
+     * harness in the suite, so a lenient double would leave the entire import path's recovery
+     * from an unreadable session payload untested anywhere.
+     */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key makes the import path reach the billable call. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -199,27 +207,67 @@ class ValidateImportAddressRowAttributionTest extends TestCase
             );
         }
 
-        // Fixture preconditions, read off the WIRE rather than claimed: the file really did span
-        // the chunk boundary, and the rows the row numbers above depend on really were the ones
-        // repeated. Without these, a fixture that quietly stopped repeating anything would leave
-        // every assertion above trivially satisfiable.
-        $this->assertSame(
-            [self::CHUNK_SIZE, self::FILE_ROWS - self::CHUNK_SIZE],
-            array_map(
-                static fn (array $chunk): int => count($chunk),
-                array_chunk($rows, self::CHUNK_SIZE)
-            ),
-            'The file must span two chunks of the plugin\'s 100 rows, or the boundary this test is about '
-            . 'is not in it.'
+        // PRECONDITION 1, READ OFF THE WIRE: the PLUGIN really did cut this file at row 100.
+        //
+        // This is the load-bearing premise of everything above - the docblock's whole subject is
+        // the boundary at offset 99/100 - and it can only be established from the connector
+        // payloads, because that is the only place the plugin's chunking is observable. An
+        // earlier revision asserted it from array_chunk($rows, self::CHUNK_SIZE): the test
+        // chunking its OWN array by its OWN constant, which cannot fail and says nothing about
+        // the plugin. If the plugin chunked at 50 that assertion stayed green while every
+        // sentence around it was false.
+        $this->assertCount(
+            2,
+            $this->apiRequests,
+            'A 150-row file must reach the connector as exactly TWO batches. One means the plugin stopped '
+            . 'chunking and there is no boundary in this fixture at all; three or more means it chunks '
+            . 'smaller than 100 and the boundary is not where every row number above was counted from.'
         );
+        $this->assertSame(
+            array_map(
+                static fn (array $row): string => (string)$row['street'][0],
+                array_slice($rows, 0, self::CHUNK_SIZE)
+            ),
+            array_column($this->apiRequests[0]['Addresses'], 'Address1'),
+            'The FIRST batch must be exactly the file\'s first 100 rows, in file order. Chunk 1 repeats '
+            . 'nothing within itself and nothing is remembered before it, so every one of its rows is sent '
+            . '- which makes the first payload a faithful picture of where the plugin cut, and of the '
+            . 'order it sends in, which the positional attribution depends on.'
+        );
+        $this->assertSame(
+            [],
+            array_values(array_diff(
+                array_column($this->apiRequests[1]['Addresses'], 'Address1'),
+                array_map(
+                    static fn (array $row): string => (string)$row['street'][0],
+                    array_slice($rows, self::CHUNK_SIZE)
+                )
+            )),
+            'And the SECOND batch may carry nothing but rows from beyond the boundary. Together with the '
+            . 'assertion above that fixes the cut at offset 99/100 from the wire alone: a plugin that '
+            . 'chunked anywhere else would put a row on the wrong side of it.'
+        );
+
+        // PRECONDITION 2, a FIXTURE SELF-CHECK and not a wire reading: the rows the row numbers
+        // above depend on really are repeats of one another. It derives from self::PLANNED_ROWS,
+        // so what it can catch is a plan edited into one that no longer repeats anything across
+        // the boundary - after which the billed count would be met by a file with nothing to
+        // de-duplicate. It is deliberately NOT read off the wire, because most of these rows are
+        // not on the wire: being absent from it is the very thing being measured.
+        //
+        // Offset 103 is excluded on purpose. It is id 5, the row whose AQI is present but
+        // unreadable, and it appears in chunk 2 ONLY - it exists to cover a fault that first
+        // occurs after other rows have already been remembered, not to be a cross-boundary
+        // repeat. Including it would add a fifth street and assert the opposite of what this
+        // check is for.
         $this->assertSame(
             ['1 Test Street', '2 Test Street', '3 Test Street', '4 Test Street'],
             array_values(array_unique(array_map(
                 static fn (int $offset): string => (string)$rows[$offset]['street'][0],
                 [0, 5, 50, 99, 100, 101, 102, 104, 149]
             ))),
-            'The rows either side of the boundary must really be repeats of one another, or nothing is '
-            . 'being de-duplicated and the billed count proves nothing.'
+            'Nine planned offsets either side of the boundary must resolve to only FOUR distinct '
+            . 'addresses, or nothing is being de-duplicated and the billed count proves nothing.'
         );
     }
 
@@ -389,9 +437,11 @@ class ValidateImportAddressRowAttributionTest extends TestCase
         $moduleList = $this->createMock(ModuleListInterface::class);
         $moduleList->method('getOne')->willReturn(['setup_version' => '9.9.9']);
 
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(static fn ($value) => json_decode($value, true));
+        // Fails the way the PRODUCTION serializer fails. This harness is the only one in the
+        // suite driving the real plugin over the real Validator over a real session store end to
+        // end, so a lenient double here would be the single place where the whole import path
+        // could meet an unreadable session payload and look safe.
+        $serializer = $this->createSerializerDouble();
 
         $validator = new Validator(
             $this->createMock(Logger::class),

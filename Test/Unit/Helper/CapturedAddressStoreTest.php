@@ -8,12 +8,12 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\App\RequestInterface;
 use Magento\Framework\Controller\ResultFactory;
 use Magento\Framework\Module\ModuleListInterface;
-use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -102,6 +102,16 @@ use stdClass;
  */
 class CapturedAddressStoreTest extends TestCase
 {
+    /**
+     * The serializer double, shared with every other harness that reads a serialised payload
+     * back. What it buys THIS class specifically: the production serializer's
+     * \InvalidArgumentException is what makes
+     * testAnUnreadableEntryInTheStoreCostsADeDuplicationRatherThanAFatal() a real test, and its
+     * TypeError on a non-string is what makes
+     * testAForeignElementInTheStoreCostsABypassRatherThanAFatalInEitherReader() one.
+     */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key lets both helpers build their API connectors. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -295,60 +305,6 @@ class CapturedAddressStoreTest extends TestCase
             'requests' => $requests,
             'session' => $sessionStore,
         ];
-    }
-
-    /**
-     * A SerializerInterface double that fails the way the production serializer fails.
-     *
-     * The configured serializer for this module is Magento\Framework\Serialize\Serializer\Json,
-     * and its unserialize() THROWS \InvalidArgumentException on anything it cannot decode -
-     * including the empty string and null - rather than answering null. A double written as
-     * `fn ($v) => json_decode($v, true)` therefore makes the whole
-     * "an entry in the store cannot be read back" family of paths unreachable from the
-     * harness: Controller::capturedEntrySignature() and Validator::checkForCapturedAddress()
-     * both wrap the call in `try { ... } catch (\InvalidArgumentException $e)`, and against a
-     * lenient double those catch blocks can never run, so deleting either of them would leave
-     * the suite green while a truncated session payload became a fatal mid-checkout
-     * (LOQ-16978 review). Mirroring the real failure mode here is what makes
-     * testAnUnreadableEntryInTheStoreCostsADeDuplicationRatherThanAFatal() a real test.
-     *
-     * The SECOND failure mode it has to mirror is the TypeError, and that one is answered by
-     * the READER's is_string() guard: json_decode()'s first parameter is declared
-     * `string $json`, so an array or object element raises an \Error, which the
-     * \InvalidArgumentException catch above does NOT cover. A lenient double swallows that as
-     * well, and testAForeignElementInTheStoreCostsABypassRatherThanAFatalInEitherReader() would
-     * then pass against a build that fatals in front of a shopper. Hence the note below.
-     *
-     * @return SerializerInterface&MockObject
-     */
-    private function createSerializerDouble()
-    {
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(
-            static function ($value) {
-                // Magento\Framework\Serialize\Serializer\Json::unserialize(), verbatim in
-                // behaviour: the two rejected-outright values first, then a decode whose
-                // failure is reported by json_last_error() rather than by a null return -
-                // null being a legitimately decodable value.
-                if ($value === false || $value === null || $value === '') {
-                    throw new \InvalidArgumentException('Unable to unserialize value.');
-                }
-
-                // NOT cast to string first, because the production serializer does not cast
-                // either: an array or an object reaching json_decode() is a TypeError there
-                // and must be one here, or this double would quietly make a caller that hands
-                // it a non-string look safe when production would fatal.
-                $decoded = json_decode($value, true);
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    throw new \InvalidArgumentException('Unable to unserialize value, string is corrupted.');
-                }
-
-                return $decoded;
-            }
-        );
-
-        return $serializer;
     }
 
     /**
