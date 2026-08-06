@@ -7,6 +7,7 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Model\Config\Source\AddressQualityIndex;
+use Loqate\ApiIntegration\Plugin\Admin\ValidateImportAddress;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
@@ -123,9 +124,14 @@ class ValidatorImportRunDedupeTest extends TestCase
 
     /**
      * Rows per verification batch, as Plugin\Admin\ValidateImportAddress::afterValidateData()
-     * chunks an import file. Mirrored rather than read from the plugin because it is a literal
-     * there; if the plugin ever chunks differently, this test's file layout is what has to be
-     * re-thought, so it should fail loudly rather than follow along.
+     * chunks an import file, and the size every fixture in this file is laid out around: the
+     * headline file's three chunks and its "repeats across chunk boundaries only" precondition are
+     * both arithmetic on this number.
+     *
+     * It is NOT the authority for that number - importChunkSize() reads the plugin's own literal,
+     * and fails the test if the two ever disagree. Written here as well because the layouts above
+     * cannot follow a change silently: if the plugin chunks differently, the fixtures have to be
+     * re-thought by a person, so the divergence must stop the suite rather than quietly re-scale it.
      */
     private const IMPORT_CHUNK_SIZE = 100;
 
@@ -599,12 +605,19 @@ class ValidatorImportRunDedupeTest extends TestCase
      *
      * EXACTLY ONE LINE PER BATCH, which is a frequency and not just a presence. Zero would leave
      * the merchant with a whole file of "Invalid address at row #N" and nothing anywhere saying
-     * their own setting refused it - the failure this line exists to prevent. One per ROW would
-     * bury it: a 100-row chunk would write 100 identical lines and a 10,000-row file 10,000, so
-     * the signal is lost in its own volume and the log costs real money to ship. The line is
-     * asserted BYTE FOR BYTE, because it is a merchant-facing artefact that support reads out of
-     * a log file: rewording it is a decision to make deliberately, which means updating this
-     * expectation, not one to have absorbed by a test matching a fragment.
+     * their own setting is a bar no address can clear - the failure this line exists to prevent.
+     * One per ROW would bury it: a 100-row chunk would write 100 identical lines and a 10,000-row
+     * file 10,000, so the signal is lost in its own volume and the log costs real money to ship.
+     * The line is asserted BYTE FOR BYTE, because it is a merchant-facing artefact that support
+     * reads out of a log file: rewording it is a decision to make deliberately, which means
+     * updating this expectation, not one to have absorbed by a test matching a fragment.
+     *
+     * WHAT THE LINE MAY NOT SAY, and why the wording moved. It used to end "rejecting the
+     * address", which the response-side caller could say truthfully and this pre-flight cannot:
+     * the threshold is read ONCE PER BATCH before any row is decided, so on a batch that refuses
+     * nothing the line named an outcome that never happened and sent support looking for refused
+     * rows that do not exist. It now reports only the configuration. That batch is pinned by
+     * testAnAllCapturedBatchUnderAnUnreadableThresholdStillReportsTheConfigurationOnce().
      *
      * @param mixed $threshold Configured address_quality_index that cannot be read as a grade.
      * @param string $why What this case protects, quoted into the failure message.
@@ -645,9 +658,10 @@ class ValidatorImportRunDedupeTest extends TestCase
             [$this->expectedBrokenThresholdLine($threshold)],
             $this->thresholdLogLines($request),
             'ONE line, and this exact line. It is the only signal a merchant has that their own quality '
-            . 'bar - not their data - is what refused the file, so it must name the offending value and '
-            . 'its type and say what the accepted values are. Zero lines is the defect this replaces; one '
-            . 'per ROW would bury the signal under a line per import row.'
+            . 'bar - not their data - is a bar nothing can clear, so it must name the offending value and '
+            . 'its type and say what the accepted values are, and it must claim no more than that. Zero '
+            . 'lines is the defect this replaces; one per ROW would bury the signal under a line per '
+            . 'import row.'
         );
 
         $request['validator']->verifyMultipleAddresses($rows, false);
@@ -737,6 +751,12 @@ class ValidatorImportRunDedupeTest extends TestCase
      * The mixed batch is what makes it a deviation rather than a special case: the captured row
      * passes and the typed row beside it is refused, in ONE call, so the guard demonstrably runs
      * per row and after the short-circuit rather than as a whole-batch bail-out.
+     *
+     * BEING MIXED IS ALSO ITS LIMIT, which is why it has a sibling. One row IS refused here, so
+     * this fixture cannot see anything the broken-threshold log line claims about refusals - the
+     * retired "rejecting the address" wording was accidentally true on exactly this batch. The
+     * all-captured batch, where the line fires with nothing refused at all, is pinned by
+     * testAnAllCapturedBatchUnderAnUnreadableThresholdStillReportsTheConfigurationOnce().
      */
     public function testACapturedAddressStillPassesUnderAnUnreadableThresholdAndStillCostsNoRequest(): void
     {
@@ -779,6 +799,95 @@ class ValidatorImportRunDedupeTest extends TestCase
             $this->batchStore($request),
             'Nor is the captured pass written to the verdict store: it is not a verdict, it is a bypass, '
             . 'and it is keyed under a threshold nobody can read.'
+        );
+    }
+
+    /**
+     * A batch whose EVERY row is a captured address, under an unreadable threshold: every row
+     * passes, nothing is bought - and the broken-quality-bar line is written anyway, saying only
+     * what the configuration is.
+     *
+     * THE CASE THAT PRODUCED THE REWORD, and the reason it is pinned in its own fixture rather
+     * than left to
+     * testACapturedAddressStillPassesUnderAnUnreadableThresholdAndStillCostsNoRequest(): that
+     * batch is MIXED, so one row IS refused there and the retired sentence "rejecting the address"
+     * was accidentally true. Here nothing is refused at all, and the old wording named an outcome
+     * that never happened - support would go looking for refused rows that do not exist.
+     *
+     * THE LINE IS A CONFIGURATION REPORT, WHICH IS WHY ITS PRESENCE IS ASSERTED INDEPENDENTLY OF
+     * THE REFUSAL COUNT. Read quickly, "zero rejections, one warning" looks like the bug rather
+     * than the fix. It is the fix: the threshold pre-flight reads the setting ONCE PER BATCH,
+     * before any row is decided, and a merchant whose quality bar cannot be read needs to be told
+     * so on every batch that ran under it - not only on the batches that happened to contain a row
+     * the fault could bite. Both halves are therefore asserted together and neither is derived
+     * from the other: [true, true] AND exactly one line.
+     *
+     * IT IS ALSO THE FIXTURE THAT FAILS IF THE LINE IS EVER MADE CONDITIONAL on at least one row
+     * having been refused - the alternative fix the coder rejected. That would make a
+     * CONFIGURATION diagnostic depend on the composition of whatever batch happened to run, and on
+     * this path specifically on the shopper's captured-address session: an admin creating an order
+     * entirely from Loqate-picked addresses would silence the only signal their setting is broken,
+     * and it would stay silent until an uncaptured row happened along. Same hole as the
+     * all-empty-'Matches' file this branch closed, through a different door.
+     *
+     * The negative assertion on 'rejecting the address' is deliberately cheap and deliberately
+     * redundant with the byte-for-byte expectation: a future edit that loosens the exact-match
+     * helper - for a grade list change, say - must not also quietly re-admit a sentence that
+     * claims a refusal nobody made.
+     */
+    public function testAnAllCapturedBatchUnderAnUnreadableThresholdStillReportsTheConfigurationOnce(): void
+    {
+        $firstCaptured = $this->distinctAddress(1);
+        $secondCaptured = $this->distinctAddress(2);
+
+        $request = $this->createRequest(
+            null,
+            new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => 'zzz'])),
+            static fn ($payload): array => array_map(
+                static fn (): array => [['AQI' => 'E', 'AVC' => self::CARRIED_AVC]],
+                (array)$payload['Addresses']
+            )
+        );
+        $request['session'][self::CAPTURED_ADDRESSES_SESSION_KEY] = [
+            self::capturedEntry($firstCaptured),
+            self::capturedEntry($secondCaptured),
+        ];
+
+        $verdicts = $request['validator']->verifyMultipleAddresses(
+            [$firstCaptured, $secondCaptured],
+            true
+        );
+
+        $this->assertSame(
+            [true, true],
+            array_values($verdicts),
+            'Fixture precondition AND guarantee in one: EVERY row of this batch is a captured address, so '
+            . 'the captured short-circuit answers all of them and the threshold guard refuses NOTHING. If '
+            . 'this ever reads [false, false] the pre-flight has moved ahead of the captured guard, and a '
+            . 'mis-set dropdown has become a total block of every address picked from the Loqate lookup.'
+        );
+        $this->assertSame(
+            0,
+            $this->apiCallCount($request),
+            'And nothing is bought: captured rows need no verification, so there is no payload to assemble '
+            . 'and no round trip to pay for.'
+        );
+        $this->assertSame(
+            [$this->expectedBrokenThresholdLine('zzz')],
+            $this->thresholdLogLines($request),
+            'The broken quality bar is STILL reported, exactly once, on a batch where not one row was '
+            . 'refused. This is not "a warning with nothing behind it": the line reports the CONFIGURATION, '
+            . 'which is broken whatever this batch contained, and making it conditional on a refusal would '
+            . 'silence it for an admin who creates orders entirely from Loqate-picked addresses - until '
+            . 'some later row that is not captured finally surfaces a fault that was there all along.'
+        );
+        $this->assertStringNotContainsString(
+            'rejecting the address',
+            implode("\n", $this->thresholdLogLines($request)),
+            'And it may not claim a refusal that did not happen. This clause is what the line used to end '
+            . 'with, and on THIS batch it was simply false - zero rows were rejected. Asserted separately '
+            . 'from the exact-match expectation above on purpose: reverting the wording has to fail loudly '
+            . 'here too, rather than only through a byte-for-byte helper a later edit might loosen.'
         );
     }
 
@@ -829,8 +938,10 @@ class ValidatorImportRunDedupeTest extends TestCase
             'Read off the WIRE: all THREE copies of each address really were sent, in row order. Nothing '
             . 'is written to either memory until the response comes back, and the pre-flight loop runs to '
             . 'completion over the whole chunk before the request is issued, so every copy misses. That is '
-            . 'LOQ-17015, and its bound is the CHUNK SIZE - 100 identical rows in one chunk bill 100 - not '
-            . 'one charge per distinct address, which is what an earlier revision of this claim said.'
+            . 'LOQ-17015, and its bound is the CHUNK SIZE - not one charge per distinct address, which is '
+            . 'what an earlier revision of this claim said. The bound AT the chunk size is executed, not '
+            . 'argued, by '
+            . 'testAFullChunkOfOneAddressIsBilledOncePerRowAndTheChunkAfterItIsFree().'
         );
         $this->assertSame(
             [true, true, true, false, false, false],
@@ -860,6 +971,118 @@ class ValidatorImportRunDedupeTest extends TestCase
             array_values($laterChunk),
             'The replayed chunk must report the same verdicts under its own keys, including the rejections: '
             . 'a de-duplicated row that loses its slot renumbers every import row after it.'
+        );
+    }
+
+    /**
+     * THE LOQ-17015 RESIDUE BOUND AT ITS WORST CASE: a chunk that is nothing but copies of ONE
+     * address, as many as the import plugin will ever put in one batch, bills one address PER ROW
+     * - and the identical chunk after it bills nothing.
+     *
+     * WHY THIS EXISTS BESIDE THE THREE-COPY TEST ABOVE. That one proves the SHAPE of the bound
+     * ("k copies cost k" rather than "the first copy plus one") on a cheap fixture. It does not
+     * prove the SIZE, and the size is the part of the claim that costs money: the published bound
+     * says "a chunk of 100 identical rows bills 100", and a suite that only ever runs k=3 leaves
+     * the strongest sentence in the documentation argued rather than executed. That is precisely
+     * how this series shipped a bound that was wrong by 99x - the two-copy case was probed,
+     * generalised to all n in prose, and disproved by execution twice. So the worst case now runs.
+     *
+     * THE k IS THE CHUNK SIZE ITSELF, READ FROM THE PLUGIN, not a literal repeated here. See
+     * importChunkSize(): it takes the number out of
+     * Plugin\Admin\ValidateImportAddress::afterValidateData()'s own array_chunk() call, so this
+     * test measures the batch production actually assembles. A mirrored literal drifting away from
+     * the plugin would leave the worst case unmeasured while looking measured, which is the same
+     * failure mode as describing it in prose.
+     *
+     * BOTH POLARITIES, ONE FULL-SIZE CHUNK EACH, rather than a half-and-half chunk: an accepted
+     * address is remembered in both memories and a rejected one only in the run map, so a dedupe
+     * that collapsed copies for one polarity and not the other must fail here too - but splitting
+     * a single chunk between them would pin k at half the chunk size and stop measuring the worst
+     * case, which is the whole point of this fixture.
+     *
+     * THE WIRE CONTENTS ARE ASSERTED, not just the count. A count says the right number of
+     * addresses was billed; the street list in row order says the right ADDRESSES were, in the
+     * order the response has to be attributed back to. That is what makes this stronger than a
+     * counter, and it is what would catch a dedupe that sent k copies of the wrong row.
+     */
+    public function testAFullChunkOfOneAddressIsBilledOncePerRowAndTheChunkAfterItIsFree(): void
+    {
+        $chunkSize = $this->importChunkSize();
+        $accepted = $this->distinctAddress(1);
+        $rejected = $this->distinctAddress(2);
+        $this->apiVerdicts[$rejected['street'][0]] = 'fail';
+
+        $acceptedChunk = array_fill(0, $chunkSize, $accepted);
+        $rejectedChunk = array_fill(0, $chunkSize, $rejected);
+
+        $firstAcceptedChunk = $this->request['validator']->verifyMultipleAddresses($acceptedChunk, false);
+        $firstRejectedChunk = $this->request['validator']->verifyMultipleAddresses($rejectedChunk, false);
+
+        $this->assertSame(
+            array_merge(
+                array_fill(0, $chunkSize, $accepted['street'][0]),
+                array_fill(0, $chunkSize, $rejected['street'][0])
+            ),
+            $this->streetsBilled($this->request),
+            sprintf(
+                'Read off the WIRE at FULL CHUNK SIZE: a chunk of %1$d identical rows bills %1$d addresses, '
+                . 'in row order, for each polarity. Nothing is written to either memory until the response '
+                . 'comes back and the pre-flight loop runs to completion before the request is issued, so '
+                . 'every copy misses. This is the sentence the LOQ-17015 residue bound is published as, and '
+                . 'until now nothing executed it at this size - the earlier claim of one duplicate charge '
+                . 'per distinct address was wrong here by a factor of %1$d, and was believed because it was '
+                . 'only ever argued.',
+                $chunkSize
+            )
+        );
+        $this->assertSame(
+            array_fill(0, $chunkSize, true),
+            array_values($firstAcceptedChunk),
+            'Every copy is answered under its own row: the row-count guard and the positional attribution '
+            . 'both depend on ONE RESPONSE ROW PER SENT ITEM, which is exactly what makes the copies cost '
+            . 'what they cost. A chunk that answered fewer rows than it was given would renumber every '
+            . 'import row after it.'
+        );
+        $this->assertSame(
+            array_fill(0, $chunkSize, false),
+            array_values($firstRejectedChunk),
+            'And the rejected polarity is answered the same way, row for row - the polarity the session '
+            . 'store never held, so its copies are the ones only the run map can make free later.'
+        );
+
+        $laterAcceptedChunk = $this->request['validator']->verifyMultipleAddresses($acceptedChunk, false);
+        $laterRejectedChunk = $this->request['validator']->verifyMultipleAddresses($rejectedChunk, false);
+
+        $this->assertSame(
+            2 * $chunkSize,
+            $this->addressesBilled($this->request),
+            sprintf(
+                'THE OTHER HALF, ALSO AT FULL SIZE: repeating both %1$d-row chunks bills NOTHING further. '
+                . 'By then the pass is in the session store and the run map and the rejection is in the run '
+                . 'map, so all %2$d replayed rows are answered from memory. %2$d billed addresses in total, '
+                . 'not %3$d: the residue is bounded by the chunk an address FIRST appears in, whatever the '
+                . 'file does afterwards.',
+                $chunkSize,
+                2 * $chunkSize,
+                4 * $chunkSize
+            )
+        );
+        $this->assertSame(
+            2,
+            $this->apiCallCount($this->request),
+            'And the replays issue no request at all - not even an empty \'Addresses\' payload, which would '
+            . 'be a round trip to a billable endpoint paid for and discarded.'
+        );
+        $this->assertSame(
+            array_fill(0, $chunkSize, true),
+            array_values($laterAcceptedChunk),
+            'The replayed accepted chunk still reports every row, under its own key.'
+        );
+        $this->assertSame(
+            array_fill(0, $chunkSize, false),
+            array_values($laterRejectedChunk),
+            'And so does the replayed rejected chunk: free must not become silent, or a whole chunk of '
+            . 'invalid rows vanishes from the merchant\'s report.'
         );
     }
 
@@ -1425,8 +1648,9 @@ class ValidatorImportRunDedupeTest extends TestCase
      *
      * Filtered rather than taken whole, because the same logger carries unrelated INFO records
      * (a missing API key, a response whose row count could not be attributed) and this file's
-     * subject is only the one line a merchant needs to see when their own setting is what
-     * refused the file.
+     * subject is only the one line a merchant needs to see when their own setting is a quality
+     * bar no address can clear. It reports the CONFIGURATION, not what became of any row: the
+     * pre-flight that emits it runs once per batch, before a single verdict exists.
      *
      * @param array $request Request harness from createRequest().
      * @return string[]
@@ -1446,6 +1670,14 @@ class ValidatorImportRunDedupeTest extends TestCase
      * out, so a grade added to the module is offered to the merchant in this message without
      * anybody having to remember this file - the WORDING is what is pinned here, not the list.
      *
+     * The middle clause is load-bearing and is the reason this helper is worth reading twice: it
+     * states what the CONFIGURATION is, and deliberately not what happened to any address. The
+     * caller emitting it is a once-per-batch pre-flight that runs before any row is decided, so a
+     * sentence naming an outcome can be false - it was, on an all-captured batch, which is what
+     * testAnAllCapturedBatchUnderAnUnreadableThresholdStillReportsTheConfigurationOnce() pins.
+     * That test also asserts the retired 'rejecting the address' clause is ABSENT, so a revert of
+     * the wording fails on its own terms and not only through this byte-for-byte helper.
+     *
      * @param mixed $threshold The unreadable configured value.
      * @return string
      */
@@ -1453,7 +1685,7 @@ class ValidatorImportRunDedupeTest extends TestCase
     {
         return sprintf(
             'Loqate: address_quality_index is not a recognised quality index (%s of type %s); '
-            . 'rejecting the address. Set it to one of %s.',
+            . 'no address can pass a quality bar that cannot be read. Set it to one of %s.',
             var_export($threshold, true),
             gettype($threshold),
             implode(', ', Validator::VALID_QUALITY_INDEXES)
@@ -1516,6 +1748,65 @@ class ValidatorImportRunDedupeTest extends TestCase
         $map->setAccessible(true);
 
         return (array)$map->getValue($request['validator']);
+    }
+
+    /**
+     * The number of rows Plugin\Admin\ValidateImportAddress::afterValidateData() puts in ONE
+     * verification batch, taken from that method's own array_chunk() call.
+     *
+     * WHY IT IS READ OUT OF THE PRODUCTION SOURCE. The LOQ-17015 residue bound is a claim about
+     * the worst case a real import can produce - "a chunk of N identical rows bills N" - so the N
+     * a test pins has to be the N the plugin actually assembles. A literal repeated in this file
+     * would keep passing while the plugin moved, leaving the worst case unmeasured but looking
+     * measured, which is the same failure that shipped a bound wrong by 99x.
+     *
+     * WHY BY SOURCE SCAN. The chunk size is an inline literal in a method body: there is no
+     * constant to reflect on and no accessor to call, and this file may not add one, so the source
+     * the code is compiled from is the only place the value exists. The scan is deliberately
+     * narrow - one array_chunk() call with an integer literal - and anything else FAILS rather
+     * than guesses, because a wrong guess here silently weakens the only test of the worst case.
+     *
+     * @return int
+     */
+    private function importChunkSize(): int
+    {
+        $pluginFile = (new ReflectionClass(ValidateImportAddress::class))->getFileName();
+        $this->assertIsString(
+            $pluginFile,
+            'Plugin\Admin\ValidateImportAddress must be a file-backed class: its chunk size is an inline '
+            . 'literal, so the source file is the only place the value can be read from.'
+        );
+
+        $matched = preg_match_all(
+            '/array_chunk\s*\(\s*\$\w+\s*,\s*(\d+)\s*\)/',
+            (string)file_get_contents($pluginFile),
+            $matches
+        );
+        $sizes = $matched ? array_values(array_unique(array_map('intval', $matches[1]))) : [];
+
+        $this->assertCount(
+            1,
+            $sizes,
+            'Plugin\Admin\ValidateImportAddress::afterValidateData() must chunk the import file with '
+            . 'exactly one array_chunk() call taking an integer literal, or this helper cannot tell what '
+            . 'size a real batch is. If the plugin now computes the size, or chunks in more than one place, '
+            . 'read it from there instead - do NOT fall back to a literal in the test, because the worst '
+            . 'case would then be measured at a size production never produces.'
+        );
+        $this->assertSame(
+            self::IMPORT_CHUNK_SIZE,
+            $sizes[0],
+            sprintf(
+                'The plugin now chunks at %d, and every fixture in this class is laid out for %d - the '
+                . 'headline file\'s three chunks, and its assertion that repeats fall only across chunk '
+                . 'boundaries. That layout has to be re-thought by a person rather than re-scaled silently, '
+                . 'so the disagreement stops the suite here.',
+                $sizes[0],
+                self::IMPORT_CHUNK_SIZE
+            )
+        );
+
+        return $sizes[0];
     }
 
     /**
