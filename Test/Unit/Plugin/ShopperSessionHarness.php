@@ -61,6 +61,9 @@ trait ShopperSessionHarness
      * one it was not told about, so the list is split by method_exists() and each half is
      * declared the way that class needs - which keeps this double working on both sides.
      *
+     * THE SPLIT GOVERNS DECLARATION ONLY. Every method is then CONFIGURED unconditionally,
+     * because a double built either way behaves the same from method() onwards.
+     *
      * @param ArrayObject $sessionStore Backing store for the session attributes.
      * @param ArrayObject $identity Holds 'customerId', read LIVE so a test can log in mid-test.
      * @return Session&MockObject
@@ -98,16 +101,22 @@ trait ShopperSessionHarness
                 return $sessionMock;
             }
         );
+        // CONFIGURED UNCONDITIONALLY, and that is not an accident. The method_exists() split
+        // above decides how each name is put ON the double (declared -> onlyMethods(), absent ->
+        // addMethods()); once the double exists PHPUnit configures both kinds identically, so
+        // repeating the split here would only skip the callback for whichever half the class in
+        // play happens to declare. It did: the stub declares these two setters, the stub is the
+        // path this suite runs, and the storing callback was therefore never installed - the
+        // double answered null and wrote nothing, which made every "no readable POST in the
+        // session" assertion unfalsifiable (LOQ-17149).
         foreach (self::CORE_FORM_DATA_SETTERS as $setter => $attribute) {
-            if (!method_exists(Session::class, $setter)) {
-                $sessionMock->method($setter)->willReturnCallback(
-                    static function ($value = null) use ($sessionStore, $sessionMock, $attribute) {
-                        $sessionStore[$attribute] = $value;
+            $sessionMock->method($setter)->willReturnCallback(
+                static function ($value = null) use ($sessionStore, $sessionMock, $attribute) {
+                    $sessionStore[$attribute] = $value;
 
-                        return $sessionMock;
-                    }
-                );
-            }
+                    return $sessionMock;
+                }
+            );
         }
         $sessionMock->method('getCustomerId')->willReturnCallback(static fn () => $identity['customerId']);
 
