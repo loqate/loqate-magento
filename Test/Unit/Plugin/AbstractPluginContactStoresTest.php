@@ -3,6 +3,7 @@
 namespace Loqate\ApiIntegration\Test\Unit\Plugin;
 
 use ArrayObject;
+use Loqate\ApiIntegration\Helper\Controller;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
 use Loqate\ApiIntegration\Helper\Validator;
@@ -50,6 +51,38 @@ class AbstractPluginContactStoresTest extends TestCase
 
     /** A phone number, likewise well clear of the numeric-string collision below. */
     private const PHONE = '+44 20 7946 0000';
+
+    /**
+     * The largest number of contact digests per store this module could defend keeping.
+     *
+     * Tied to Helper\Controller::CAPTURED_ADDRESSES_LIMIT rather than invented: that is the
+     * bound on the OTHER store a shopper fills interactively, and
+     * ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT's own docblock says it is deliberately
+     * SMALLER than its siblings, because no import writes these two lists and one interactive
+     * checkout presents one email address and at most two phone numbers. Asserted as "no
+     * larger than" rather than as the exact figure, so tuning 25 up or down within what a
+     * session can carry is not a test failure while abandoning the bound is.
+     */
+    private const LARGEST_DEFENSIBLE_CONTACT_LIMIT = Controller::CAPTURED_ADDRESSES_LIMIT;
+
+    /**
+     * Characters one stored digest occupies: hash_hmac('sha256', ...) in lowercase hex.
+     *
+     * Used to state the worst case both stores can add to a session payload as a SIZE rather
+     * than as an entry count, because the size is the thing that has a consequence - a PHP
+     * session is read and written whole on every request that touches it.
+     */
+    private const DIGEST_CHARACTERS = 64;
+
+    /**
+     * The most the two contact stores may add to one session payload, in characters.
+     *
+     * 8 kB, which is generous against the ~3 kB the shipped limit actually costs
+     * (2 stores x 25 entries x 64 characters) and is still far below the point at which the
+     * session becomes a problem to carry. The figure is a ceiling on the DECISION, not a
+     * prediction of the value.
+     */
+    private const LARGEST_DEFENSIBLE_CONTACT_PAYLOAD = 8192;
 
     /**
      * A stored email address must never be readable out of the session again.
@@ -232,6 +265,151 @@ class AbstractPluginContactStoresTest extends TestCase
             . 'Validator::storeVerifyResult(). Evicting anything else would risk dropping the value the '
             . 'shopper is currently submitting.'
         );
+    }
+
+    /**
+     * The bound has to BE a bound: one shopper's session can never carry more than a few
+     * kilobytes of contact digests, whatever the limit is tuned to.
+     *
+     * WHY THE FIFO TEST ABOVE DOES NOT ALREADY SAY THIS, which is the whole reason this one
+     * exists. That test reads VERIFIED_CONTACT_LIMIT from production and asserts the store
+     * never exceeds it - so it is true of 25 and equally true of 100000, and a limit raised to
+     * a number that is not a bound at all passes it (or, worse, exhausts the process's memory
+     * while filling the store, which is a crash and not a verdict). What has to be pinned is
+     * the DECISION that these two lists stay small, and the reason it was taken: they are
+     * append-only for the life of a session, they are never refreshed on a hit, and the session
+     * they live in is read and rewritten whole on every request that touches it. An unbounded
+     * or effectively-unbounded list is what LOQ-17149 found and is what this asserts against.
+     */
+    public function testTheTwoContactStoresCannotGrowTheSessionPayloadWithoutBound(): void
+    {
+        $limit = $this->contactLimit();
+
+        $this->assertLessThanOrEqual(
+            self::LARGEST_DEFENSIBLE_CONTACT_LIMIT,
+            $limit,
+            sprintf(
+                'Each contact store must hold no more entries than the captured-address store (%d). These two '
+                . 'are the SMALLEST of the module\'s session stores by design: no import writes them, and one '
+                . 'interactive checkout presents one email address and at most two phone numbers, so a limit '
+                . 'above the address stores\' would be keeping more of the customer\'s contact details, for '
+                . 'longer, than anything asks for.',
+                self::LARGEST_DEFENSIBLE_CONTACT_LIMIT
+            )
+        );
+        $this->assertLessThanOrEqual(
+            self::LARGEST_DEFENSIBLE_CONTACT_PAYLOAD,
+            2 * $limit * self::DIGEST_CHARACTERS,
+            sprintf(
+                'The two contact stores together must not be able to add more than %d characters to a session '
+                . 'payload (2 stores x %d entries x %d characters). The session is read and rewritten whole on '
+                . 'every request that touches it, so "the list is bounded" is only worth anything if the bound '
+                . 'is a size a session can carry.',
+                self::LARGEST_DEFENSIBLE_CONTACT_PAYLOAD,
+                $limit,
+                self::DIGEST_CHARACTERS
+            )
+        );
+
+        // ...and the bound is real rather than arithmetic: filling one store past it leaves a
+        // payload inside the ceiling asserted above.
+        $harness = $this->createPlugin();
+        for ($i = 0; $i <= $limit; $i++) {
+            $harness['plugin']->checkEmail(sprintf('shopper+%d@example.com', $i));
+            $harness['plugin']->checkPhone(sprintf('+44 20 7946 %04d', $i));
+        }
+
+        $stored = count((array)($harness['session'][self::VERIFIED_EMAIL_SESSION_KEY] ?? []))
+            + count((array)($harness['session'][self::VERIFIED_PHONE_SESSION_KEY] ?? []));
+
+        $this->assertLessThanOrEqual(
+            2 * $limit,
+            $stored,
+            'Submitting more distinct values than the bound must not grow the stores past it. Each list is '
+            . 'bounded SEPARATELY, so the session holds at most twice the limit in digests however the '
+            . 'submissions are split between an email address and a phone number.'
+        );
+    }
+
+    /**
+     * No plugin can reach a shopper-scoped store without the ownership guard, whatever it
+     * chooses to do with the session it is handed.
+     *
+     * THIS IS THE HOLE LOQ-17149 HAD TO CLOSE, and it is invisible to every behavioural test in
+     * this file. Plugin\AbstractPlugin is the base class of TEN plugins, four of which reach
+     * these stores; while its raw Magento\Customer\Model\Session was `protected`, any of those
+     * ten - and any third-party subclass - could read or write 'loqate_email',
+     * 'loqate_phone', 'loqate_email_to_validate' or 'loqate_billing_errors' directly, with no
+     * flush on a shopper change, no bound and no hashing. The tests above would all still pass,
+     * because they exercise the paths that DO go through the seam.
+     *
+     * Asserted on a plugin built through the REAL constructor, by VALUE rather than by declared
+     * type, so it holds however the property is written: an untyped `protected $session`
+     * re-introduced with a docblock is caught exactly as a typed one is. The seam itself is
+     * covered by the same rule for the same reason - a protected ShopperScopedSessionStores
+     * would hand all seven enrolled stores to ten subclasses, which is wider than any of them
+     * needs and wider than the named accessors this class exposes.
+     */
+    public function testNoPluginCanReachAShopperScopedStoreWithoutTheOwnershipGuard(): void
+    {
+        $harness = $this->createPlugin();
+        $found = [];
+
+        foreach ($this->declaredProperties($harness['plugin']) as $property) {
+            $property->setAccessible(true);
+            if (!$property->isInitialized($harness['plugin'])) {
+                continue;
+            }
+            $value = $property->getValue($harness['plugin']);
+
+            if (!is_a($value, Session::class) && !$value instanceof ShopperScopedSessionStores) {
+                continue;
+            }
+
+            $found[] = is_a($value, Session::class) ? 'session' : 'seam';
+            $this->assertTrue(
+                $property->isPrivate(),
+                sprintf(
+                    '%s::$%s must be PRIVATE. It holds %s, and anything a subclass can reach is a way past the '
+                    . 'shopper-ownership guard: ten plugins extend this class, four of them reach the contact '
+                    . 'bypass lists, the pending email address or the billing-error gate, and a `protected` '
+                    . 'one lets any of them - or a third-party subclass - read and write those attributes '
+                    . 'with no flush when the shopper changes, no bound and no hashing. That is exactly the '
+                    . 'state LOQ-17149 found and had to close.',
+                    $property->getDeclaringClass()->getShortName(),
+                    $property->getName(),
+                    is_a($value, Session::class) ? 'the raw customer session' : 'the session-store seam'
+                )
+            );
+        }
+
+        $this->assertSame(
+            ['session', 'seam'],
+            array_values(array_unique($found)),
+            'Fixture guard: the plugin must really hold both a raw customer session and a '
+            . 'ShopperScopedSessionStores, or the visibility assertions above passed over an empty list and '
+            . 'proved nothing.'
+        );
+    }
+
+    /**
+     * Every property a plugin holds, its own and its parents', as reflection objects.
+     *
+     * @param object $plugin
+     * @return \ReflectionProperty[]
+     */
+    private function declaredProperties(object $plugin): array
+    {
+        $properties = [];
+        for ($class = new ReflectionClass($plugin); $class !== false; $class = $class->getParentClass()) {
+            foreach ($class->getProperties() as $property) {
+                if (!isset($properties[$property->getName()])) {
+                    $properties[$property->getName()] = $property;
+                }
+            }
+        }
+
+        return array_values($properties);
     }
 
     /**
@@ -551,6 +729,13 @@ class AbstractPluginContactStoresTest extends TestCase
 
     /**
      * The production bound, read rather than mirrored so the test describes the real limit.
+     *
+     * THE RANGE CHECK IS NOT DECORATION. Every test that fills a store loops over this figure,
+     * so a limit raised to an absurd number does not make those tests FAIL - it makes the
+     * PROCESS die of a memory exhaustion fatal partway through the suite, which is a crash
+     * rather than a verdict and tells the next reader nothing about what is wrong. Failing here
+     * turns that into a sentence. The upper bound itself is asserted for its own sake in
+     * testTheTwoContactStoresCannotGrowTheSessionPayloadWithoutBound().
      */
     private function contactLimit(): int
     {
@@ -563,7 +748,26 @@ class AbstractPluginContactStoresTest extends TestCase
             );
         }
 
-        return (int)$reflection->getConstant('VERIFIED_CONTACT_LIMIT');
+        $limit = (int)$reflection->getConstant('VERIFIED_CONTACT_LIMIT');
+        $this->assertGreaterThanOrEqual(
+            1,
+            $limit,
+            'ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT must leave room for at least one entry, or the '
+            . 'two stores can never remember anything and every resubmission is billed and warned about again.'
+        );
+        $this->assertLessThanOrEqual(
+            self::LARGEST_DEFENSIBLE_CONTACT_LIMIT,
+            $limit,
+            sprintf(
+                'ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT is %d, which is past anything this store '
+                . 'can justify holding - see testTheTwoContactStoresCannotGrowTheSessionPayloadWithoutBound(). '
+                . 'It is reported here as well because the tests that fill the store loop over this figure, so '
+                . 'an absurd value kills the PHP process with a memory fatal instead of failing an assertion.',
+                $limit
+            )
+        );
+
+        return $limit;
     }
 
     /**
