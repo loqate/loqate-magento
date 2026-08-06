@@ -29,18 +29,22 @@ use PHPUnit\Framework\TestCase;
  * same flush, but they fail in opposite directions, so a test written for the bypass shape
  * would not notice this one at all.
  *
- * AND WHY THE DENIAL IS UNRECOVERABLE WITHOUT THE FLUSH, which is what makes it worth three
- * tests rather than one. The gate is written ONLY by CheckoutBillingAddress::aroundAssign(),
- * i.e. on BillingAddressManagement::assign(). Both readers are BEFORE plugins on
+ * AND WHY THE DENIAL IS UNRECOVERABLE, which is what makes it worth three tests rather than
+ * one. The gate is written ONLY by CheckoutBillingAddress::aroundAssign(), i.e. on
+ * BillingAddressManagement::assign(). Both readers are BEFORE plugins on
  * savePaymentInformationAndPlaceOrder(), which assigns the billing address further down the
  * same call. So on any flow that submits the billing address together with the place-order call
- * - which is what the default one-page checkout does when the shopper edits the billing address
- * in the payment step - the reader throws before the only thing that could clear the gate ever
- * runs. The shopper is then stuck behind a message that names no field
- * ("Please check the error again before continuing."), and no amount of correcting their address
- * helps. testResubmittingACorrectedBillingAddressWithThePlaceOrderCallCannotReleaseTheBlock()
- * pins that reading, and it is the argument for enrolling this attribute in the flush rather
- * than trusting that it gets overwritten.
+ * the reader throws before the only thing that could clear the gate ever runs. The shopper is
+ * then stuck behind a message that names no field ("Please check the error again before
+ * continuing."), and no amount of correcting their address helps.
+ *
+ * THAT LAST READING IS A LIVE DEFECT, NOT A GUARANTEE, AND IT IS ONLY HALF CLOSED HERE. The
+ * flush closes the INHERITED case - shopper A's gate denying shopper B - because that is the
+ * one an identity change can see. It does NOT close the SAME-shopper case: one person, one
+ * session, no identity change, and so no flush. That residual is tracked as LOQ-17195 and is
+ * pinned below by
+ * testPinnedDefectLoq17195TheSameShopperCannotReleaseTheBlockWithThePlaceOrderCall(), which
+ * asserts what the code DOES today and must be inverted when LOQ-17195 is fixed.
  */
 class BillingErrorGateTest extends TestCase
 {
@@ -157,7 +161,7 @@ class BillingErrorGateTest extends TestCase
             'A block earned by the PREVIOUS shopper must not deny this one their order. Nothing on this '
             . 'checkout is wrong, the message names no field they could correct, and on a flow that submits '
             . 'the billing address with the place-order call there is nothing they could do about it - see '
-            . 'testResubmittingACorrectedBillingAddressWithThePlaceOrderCallCannotReleaseTheBlock().',
+            . 'testPinnedDefectLoq17195TheSameShopperCannotReleaseTheBlockWithThePlaceOrderCall().',
             $reader
         );
         $this->assertNull(
@@ -183,21 +187,30 @@ class BillingErrorGateTest extends TestCase
     }
 
     /**
-     * THE READING THAT MAKES THE FLUSH NECESSARY RATHER THAN MERELY TIDY: on a checkout that
-     * submits the billing address together with the place-order call, correcting the address
-     * cannot release the block, because the reader throws before the only writer runs.
+     * A DEFECT HELD IN PLACE DELIBERATELY, TRACKED AS LOQ-17195 - NOT A GUARANTEE. On a
+     * checkout that submits the billing address together with the place-order call, ONE
+     * unchanged shopper cannot release their own block: correcting the address does not help,
+     * because the reader throws before the only writer runs, and there is no identity change
+     * for LOQ-17149's flush to see. The block therefore lasts until they sign in or out or the
+     * session ends.
      *
-     * Pinned as behaviour, not left in a comment, because it is the whole argument for
-     * enrolling this attribute: if the block could simply be overwritten by the next billing
-     * submission, an inherited one would cost the next shopper one confusing message and no
-     * more. It cannot, so an inherited one is permanent for the life of the session.
+     * WHAT THIS TEST IS FOR, AND WHAT TO DO WITH IT WHEN LOQ-17195 IS FIXED. It pins what the
+     * code DOES, so that the reading cannot be lost and so that the flush's scope is honest:
+     * LOQ-17149 closes the INHERITED block (shopper A's gate denying shopper B) and this
+     * same-shopper permanence is what it leaves behind. It is not describing intended
+     * behaviour and it must not be defended as such. Fixing LOQ-17195 - by clearing the gate
+     * where the place-order call assigns the billing address, or by not gating that path at
+     * all - will make every assertion below fail, and the correct response is to INVERT them
+     * (the second attempt must go through, the corrected number must be verified, the gate
+     * must end up clear), not to delete the test or to reinstate the behaviour. Recorded in
+     * CHANGELOG.md under Known limitations.
      *
      * The order of the two calls below is production's, not the test's: Magento runs a before
      * plugin, and only if it returns does it run the subject method - which is where the
      * billing address is assigned and therefore where CheckoutBillingAddress::aroundAssign()
      * gets its chance to clear the gate.
      */
-    public function testResubmittingACorrectedBillingAddressWithThePlaceOrderCallCannotReleaseTheBlock(): void
+    public function testPinnedDefectLoq17195TheSameShopperCannotReleaseTheBlockWithThePlaceOrderCall(): void
     {
         $harness = $this->createCheckout(['phonePasses' => false]);
 
@@ -232,9 +245,11 @@ class BillingErrorGateTest extends TestCase
                 CouldNotSaveException::class,
                 $refused,
                 sprintf(
-                    'Attempt %d: the gate must still refuse the order. The corrected address travels WITH the '
-                    . 'place-order call, so it is never inspected - which is why an inherited gate has to be '
-                    . 'flushed rather than left to be overwritten.',
+                    'Attempt %d: the gate still refuses the order, and this assertion PINS a defect rather than '
+                    . 'requiring one. The corrected address travels WITH the place-order call, so it is never '
+                    . 'inspected. Tracked as LOQ-17195; when it is fixed this expectation inverts - the attempt '
+                    . 'must go through. Until then it is also why an inherited gate has to be FLUSHED rather '
+                    . 'than left to be overwritten (LOQ-17149).',
                     $attempt
                 )
             );
@@ -243,20 +258,23 @@ class BillingErrorGateTest extends TestCase
         $this->assertSame(
             1,
             count($harness['phoneRequests']),
-            'The corrected phone number must never have been verified at all: the throw happens before the '
-            . 'billing address is assigned, so the only writer of the gate never runs. One call, from the '
-            . 'original rejection.'
+            'The corrected phone number is never verified at all: the throw happens before the billing address '
+            . 'is assigned, so the only writer of the gate never runs. One call, from the original rejection. '
+            . 'Pinned, not required - under a LOQ-17195 fix the corrected number WOULD be verified and this '
+            . 'becomes 2.'
         );
         $this->assertTrue(
             (bool)($harness['session'][self::BILLING_ERRORS_SESSION_KEY] ?? false),
-            'And the gate is still set after both attempts: nothing on this flow can clear it.'
+            'And the gate is still set after both attempts: nothing on this flow can clear it, for the same '
+            . 'shopper or any other. This is the residual LOQ-17149 leaves behind and LOQ-17195 has to remove; '
+            . 'fixing it inverts this assertion to assertFalse().'
         );
         $this->assertStringNotContainsStringIgnoringCase(
             'phone',
             $refusalMessage,
             'The refusal names no field, which is why a shopper cannot work out what to correct: the message is '
             . '"Please check the error again before continuing." and the error it refers to may have been '
-            . 'someone else\'s.'
+            . 'someone else\'s. Part of the same pinned defect (LOQ-17195), not a requirement on the wording.'
         );
     }
 

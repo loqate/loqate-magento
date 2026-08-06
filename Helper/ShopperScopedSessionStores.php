@@ -390,20 +390,33 @@ class ShopperScopedSessionStores
      *
      * BOUNDING IT WOULD BE MEANINGLESS AND IS DELIBERATELY NOT DONE: it holds one boolean.
      *
+     * THE ORDERING THAT MAKES THIS ATTRIBUTE DANGEROUS, stated once and relied on twice
+     * below. The ONLY writer is CheckoutBillingAddress::aroundAssign(), i.e. a call to
+     * Magento\Quote\Model\BillingAddressManagement::assign(). Both readers are BEFORE plugins
+     * on savePaymentInformationAndPlaceOrder(), which assigns the billing address further
+     * down that same call. So on any flow that submits the billing address WITH the
+     * place-order call rather than in a separate request, a truthy value makes the reader
+     * throw BEFORE the only writer that could clear it is reached.
+     *
      * FLUSHING IT IS ESSENTIAL, AND THE CONSEQUENCE IS A DENIAL OF CHECKOUT, NOT A BYPASS.
      * Stated precisely because the two directions call for opposite fixes. A stale FALSE
      * grants nothing - it is the same as the empty default. A stale TRUE inherited across a
-     * shopper change makes both place-order plugins throw, and the ONLY writer that can
-     * clear it is CheckoutBillingAddress::aroundAssign(), i.e. a call to
-     * Magento\Quote\Model\BillingAddressManagement::assign(). Both readers are BEFORE
-     * plugins on savePaymentInformationAndPlaceOrder(), so on any flow that submits the
-     * billing address WITH the place-order call rather than in a separate request, the throw
-     * happens before assign() is reached and the value can never be cleared: the shopper is
-     * permanently unable to place an order, and the message names an error they never saw.
+     * shopper change makes both place-order plugins throw at the NEXT shopper, on a checkout
+     * where nothing is wrong, with a message naming an error they never saw and no field they
+     * could correct; and by the ordering above they cannot resubmit their way out of it.
      * Flushing writes null, which is falsy, so the post-flush state is "not blocked" - the
      * same state as a fresh session, and the safe default in the one direction that cannot
      * let an unverified billing address through (the address itself is re-verified by
      * aroundAssign() whenever that runs).
+     *
+     * WHAT THE FLUSH DOES NOT FIX, so this docblock is not read as closing the whole defect:
+     * the SAME shopper, unchanged, is still permanently blocked on those same flows. Their
+     * first attempt sets the gate and throws; every attempt after it is refused by the gate
+     * before assign() runs, so nothing they can do releases it. There is no identity change
+     * for enforceOwnership() to see - one person, one session - so no flush fires and none
+     * could. That is a live defect, tracked as LOQ-17195, NOT closed by LOQ-17149, and pinned
+     * as behaviour by Test\Unit\Plugin\Frontend\BillingErrorGateTest. What clears it today is
+     * a sign-in, a sign-out or the session ending.
      */
     public const BILLING_ERRORS_SESSION_KEY = 'loqate_billing_errors';
 

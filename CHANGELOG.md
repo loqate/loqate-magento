@@ -162,16 +162,22 @@ predate it and are described by their git tags and commit history.
   and its verify bypass survived a logout/login on a shared browser. It is now
   bounded to 50 entries with FIFO eviction, and it and both verdict caches are
   flushed when the logged-in customer changes (LOQ-16978).
-- **A shopper could be permanently unable to place an order, with the message
-  "Please check the error again before continuing." and nothing on the page to
-  correct.** A failed billing-address validation set a session flag that only a
-  fresh billing-address submission could clear — but the flag is checked *before*
-  the place-order call assigns the billing address, so on a checkout flow that
-  submits the two together the check always fired first and the flag was never
-  cleared. Combined with the flag surviving a logout/login on a shared browser,
-  one shopper's validation failure could block the next shopper's checkout
-  indefinitely. The flag is now cleared when the logged-in customer changes
-  (LOQ-17149).
+- **A billing-address block earned by the PREVIOUS shopper at a shared browser no
+  longer denies the next shopper their checkout.** A failed billing-address
+  validation sets a session flag that both place-order plugins refuse the order on,
+  with the message "Please check the error again before continuing." and no field
+  named that the shopper could correct. That flag survived a logout/login, so one
+  shopper's validation failure could block the next shopper's checkout — and because
+  the flag is checked *before* the place-order call assigns the billing address, on a
+  flow that submits the two together the next shopper had nothing on the page they
+  could do about it. The flag is now cleared when the logged-in customer changes, so
+  an **inherited** block is gone (LOQ-17149).
+
+  **This does not fix the same defect for the shopper who tripped the flag
+  themselves.** On those same flows their own corrected resubmission still cannot
+  clear it, because the flush needs an identity change to see and there is none. That
+  is a live defect, not a fixed one; it is listed under Known limitations below and
+  tracked as LOQ-17195.
 - **An email address left behind by an abandoned checkout was verified inside the
   next shopper's checkout.** The pending address is cleared only on a successful
   verification, so a guest who typed an email and left it behind left it in the
@@ -304,3 +310,23 @@ predate it and are described by their git tags and commit history.
   with: nothing tells the application that a different person is at the browser when
   neither of them authenticates. What bounds it is the **session lifetime**, which a
   merchant running a shared terminal should shorten (LOQ-17149).
+- **A shopper who trips the billing-address block themselves cannot clear it, on any
+  checkout flow that submits the billing address together with the place-order call**
+  (LOQ-17195). This is a live defect and is NOT fixed by the flush described under
+  Fixed above; the flush fixes only the block *inherited* across a shopper change. The
+  mechanism is the ordering: the flag is written by one method only,
+  `BillingAddressManagement::assign()`, while the two readers are `before` plugins on
+  `savePaymentInformationAndPlaceOrder()`, which assigns the billing address further
+  down the same call. The first attempt therefore passes the gate, fails validation,
+  sets the flag and throws; every attempt after it is refused by the gate *before*
+  `assign()` runs, so the only thing that could clear the flag never runs again.
+  Correcting the address does not help and the message names no field. The flush
+  cannot reach it either — it needs an identity change to see, and this is one shopper
+  in one session. **Exposed:** the flows that submit the billing address with the
+  place-order call, which for this module are the Hyvä and GraphQL place-order path
+  named under Changed above. **Not exposed:** default Luma checkout, which calls
+  `assign()` in a request of its own, so a corrected resubmission clears the flag
+  before the place-order call reads it. What clears it today is signing in or out, or
+  the session ending. The reading is pinned as behaviour by
+  `Test/Unit/Plugin/Frontend/BillingErrorGateTest.php`, whose assertions have to be
+  INVERTED when LOQ-17195 is fixed.
