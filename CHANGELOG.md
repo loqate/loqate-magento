@@ -192,15 +192,33 @@ predate it and are described by their git tags and commit history.
   salt is generated per session, never persisted or configured, and is replaced
   whenever the logged-in customer changes. Values written by earlier releases are
   discarded the first time the list is written to. This covers the email address and
-  the phone number only. Four things in the session are deliberately still readable,
-  because hashing them would break what they are for: the pending checkout email
-  address described above, which is sent to Loqate to be verified; the
-  `captured_addresses` store, which holds the addresses picked from the Capture lookup
-  so they can be compared field by field; and the two verify caches
+  the phone number only.
+
+  **Four things in the session are still readable, and only one of them has to be.**
+  The pending checkout email address described above is read back and sent to Loqate
+  to be verified, and a digest cannot be verified, so it stays raw. The other three
+  are addresses: the `captured_addresses` store, which holds in full the addresses
+  picked from the Capture lookup, and the two verify caches
   (`loqate_verified_addresses`, `loqate_verified_batch_addresses`), whose entries hold
   only a verdict and a schema version but whose **keys** carry the address in plain
-  text — street, city, postcode, country and region, normalised — because a cache is
-  looked up by the thing it caches (LOQ-17149).
+  text — the two street lines, the city, the postcode, the country, the full joined
+  street and the region, normalised. Those three are unhashed because they were
+  **outside LOQ-17149's scope**, which was the two contact lists. They are tracked as
+  LOQ-17196.
+
+  **All three can be hashed**, on LOQ-17149's own argument for hashing the contact
+  lists — a store that only has to compare does not need to hold the value. Every
+  reader of all three reduces an address to one normalised signature string and
+  compares strings: `Validator::checkForCapturedAddress()`,
+  `Helper\Controller::isSameCapturedAddress()` and both cache-key builders. No field
+  value is ever read back for any other purpose, and a key being a key is no obstacle
+  either — `buildBatchVerifyCacheKey()` already hashes the threshold segment of that
+  same key. The one real cost is named so that it is weighed rather than rediscovered
+  as a blocker: `isSameCapturedAddress()` would lose its byte-equality fast path,
+  which is the only thing that can collapse a duplicate whose signature is empty.
+  Until LOQ-17196 is done the exposure is exactly what this module's own ACCEPTED
+  LIMITS block states — a second admin at a shared browser can read every address the
+  first one verified, imported or looked up (LOQ-17149).
 - **An admin order create no longer copies the submitted order into the session.**
   When a check failed, `Plugin\Admin\OrderSave` handed the whole POST — the account
   email address, every address's telephone, the names and the streets — to Magento's
