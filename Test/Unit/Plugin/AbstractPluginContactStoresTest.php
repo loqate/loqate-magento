@@ -3,9 +3,7 @@
 namespace Loqate\ApiIntegration\Test\Unit\Plugin;
 
 use ArrayObject;
-use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
-use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Plugin\AbstractPlugin;
 use Loqate\ApiIntegration\Test\Support\Csprng;
 use Magento\Customer\Model\Session;
@@ -13,7 +11,6 @@ use Magento\Framework\App\Action\Context;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\UrlInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
-use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 
@@ -40,6 +37,11 @@ use ReflectionClass;
  */
 class AbstractPluginContactStoresTest extends TestCase
 {
+    // The session double, the configuration helper and the counting Validator, shared with the
+    // plugin-level tests in this namespace rather than copied into each of them: three copies of
+    // a double is three places for one of them to stop resembling the real Session.
+    use ShopperSessionHarness;
+
     /** Session attribute the email bypass list lives under. */
     private const VERIFIED_EMAIL_SESSION_KEY = 'loqate_email';
 
@@ -737,35 +739,14 @@ class AbstractPluginContactStoresTest extends TestCase
         $emailRequests = new ArrayObject();
         $phoneRequests = new ArrayObject();
 
-        $helper = $this->createMock(Data::class);
-        $helper->method('getConfigValue')->willReturnCallback(
-            static function ($configPath) {
-                // '' for BOTH prevent_submit toggles, which is the SHIPPED DEFAULT
-                // (etc/config.xml sets them to 0) and the only mode in which the bypass
-                // stores are consulted at all. Setting them would make every test here pass
-                // for the wrong reason: the store would never be read.
-                return '';
-            }
-        );
-        $helper->method('getCurrentStore')->willReturnCallback(static fn (): int => (int)$storeId['id']);
-
-        $validator = $this->createMock(Validator::class);
-        $validator->method('verifyEmail')->willReturnCallback(
-            static function ($email) use ($emailRequests) {
-                $emailRequests[] = $email;
-
-                // Truthy, with no 'error' and no 'noKeyFound', so validateEmail() reports no
-                // error. The tests count CALLS, not verdicts.
-                return ['Valid' => true];
-            }
-        );
-        $validator->method('verifyPhoneNumber')->willReturnCallback(
-            static function ($phone, $country = null) use ($phoneRequests) {
-                $phoneRequests[] = $phone;
-
-                return ['Valid' => true];
-            }
-        );
+        // NO configuration paths at all, which leaves createConfigHelper() answering '' to
+        // everything - and in particular to BOTH prevent_submit toggles, whose shipped default
+        // (etc/config.xml sets them to 0) is the only mode in which the bypass stores are
+        // consulted. Switching either on would make every test in this file pass for the wrong
+        // reason: the store would never be read.
+        $helper = $this->createConfigHelper([], $storeId);
+        // Both connectors ACCEPT what they are sent: these tests count CALLS, not verdicts.
+        $validator = $this->createCountingValidator($emailRequests, $phoneRequests);
 
         $plugin = new class (
             $this->createMock(Context::class),
@@ -808,46 +789,6 @@ class AbstractPluginContactStoresTest extends TestCase
             'emailRequests' => $emailRequests,
             'phoneRequests' => $phoneRequests,
         ];
-    }
-
-    /**
-     * A Magento\Customer\Model\Session double that actually stores what it is given.
-     *
-     * The shared Test/stubs Session is a no-op (getData() returns null, setData() stores
-     * nothing), so nothing under test could ever be observed. getData()/setData() have to be
-     * *added* when the real Magento Session is present, because it does not declare them -
-     * SessionManager __call-forwards them to Session\Storage - while the stub does declare
-     * them and PHPUnit refuses to "add" an existing method; hence the method_exists() filter,
-     * which keeps this double working on both sides.
-     *
-     * @param ArrayObject $sessionStore Backing store for the session attributes.
-     * @param ArrayObject $identity Holds 'customerId', read LIVE so a test can log in mid-test.
-     * @return Session&MockObject
-     */
-    private function createSessionDouble(ArrayObject $sessionStore, ArrayObject $identity)
-    {
-        $sessionBuilder = $this->getMockBuilder(Session::class)->disableOriginalConstructor();
-        $undeclared = array_values(array_filter(
-            ['getData', 'setData'],
-            static fn (string $method): bool => !method_exists(Session::class, $method)
-        ));
-        if ($undeclared) {
-            $sessionBuilder->addMethods($undeclared);
-        }
-        $sessionMock = $sessionBuilder->getMock();
-        $sessionMock->method('getData')->willReturnCallback(
-            static fn ($key = '', $clear = false) => $sessionStore[$key] ?? null
-        );
-        $sessionMock->method('setData')->willReturnCallback(
-            static function ($key, $value = null) use ($sessionStore, $sessionMock) {
-                $sessionStore[$key] = $value;
-
-                return $sessionMock;
-            }
-        );
-        $sessionMock->method('getCustomerId')->willReturnCallback(static fn () => $identity['customerId']);
-
-        return $sessionMock;
     }
 
     /** Billable verifyEmail() calls made so far. */
