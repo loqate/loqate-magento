@@ -59,8 +59,19 @@ class Validator
      * a STRING comparison, so an unrecognised threshold does not fail closed - anything
      * sorting above 'E' passes every address. This list is what makes that comparison
      * meaningful; see checkQualityIndex() for the failure it prevents.
+     *
+     * PUBLIC BECAUSE THE ADMIN FIELD'S OPTION LIST IS DERIVED FROM IT (LOQ-17148).
+     * Model\Config\Source\AddressQualityIndex - the source_model behind the
+     * address_quality_index select in etc/adminhtml/system.xml - reads its option VALUES from
+     * here and supplies only the labels. It used to spell A-E out itself, which was a second
+     * copy of this list free to drift: a grade added here but not there would be honoured by
+     * the verifier and unreachable in the form, and a grade added there but not here would be
+     * selectable and would then reject EVERY address, reported to the merchant row by row as
+     * invalid data rather than as a bad setting. Deriving one from the other makes both
+     * directions impossible rather than merely tested (they are tested too, in
+     * Test\Unit\Model\Config\Source\AddressQualityIndexTest).
      */
-    private const VALID_QUALITY_INDEXES = ['A', 'B', 'C', 'D', 'E'];
+    public const VALID_QUALITY_INDEXES = ['A', 'B', 'C', 'D', 'E'];
 
     /**
      * Version of the verify caches' KEY SCHEME. Stamped into every verdict written by
@@ -156,8 +167,8 @@ class Validator
      *
      * Deliberately larger than self::VERIFY_CACHE_LIMIT because this path is BATCHED:
      * customer import verifies in chunks of 100 rows
-     * (Plugin\Admin\ValidateImportAddress.php:50), so any limit below 100 could not hold
-     * even one chunk - the eviction would discard a chunk's earliest rows before the
+     * (Plugin\Admin\ValidateImportAddress::afterValidateData()), so any limit below 100 could
+     * not hold even one chunk - the eviction would discard a chunk's earliest rows before the
      * chunk finished, and re-running a file that FITS WITHIN THIS LIMIT would re-bill them.
      * 200 holds two full chunks while still bounding the session payload, which is the whole
      * point of having a limit at all (see self::VERIFY_CACHE_LIMIT and
@@ -167,25 +178,62 @@ class Validator
      * READ THAT PARAGRAPH AS A FLOOR ON THE CONSTANT, NOT AS A SAVING ON THE IMPORT PATH.
      * It is why >= 100 is asserted, and it holds only for a file whose whole working set
      * fits inside the limit; for a file LARGER than the limit it claims nothing, because
-     * FIFO eviction leaves close to zero hits however the constant is chosen. The paragraph
-     * below is the one to quote when crediting this cache with a saving.
+     * FIFO eviction leaves close to zero hits however the constant is chosen.
      *
-     * DO NOT MEASURE THIS AGAINST THE IMPORT PATH - state the consequence plainly so the
-     * saving is not credited to the wrong place. Eviction is FIFO, so re-running a file
-     * LARGER than this limit yields close to ZERO cache hits: chunk 1's entries are already
-     * evicted by the time run 1 finishes, and re-fetching them during run 2 evicts exactly
-     * what chunk 2 would have needed. Two further facts compound it: only PASSING verdicts
-     * are cached at all (storeBatchVerifyResult()), and address_quality_index defaults to
-     * 'A' (etc/config.xml:20), the strictest value, so on a default install most rows fail
-     * and are therefore never cacheable in the first place. The practical dedupe on the
-     * import path is consequently near nil, and raising this constant would not change that
-     * - it is inherent to FIFO over a working set larger than the cache.
+     * WHAT DEDUPES THE IMPORT PATH IS NOT THIS STORE (LOQ-17148). An import run chunks at 100
+     * rows and verifies every chunk INSIDE ONE PHP REQUEST, so the lifetime that matters there
+     * is the RUN, not the session. That is served by the run-scoped verdict map on this
+     * instance - see rememberBatchVerdict() and getRunScopedBatchVerdict() - which remembers
+     * BOTH polarities and is unbounded by this limit. Measured on the file shapes that showed
+     * the defect: 29% fewer billed addresses on a 1000-row file holding 700 distinct
+     * addresses, and 58.8% fewer on 1000 rows holding 400. Before it, a REJECTED address was
+     * re-sent - and so re-billed, the Cleansing API being billed per ADDRESS - in every chunk
+     * it appeared in, because this store caches PASSES ONLY (storeBatchVerifyResult()) and
+     * address_quality_index ships as 'A' (etc/config.xml), the strictest grade, so on a
+     * default install most rows fail and were never cacheable here in the first place.
      *
-     * THIS IS TRACKED, NOT ACCEPTED. LOQ-16976 was raised for admin order create AND customer
-     * import; this cache delivers the first. The import half is LOQ-17148, which is where the
-     * two fixable causes belong - caching failed verdicts on that path, where a failure costs
-     * a re-verify rather than a bypass, and exposing address_quality_index in
-     * etc/adminhtml/system.xml so the default cannot silently fail every row.
+     * THIS STORE IS DELIBERATELY UNCHANGED BY LOQ-17148 - passes only, FIFO, 200 - and the
+     * measurements behind each rejected alternative are recorded here because every one of
+     * them looks like an obvious improvement:
+     *  - CACHING FAILURES HERE IS A REGRESSION on the target workload, not an omission.
+     *    Eviction is FIFO and bounded, so failures crowd out the sparse passes the store
+     *    currently manages to keep: for 1000 distinct rows at a 5% pass rate, a second run
+     *    goes from 950 billed addresses to 1000, and for 500 rows at 5% from 475 to 500. It is
+     *    never better for any file larger than this limit. (An earlier revision of this
+     *    docblock promised LOQ-17148 would deliver exactly that. It was wrong, and this
+     *    paragraph is the correction.) It would also strand a merchant: a rejection that
+     *    outlived the request would be replayed after they corrected the file or loosened the
+     *    threshold, with no request made and no way to clear it.
+     *  - "RETAIN ON FULL" (freeze the store instead of evicting) is rejected: one Check Data
+     *    click on a file of 200 rows or more would permanently fill the store for the rest of
+     *    that admin's browser session - adminhtml never flushes it, see
+     *    ShopperScopedAddressStores' ACCEPTED LIMITS - destroying the admin-order-create win
+     *    below, which is the win LOQ-16976 actually delivered.
+     *  - SIZING THE STORE TO THE FILE is rejected on measured cost: ~147 bytes per entry, so
+     *    1000 entries is ~141 KB and 5000 is ~712 KB of raw session data. Magento reads and
+     *    writes the WHOLE session on every request, so a 5000-entry store costs ~1.4 MB of
+     *    session I/O on EVERY unrelated admin page load for the life of the session (~278 MB
+     *    over 200 page loads) to serve a re-run the merchant may never perform.
+     *
+     * RESIDUAL EXPOSURE, stated plainly rather than left to be rediscovered from an invoice.
+     * CROSS-RUN dedupe is not delivered for a file with more than this many distinct
+     * addresses: a re-run in the same browser session (a second Check Data click, a second
+     * import) re-bills essentially every row, because a sequential cyclic scan through a
+     * smaller FIFO cache has a ~0% hit rate. For a programmatic, CLI or cron-driven import it
+     * is 0% BY CONSTRUCTION and no cache size would change that - each process starts a fresh
+     * session id, so nothing one run writes is ever found by the next. Raising this constant
+     * does not fix either case; it is inherent to FIFO over a working set larger than the
+     * cache, and to session-scoped storage outside a browser session.
+     *
+     * NOT THE SAME TICKET AS INTRA-CHUNK DUPLICATES, AND LOQ-17015 IS NOT CLOSED BY THIS WORK.
+     * LOQ-17148 dedupes ACROSS the chunks of one run. Two copies of an address in ONE assembled
+     * payload are still both billed on that address's FIRST appearance in the run, because
+     * nothing is remembered until the response returns, so both copies miss; every LATER
+     * appearance is answered from the run map, two copies in one batch included. That residue
+     * is LOQ-17015 and it is riskier to fix - it changes the payload row arithmetic and must be
+     * done TOGETHER with the count($response) !== count($sentItems) guard in
+     * verifyMultipleAddresses(), never by comparing against the pre-dedupe count. See the
+     * ACCEPTED LIMITS on that method for the boundary stated exactly.
      *
      * Where this cache actually pays for itself is ADMIN ORDER CREATE: two addresses per
      * submission, re-submitted after a validation bounce or an unrelated form error, is
@@ -207,6 +255,56 @@ class Validator
      *      the guard - see ShopperScopedAddressStores.
      */
     private ShopperScopedAddressStores $shopperSession;
+
+    /**
+     * Batch verdicts earned by THIS instance, keyed exactly as the session store is
+     * (buildBatchVerifyCacheKey()) and holding BOTH polarities (LOQ-17148).
+     *
+     * THE LIFETIME IS THE RUN, and that is the whole point: an import file is chunked at 100
+     * rows by Plugin\Admin\ValidateImportAddress::afterValidateData() and every chunk is
+     * verified inside ONE PHP request against ONE Validator, so "this instance" IS "this import
+     * run". A rejected address repeated in a later chunk used to be re-sent and re-billed in
+     * every chunk it appeared in, because the session store holds passes only; this map is what
+     * answers it instead. Passes are remembered here too, because the session store is bounded
+     * and FIFO - on a file larger than self::BATCH_VERIFY_CACHE_LIMIT an early pass is evicted
+     * before the file ends and would otherwise be re-billed within the same run.
+     *
+     * NEVER SERIALISED AND NEVER PERSISTED. It dies with the request, by construction: it is a
+     * plain property, nothing writes it to the session, and it is deliberately NOT a static or
+     * a Registry entry (either would serve one shopper's verdicts to another - see
+     * self::VERIFY_CACHE_SESSION_KEY). That mortality is a FEATURE and is asserted: a rejection
+     * must never outlive the request, or a merchant who corrects the file or loosens the
+     * threshold keeps being told "invalid" with no request made and no way to clear it.
+     *
+     * KEYED ON THE KEY, NOT ON THE RAW SIGNATURE. buildBatchVerifyCacheKey() is where the
+     * '' -"nothing identifiable" sentinel is honoured and where the store view and the AQI
+     * threshold fingerprint enter, so keying on the signature would remember verdicts across a
+     * threshold change and would file two unidentifiable addresses under one key.
+     *
+     * ONLY READABLE VERDICTS ARE IN HERE. An unreadable AQI or an unreadable threshold produces
+     * a rejection that is a FAULT REPORT, not a verdict, and is remembered nowhere - see
+     * rememberBatchVerdict(), which is the single gate for both lifetimes.
+     *
+     * @var array<string, bool> Batch cache key => verdict.
+     */
+    private array $runScopedBatchVerdicts = [];
+
+    /**
+     * The ShopperScopedAddressStores generation self::$runScopedBatchVerdicts was earned under,
+     * or null before this instance has asked (LOQ-17148, LOQ-16978).
+     *
+     * The map holds the same kind of data as the session verdict stores - licences to skip a
+     * billable verify - so it must have the same OWNERSHIP lifetime, not merely the same
+     * request. A request-scoped map does NOT get that for free: one Validator can outlive a
+     * mid-request identity change, and it would then answer the new shopper from the previous
+     * shopper's verdicts while the guard had just flushed the three stores beside it. So the
+     * map is enrolled in the guard's own ownership model rather than checked ad hoc at the call
+     * site: see ShopperScopedAddressStores::ownershipGeneration() and
+     * discardRunScopedVerdictsIfShopperChanged().
+     *
+     * @var int|null
+     */
+    private ?int $runScopedVerdictsGeneration = null;
 
     /** @var RegionFactory */
     private $regionFactory;
@@ -454,8 +552,8 @@ class Validator
     /**
      * Verify multiple addresses using Loqate API
      *
-     * Used by admin order create (Plugin\Admin\OrderSave.php:49) and customer import
-     * (Plugin\Admin\ValidateImportAddress.php:53).
+     * Used by admin order create (Plugin\Admin\OrderSave::aroundExecute()) and customer import
+     * (Plugin\Admin\ValidateImportAddress::afterValidateData()).
      *
      * BILLING (LOQ-16976): the Cleansing API is billable PER ADDRESS, not per request, so
      * the verdict cache is consulted PER ADDRESS, before the address is added to the
@@ -466,6 +564,22 @@ class Validator
      * before considering merging the two. Only PASSING verdicts are cached, see
      * storeBatchVerifyResult(). The pre-existing captured-address guard is applied first
      * and is likewise free.
+     *
+     * TWO MEMORIES, TWO LIFETIMES, ONE KEY (LOQ-17148). The lookup before payload assembly
+     * consults BOTH, in this order:
+     *  - self::$runScopedBatchVerdicts, this INSTANCE's map, holding BOTH polarities. Its
+     *    lifetime is one import RUN, because that is what one instance is here: an import file
+     *    is chunked at 100 rows and every chunk is verified against the same Validator inside
+     *    one PHP request. This is what stops a REJECTED address being re-billed in every chunk
+     *    it appears in, which the session store structurally could not do, and it is unbounded
+     *    by self::BATCH_VERIFY_CACHE_LIMIT so an evicted PASS is not re-billed mid-run either;
+     *  - the SESSION store, holding PASSES ONLY and bounded, which is what survives to a LATER
+     *    REQUEST (the re-submitted admin order, a re-run import that fits inside the limit).
+     * Both are keyed by buildBatchVerifyCacheKey(), so one address is one key in both and a
+     * threshold or store-view change invalidates both at once. A rejection is deliberately
+     * asymmetric - remembered for the run, never for the session - and
+     * self::BATCH_VERIFY_CACHE_LIMIT records the measurements behind that asymmetry, including
+     * why widening the session store is a REGRESSION rather than the obvious next step.
      *
      * RETURN SHAPE - load-bearing in two ways, do not "simplify" either:
      *  - one entry per input address, under the INPUT's OWN KEY. OrderSave.php:51-57
@@ -557,15 +671,28 @@ class Validator
      *    batch can both miss and both be billed. Sequential replay - the re-submitted
      *    admin order, the re-run import - is what this de-duplicates.
      *  - a row present in the response but carrying no readable AQI is answered INVALID and
-     *    is never cached. That is a fail-closed verdict, decided by checkQualityIndex()'s
-     *    shape guard, and reached for a record whose 'Matches' list is present but empty -
-     *    the row-count guard below cannot catch that shape, because array_column()
-     *    PRESERVES such a record, see the attribution loop for the demonstration. It is a
-     *    deliberate rejection, not a gap: it costs one re-attempt on a response we could
-     *    not read, where the previous behaviour reported "no match found" as VALID.
-     *  - the same address twice in ONE batch is billed twice: both copies miss the cache in
-     *    the pre-flight pass, since nothing is written until the response comes back.
-     *    Tracked as LOQ-17015. Whoever implements it MUST preserve the
+     *    is remembered NOWHERE - not in the session, and not for the rest of the run either.
+     *    That is a fail-closed rejection, decided by checkQualityIndex() answering null, and
+     *    reached for a record whose 'Matches' list is present but empty - the row-count guard
+     *    below cannot catch that shape, because array_column() PRESERVES such a record, see
+     *    the attribution loop for the demonstration. It is a deliberate rejection, not a gap:
+     *    it costs one re-attempt on a response we could not read, where the previous behaviour
+     *    reported "no match found" as VALID. The price of remembering it would be far higher -
+     *    ONE connector fault or one bad credential would brand every matching row in the file
+     *    invalid for the rest of the run, sending the merchant to edit rows Loqate never
+     *    rejected.
+     *  - LOQ-17015 IS NOT RESOLVED BY LOQ-17148, and here is the boundary stated exactly, so
+     *    that ticket is neither closed on a partial fix nor re-implemented for work already
+     *    done. VERIFIED against this implementation, not merely reasoned about: two copies of
+     *    an address in one batch, on that address's FIRST appearance in the run, are BOTH
+     *    billed - both copies miss both memories in the pre-flight pass, because nothing is
+     *    remembered until the response comes back. What LOQ-17148 does change is every LATER
+     *    appearance: once the run map holds a readable verdict for an address, every copy of it
+     *    in every subsequent batch is answered from memory, including two copies inside the
+     *    SAME batch. So the residue of LOQ-17015 is exactly "the first batch in which an
+     *    address appears more than once", and it is bounded by ONE duplicate charge per
+     *    distinct address per run rather than one per occurrence.
+     *    Whoever implements the rest MUST preserve the
      *    ONE-RESPONSE-ROW-PER-SENT-ITEM assumption the row-count guard below and the
      *    positional attribution loop after it both depend on: collapsing duplicates into a
      *    single payload slot changes the row/address arithmetic, so that dedupe and this
@@ -631,7 +758,16 @@ class Validator
             // ValidatorBatchVerifyCacheTest::testAnUnverifiedCountyVariantIsNeverServedACachedBatchPass()
             // and ::testChangingOnlyTheCountyCostsASecondBillableAddress().
             $signature = $this->buildVerifyCacheSignature($parsedAddress);
-            $cachedVerdict = $this->getCachedBatchVerifyResult($signature);
+
+            // BOTH memories, run-scoped first, and reported as ONE 'hit' either way (LOQ-17148).
+            // The run map is asked first because it is free (no session read, no unserialise),
+            // strictly newer than anything in the session store for the same key, and the only
+            // one of the two that can answer a REJECTION. The log line stays a single 'hit'
+            // token deliberately: it is what reconciles the drop in billed addresses against
+            // the invoice, and an operator counting hits against misses does not care which
+            // memory answered - see logBatchVerifyCacheOutcome().
+            $cachedVerdict = $this->getRunScopedBatchVerdict($signature)
+                ?? $this->getCachedBatchVerifyResult($signature);
             if ($cachedVerdict !== null) {
                 $this->logBatchVerifyCacheOutcome('hit', $signature);
                 $result[$index] = $cachedVerdict;
@@ -740,28 +876,43 @@ class Validator
             //
             // checkQualityIndex() now mirrors verifyAddress()'s AVC guard; see
             // checkQualityIndex()'s own docblock for why the test is on the value's shape
-            // rather than on truthiness, and for why an unrecognised THRESHOLD rejects rather
-            // than - as it once did - passing every address.
-            $isValid = $this->checkQualityIndex($qualityIndex);
+            // rather than on truthiness, for why an unrecognised THRESHOLD rejects rather
+            // than - as it once did - passing every address, and for why it answers THREE
+            // states rather than two.
+            $verdict = $this->checkQualityIndex($qualityIndex);
+
+            // THE STRICT BOOL COERCION IS LOAD-BEARING, AND THIS IS THE ONLY PLACE A null CAN
+            // REACH $result (LOQ-17148). checkQualityIndex() answers null for "we could not
+            // read this", which must still REJECT the row - it is only the REMEMBERING that
+            // differs - so it is coerced here rather than assigned. Assigning the null instead
+            // would leave the slot looking unfilled, the array_filter() below would DROP the
+            // row, and Plugin\Admin\ValidateImportAddress's array_merge() would then renumber
+            // every later row: an invalid row reported against a valid row's number, which is
+            // exactly the mis-attribution LOQ-16977 was raised to fix. Pinned by
+            // Test\Unit\Plugin\Admin\ValidateImportAddressRowAttributionTest.
+            $isValid = $verdict === true;
             $result[$sentItem['key']] = $isValid;
 
-            // NEVER CACHE A VERDICT WE COULD NOT READ still holds, and it no longer needs a
-            // separate readability test here: an unreadable AQI is now a FALSE verdict, and
-            // storeBatchVerifyResult() caches nothing but passes. One test, one place - the
-            // previous arrangement had the readability rule stated twice (once for the verdict,
-            // once for the cache) and could drift.
-            $this->storeBatchVerifyResult($sentItem['signature'], $isValid);
+            // NEVER REMEMBER A VERDICT WE COULD NOT READ, in ONE place for BOTH lifetimes:
+            // rememberBatchVerdict() is the single gate, and it is handed the three-state
+            // answer rather than the coerced bool precisely so that "unreadable" is still
+            // distinguishable when the decision is made. No readability test here, none in
+            // storeBatchVerifyResult(); one rule, one site.
+            $this->rememberBatchVerdict($sentItem['signature'], $verdict);
         }
 
         // With the count guard in place this filter is a NO-OP by construction, and that is
         // worth stating rather than deleting: every reserved slot is now necessarily filled -
-        // captured, cache hit, or sent and therefore answered, since a mismatched row count
-        // returned above - so no null can survive to here. It is kept as the enforcement of the
-        // documented return shape ("no null verdicts, ever"), so that a future edit which adds
-        // a fourth way of leaving a slot unfilled degrades to a missing key, which callers
-        // already read as "nothing to report", instead of shipping a null that
-        // ValidateImportAddress would report as an invalid row. array_filter() preserves both
-        // keys and order, so the return-shape guarantees above survive it either way.
+        // captured, remembered verdict (either memory), or sent and therefore answered, since a
+        // mismatched row count returned above - so no null can survive to here. The one edit
+        // that could have broken that claim is the readability split above, and it does not: an
+        // unreadable answer is coerced to false before it is assigned, never left as null. It
+        // is kept as the enforcement of the documented return shape ("no null verdicts, ever"),
+        // so that a future edit which adds a further way of leaving a slot unfilled degrades to
+        // a missing key, which callers already read as "nothing to report", instead of shipping
+        // a null that ValidateImportAddress would report as an invalid row. array_filter()
+        // preserves both keys and order, so the return-shape guarantees above survive it
+        // either way.
         return array_filter($result, static fn ($verdict) => $verdict !== null);
     }
 
@@ -837,6 +988,28 @@ class Validator
     /**
      * Check if response quality index matches the quality customer has set.
      *
+     * THREE STATES, NOT TWO, AND THAT IS THE WHOLE OF THE READABILITY RULE (LOQ-17148):
+     *  - true  - the AQI is readable, the threshold is readable, and the AQI meets it;
+     *  - false - both are readable and the AQI MISSES the threshold. A VERDICT: Loqate judged
+     *            this address and this merchant's quality bar refused it;
+     *  - null  - the AQI could not be read, or the threshold could not be read. NOT A VERDICT
+     *            but a FAULT REPORT, about the response or about the configuration.
+     * The row is REJECTED for false and for null alike - the caller coerces null to false, see
+     * the attribution loop in verifyMultipleAddresses() - so nothing about which rows an import
+     * rejects changes. What the third state buys is the ability to remember the second one:
+     * rememberBatchVerdict() remembers a readable verdict of either polarity and remembers a
+     * null NOWHERE, so one connector fault, one "no match for this address" or one bad
+     * credential cannot brand every matching row in a file invalid for the rest of the run.
+     * Before the split, "readable rejection" and "unreadable, therefore rejected" were the same
+     * false and could not be told apart at all.
+     *
+     * THE RULE LIVES IN ONE PLACE. This method decides READABILITY; rememberBatchVerdict()
+     * decides what a null means for memory. Neither the call site nor storeBatchVerifyResult()
+     * repeats the test, which is what the previous arrangement got wrong in the other direction
+     * (it delegated the whole rule to this method's fail-closed guard, so "never remember an
+     * unreadable verdict" was true only as a side effect of failures not being cached - and it
+     * would have silently stopped being true the moment any failure was).
+     *
      * FAILS CLOSED on an AQI it cannot read. The guard is on the value's SHAPE - "is this a
      * non-empty string" - and deliberately not on truthiness or emptiness, because the
      * comparison below is a STRING comparison in which 'A' is the strongest grade
@@ -873,28 +1046,36 @@ class Validator
      * arrived at silently, and no amount of guarding the response side detects it.
      *
      * So the threshold is required to be one of self::VALID_QUALITY_INDEXES and anything
-     * else fails closed and is logged. Rejecting is the only safe answer: the whole point of
-     * the setting is to bar addresses, and a threshold nobody can read cannot be said to
-     * admit any of them.
+     * else fails closed and is logged - EVERY time, once per verdict, not once per run. That
+     * log line is the only signal a merchant has that their quality bar is broken, so it is
+     * emitted from here rather than hoisted anywhere a remembered verdict could skip it.
+     * Rejecting is the only safe answer: the whole point of the setting is to bar addresses,
+     * and a threshold nobody can read cannot be said to admit any of them.
      *
-     * Not reachable from the admin UI today - etc/config.xml:20 supplies the default and
-     * etc/adminhtml/system.xml exposes no field for it - but "unreachable" here rests on the
-     * absence of a form field, and the value is a plain core_config_data row that a data
-     * patch, a CLI config:set, or an admin field added later can put anything into. The
-     * guard costs one in_array() per verdict.
+     * REACHABLE FROM THE ADMIN UI SINCE LOQ-17148: etc/adminhtml/system.xml now exposes
+     * address_quality_index as a SELECT over Model\Config\Source\AddressQualityIndex, whose
+     * option values are derived from self::VALID_QUALITY_INDEXES - so nothing a merchant can
+     * choose in the form can reach the branch below. The guard is not thereby redundant, and
+     * this is why it was written before the field existed: the value is a plain
+     * core_config_data row, and a data patch, a CLI config:set, direct SQL or an env.php
+     * override can still put anything into it. The guard costs one in_array() per verdict.
      *
      * resolveQualityIndexThreshold() still returns the value RAW and uncast, so the batch
      * cache key keeps fingerprinting exactly what was compared; see its docblock.
      *
      * @param $qualityIndex The AQI from the response row, of any type - it is unvalidated
      *                      connector output, so this method must not assume a string.
-     * @return bool True only when the AQI is readable, the threshold is readable, AND the
-     *              AQI meets it.
+     * @return bool|null true when the AQI is readable, the threshold is readable and the AQI
+     *                   meets it; false when both are readable and it does not; null when
+     *                   either could not be read, which is a fault report and not a verdict.
+     *                   NOTE for callers: null is FALSY, so a bare truthiness test still
+     *                   rejects correctly - but it must never be stored or compared as a
+     *                   verdict. See rememberBatchVerdict().
      */
-    private function checkQualityIndex($qualityIndex): bool
+    private function checkQualityIndex($qualityIndex): ?bool
     {
         if (!is_string($qualityIndex) || $qualityIndex === '') {
-            return false;
+            return null;
         }
 
         $configIndex = $this->resolveQualityIndexThreshold();
@@ -908,7 +1089,7 @@ class Validator
                 implode(', ', self::VALID_QUALITY_INDEXES)
             ));
 
-            return false;
+            return null;
         }
 
         return $qualityIndex <= $configIndex;
@@ -1570,6 +1751,132 @@ class Validator
     }
 
     /**
+     * Remember one batch verdict - in BOTH memories, or in NEITHER (LOQ-17148).
+     *
+     * THE SINGLE GATE FOR "NEVER REMEMBER A VERDICT WE COULD NOT READ". It takes
+     * checkQualityIndex()'s three-state answer, not a bool, precisely so that the decision is
+     * made where the distinction still exists: null is an unreadable AQI or an unreadable
+     * threshold, which is a FAULT REPORT and not a verdict, so it is written nowhere and the
+     * identical address is billed again - within this run as well as in any later request. One
+     * connector fault, one "no match for this address" or one bad credential must not brand
+     * every matching row in an import file invalid for the rest of the run, reported to the
+     * merchant as rows to go and fix with nothing on the server saying otherwise.
+     *
+     * WHY THE RULE IS HERE AND NOWHERE ELSE. It used to be delegated to checkQualityIndex()
+     * failing closed plus storeBatchVerifyResult() storing no failures: true at the time, but
+     * true only as a SIDE EFFECT of failures never being remembered, so it stopped being true
+     * the moment one lifetime started remembering them. Stating it once, at the only place both
+     * memories are written, is what keeps the two lifetimes from drifting apart - and it is
+     * always the readability half that gets relaxed when they do. The call site holds no
+     * readability test, and neither does storeBatchVerifyResult(), which keeps its own
+     * PASSES-ONLY guard for its own separate reason (see its docblock).
+     *
+     * THE TWO POLARITIES ARE ASYMMETRIC BY DESIGN: a readable rejection is remembered for the
+     * RUN and never for the SESSION. self::BATCH_VERIFY_CACHE_LIMIT records the measurements
+     * behind that - caching failures in the session store is a regression on the target
+     * workload, and a rejection that outlived the request would strand a merchant who had
+     * corrected the file or loosened the threshold.
+     *
+     * @param string $signature Signature the verdict was earned under.
+     * @param bool|null $verdict checkQualityIndex()'s answer, passed through UNCOERCED.
+     * @return void
+     */
+    private function rememberBatchVerdict(string $signature, ?bool $verdict): void
+    {
+        if ($verdict === null) {
+            return;
+        }
+
+        $this->rememberRunScopedBatchVerdict($signature, $verdict);
+
+        // Passes only, and its own guard decides that - see storeBatchVerifyResult().
+        $this->storeBatchVerifyResult($signature, $verdict);
+    }
+
+    /**
+     * Read this RUN's verdict for the given address signature, of either polarity.
+     *
+     * @param string $signature
+     * @return bool|null The remembered verdict, or null when this run holds none - which is
+     *                   the same "ask Loqate" answer getCachedBatchVerifyResult() gives, so
+     *                   the two compose with a plain ?? at the call site.
+     */
+    private function getRunScopedBatchVerdict(string $signature): ?bool
+    {
+        $key = $this->buildBatchVerifyCacheKey($signature);
+        if ($key === '') {
+            // The '' sentinel: an address carrying nothing identifiable is kept out of every
+            // memory rather than sharing one with every other unidentifiable address.
+            return null;
+        }
+
+        $this->discardRunScopedVerdictsIfShopperChanged();
+
+        return $this->runScopedBatchVerdicts[$key] ?? null;
+    }
+
+    /**
+     * Remember one readable verdict for the rest of this run.
+     *
+     * Deliberately UNBOUNDED, unlike the session store. It holds one array entry per distinct
+     * address in one import file, it is never serialised and it dies with the request, so the
+     * cost is bounded by the file the merchant chose to import - whereas the session store is
+     * re-read and re-written on every subsequent request of the browser session, which is the
+     * whole reason THAT one has a limit (see self::BATCH_VERIFY_CACHE_LIMIT).
+     *
+     * @param string $signature
+     * @param bool $verdict Readable verdict of either polarity; nulls are stopped by
+     *                      rememberBatchVerdict(), which is the only caller.
+     * @return void
+     */
+    private function rememberRunScopedBatchVerdict(string $signature, bool $verdict): void
+    {
+        $key = $this->buildBatchVerifyCacheKey($signature);
+        if ($key === '') {
+            return;
+        }
+
+        $this->discardRunScopedVerdictsIfShopperChanged();
+
+        $this->runScopedBatchVerdicts[$key] = $verdict;
+    }
+
+    /**
+     * Discard this run's remembered verdicts if the shopper-scoped stores have been flushed
+     * since they were earned (LOQ-17148, LOQ-16978).
+     *
+     * The map is verdict data, so it has the OWNERSHIP lifetime of the session verdict stores
+     * and not merely the request's: one Validator can outlive a mid-request identity change,
+     * and a plain request-scoped map would then answer the new shopper out of the previous
+     * shopper's verdicts while the guard had just flushed the three stores beside it - reopening
+     * exactly the leak ShopperScopedAddressStores exists to close, through a store that class
+     * cannot see. Pinned by
+     * ShopperScopedAddressStoresTest::testABatchVerdictDoesNotSurviveALogin().
+     *
+     * ASKING IS WHAT ENFORCES IT. ShopperScopedAddressStores::ownershipGeneration() runs the
+     * ownership check itself and then reports the generation, so this is correct even on the
+     * import path, where $checkForCaptured is false and the run map is consulted before any
+     * session attribute is touched at all. Enrolling the map in the guard's own model, rather
+     * than comparing customer ids at this call site, is what keeps ONE definition of "the
+     * shopper changed" in the codebase.
+     *
+     * @return void
+     */
+    private function discardRunScopedVerdictsIfShopperChanged(): void
+    {
+        $generation = $this->shopperSession->ownershipGeneration();
+        if ($generation === $this->runScopedVerdictsGeneration) {
+            return;
+        }
+
+        // Either the first lookup of this instance (nothing to discard) or a genuine flush.
+        // Both are answered by starting from empty, which is why no special case is needed for
+        // the null the property starts out holding.
+        $this->runScopedBatchVerdicts = [];
+        $this->runScopedVerdictsGeneration = $generation;
+    }
+
+    /**
      * Read a previously stored batch verdict for the given address signature.
      *
      * Only ever returns true or null, because only passing verdicts are stored: null means
@@ -1621,21 +1928,30 @@ class Validator
      * Store a batch verdict against the given address signature - if, and only if, it
      * PASSED.
      *
-     * NEVER CACHING A FAILURE is load-bearing, not tidiness. Two things rest on it: an admin
-     * or an import can never be stranded on a replayed rejection, because there is none to
-     * replay; and the stored shape stays 'valid'-only, which is the second guard against
-     * this store and the single-address one being read for each other (see
-     * getCachedBatchVerifyResult()). The guard therefore lives HERE rather than at the call
-     * site, so a future caller cannot reintroduce cached failures by forgetting it.
+     * NEVER CACHING A FAILURE IN THE SESSION is load-bearing, not tidiness. Three things rest
+     * on it: an admin or an import can never be stranded on a replayed rejection in a LATER
+     * REQUEST, because there is none to replay; the stored shape stays 'valid'-only, which is
+     * the second guard against this store and the single-address one being read for each other
+     * (see getCachedBatchVerifyResult()); and the bounded FIFO store keeps spending its 200
+     * slots on the sparse PASSES, which is what makes it worth having at all on a default
+     * install where most rows fail. self::BATCH_VERIFY_CACHE_LIMIT carries the measurements,
+     * including why caching failures here would make a second run cost MORE. The guard
+     * therefore lives HERE rather than at the call site, so a future caller cannot reintroduce
+     * cached failures by forgetting it.
      *
-     * WHAT THIS GUARD RELIES ON, and where that half lives: "$valid === true" only means
-     * checkQualityIndex() said so, and this method cannot audit that - by the time it is
-     * called the response value is gone. It is safe because checkQualityIndex() itself now
-     * FAILS CLOSED on an AQI it cannot read (its opening shape guard): an unreadable value
-     * can no longer arrive here as a genuine-looking pass to be replayed all session. Do
-     * not relax that guard without adding a readability test at this method's call site -
-     * the positional attribution loop in verifyMultipleAddresses() - or unreadable
-     * responses start being cached as passes again.
+     * NOTE THE SCOPE OF THAT WORD "NEVER": it is about THIS store. A readable rejection IS
+     * remembered for the length of one import RUN, in self::$runScopedBatchVerdicts, which is
+     * what LOQ-17148 delivers and what this store structurally could not - see
+     * rememberBatchVerdict(), the one caller of this method.
+     *
+     * WHAT THIS GUARD NO LONGER RELIES ON, since the reasoning changed and the old note would
+     * now be actively misleading. It used to lean on checkQualityIndex() failing closed: an
+     * unreadable AQI became false, and a false was not cached, so unreadable answers were kept
+     * out of this store as a side effect. That delegation is gone. checkQualityIndex() now
+     * answers null for anything it could not read, and rememberBatchVerdict() drops a null
+     * before either memory is touched - so "no unreadable verdict is ever remembered" is now an
+     * explicit rule with one site, and this method's own guard means only what it says: this
+     * store holds passes.
      *
      * Bounding and eviction mirror storeVerifyResult() exactly - unset-then-append so a
      * refreshed entry does not cost an unrelated address its verdict, FIFO array_shift()
@@ -1739,6 +2055,14 @@ class Validator
      * reason: that method hashes buildVerifyCacheKey(), the AVC-namespaced key, which for
      * an address on this path names a cache entry that does not exist - the log line would
      * correlate with the wrong cache.
+     *
+     * ONE 'hit' TOKEN FOR BOTH MEMORIES (LOQ-17148). A verdict remembered for the run and one
+     * replayed from the session store are logged identically, and deliberately so: what this
+     * instrumentation is for is reconciling billed addresses against the invoice, misses map
+     * one-to-one onto billed addresses either way, and splitting the token would break every
+     * existing counter for a distinction no operator is counting. The two are still
+     * distinguishable where it matters - a run-scoped hit leaves no entry in the session store,
+     * which is what the tests read.
      *
      * The literal "family=strict" segment is a vestige of the single-address cache once
      * having had two key shapes. There is one signature builder now, so it distinguishes

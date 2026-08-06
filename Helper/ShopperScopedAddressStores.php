@@ -107,6 +107,16 @@ use Magento\Customer\Model\Session;
  * getData()/setData() now REJECT any key missing from it so that an un-enrolled attribute
  * cannot quietly acquire the guard's appearance without its protection.
  *
+ * ADDING A STORE THAT IS NOT A SESSION ATTRIBUTE: use ownershipGeneration() (LOQ-17148).
+ * Verdict data does not have to live in the session to belong to one shopper -
+ * Validator::verifyMultipleAddresses() now also remembers batch verdicts in a PLAIN PHP MAP
+ * on the Validator instance, for the length of one import run - and a store this class
+ * cannot flush is a store that survives the flush, which re-opens exactly the hand-off the
+ * class exists to close. Such a store is enrolled by asking ownershipGeneration() before it
+ * is read or written and discarding its own contents when the answer has moved on: one
+ * ownership model, two mechanisms, rather than a second identity check written at a call
+ * site where it would rot independently of this one.
+ *
  * THE MODULE HAS OTHER SESSION ATTRIBUTES, and they are NOT enrolled here - named so the
  * next reader does not conclude there are only three. Out of scope for LOQ-16978, which is
  * about the ADDRESS stores. THIS IS TRACKED, NOT ACCEPTED: enrolling them is LOQ-17149,
@@ -204,6 +214,21 @@ class ShopperScopedAddressStores
     private $session;
 
     /**
+     * How many times THIS instance has flushed the stores because the identity changed.
+     *
+     * A COUNTER RATHER THAN A BOOLEAN, and per instance rather than per session: it is read
+     * by holders of data that is derived from these stores but does not live in them (see
+     * ownershipGeneration()), and such a holder has to be able to tell "no flush since I last
+     * looked" from "flushed twice since I last looked". A boolean cannot, and a flag that had
+     * to be cleared by its reader would be wrong the moment there were two readers.
+     *
+     * Not persisted anywhere, deliberately. It describes THIS request's view of the stores,
+     * which is the only lifetime the derived data it protects has; written to the session it
+     * would grow without bound and mean nothing to the next request.
+     */
+    private int $flushGeneration = 0;
+
+    /**
      * @param Session $session The per-shopper customer session the stores live in.
      */
     public function __construct(Session $session)
@@ -247,6 +272,54 @@ class ShopperScopedAddressStores
         $this->enforceOwnership();
 
         $this->session->setData($key, $value);
+    }
+
+    /**
+     * Enforce ownership NOW and report which generation of the stores the caller is looking
+     * at, so data DERIVED from them - held anywhere, not only in the session - can be
+     * discarded on the same identity change that flushes them (LOQ-17148).
+     *
+     * WHAT PROBLEM THIS SOLVES. Validator::verifyMultipleAddresses() remembers batch verdicts
+     * for the length of one import run in a plain map on the Validator instance, because a
+     * run chunks at 100 rows inside ONE request and the session store cannot serve it (it is
+     * bounded and holds passes only - see Validator::BATCH_VERIFY_CACHE_LIMIT). That map holds
+     * exactly the same kind of data as self::BATCH_VERIFY_CACHE_SESSION_KEY - licences to skip
+     * a billable verify - so it must have the same OWNERSHIP lifetime. A plain request-scoped
+     * map does not: one Validator can outlive a mid-request identity change (a login handled
+     * by the same PHP request), and the map would then answer the new shopper with the old
+     * shopper's verdicts while the three session stores beside it had just been flushed. That
+     * is precisely the hand-off this class exists to stop, arriving through a store this class
+     * could not see.
+     *
+     * WHY A GENERATION RATHER THAN A CALLBACK OR A FLUSH LIST. This class holds no reference
+     * to its holders and must not start holding one: it is constructed inside Controller's and
+     * Validator's constructors and reaching back into them would invert that dependency and
+     * make the flush order matter. A monotonic counter inverts the responsibility instead -
+     * the guard states a fact about the stores, and each holder decides what its own derived
+     * data means when that fact changes. It also composes: any number of holders can read it
+     * independently, and none of them can consume the signal from under another.
+     *
+     * ENFORCES OWNERSHIP ITSELF, and that is the load-bearing half. A caller that consulted
+     * its own map BEFORE touching any session attribute - which is exactly what the run map
+     * does on the import path, where the captured-address read is skipped - would otherwise
+     * read a generation from before the flush and serve a stale verdict on the first address
+     * of the request. Asking through this method makes the check happen at the moment the
+     * derived data is used, on the same terms as getData()/setData().
+     *
+     * NO KEY, AND THEREFORE NO assertEnrolled() CALL. There is no attribute to enrol: this
+     * reports on the whole flush unit named by self::SHOPPER_SCOPED_SESSION_KEYS, all of
+     * which are flushed together. The assertion still governs every attribute reachable
+     * through this class, which is what it is for.
+     *
+     * @return int Generation of the shopper-scoped stores as of this call. Compare it against
+     *             the value seen last time; any difference means the stores were flushed in
+     *             between and anything derived from them must be discarded.
+     */
+    public function ownershipGeneration(): int
+    {
+        $this->enforceOwnership();
+
+        return $this->flushGeneration;
     }
 
     /**
@@ -349,6 +422,12 @@ class ShopperScopedAddressStores
             foreach (self::SHOPPER_SCOPED_SESSION_KEYS as $key) {
                 $this->session->setData($key, null);
             }
+
+            // Counted AFTER the stores are actually cleared, and only in this branch: the
+            // ADOPTION path below flushes nothing, so it must not advance the generation or
+            // every first access of a session would throw away derived data that is still
+            // valid. See ownershipGeneration() for who reads this and why it is a counter.
+            $this->flushGeneration++;
         }
 
         $this->session->setData(self::SESSION_OWNER_KEY, $owner);
