@@ -30,14 +30,33 @@ namespace Loqate\ApiIntegration\Test\Support;
  * class is still built through its real constructor and still calls random_bytes() itself. The
  * only thing replaced is the PLATFORM capability, which is the thing the guarantee is about.
  *
- * IT DOES SHIP, and that is worth knowing rather than fixing here: composer.json maps
- * "Loqate\\ApiIntegration\\": "" under the production autoload section (the module root is the
- * PSR-4 root, which is how a Magento module is laid out), so this class is autoloadable in a
- * live install even though the Test\ prefix is also mapped under autoload-dev. Nothing calls it
- * there - it is one public static bool and one static method, no constructor, no state that
- * outlives a call - and the FUNCTION that reads it (Test/Support/CsprngOverride.php) is a bare
- * function that Composer's PSR-4 cannot autoload at all and that only Test/bootstrap.php
- * requires. So in production the flag exists, nothing sets it, and nothing reads it.
+ * IT DOES SHIP TO PRODUCTION, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT. composer.json
+ * maps "Loqate\\ApiIntegration\\": "" under the PRODUCTION autoload section - the module root is
+ * the PSR-4 root, which is how a Magento module is laid out - so this class is autoloadable in a
+ * live install even though the Test\ prefix is also mapped under autoload-dev. Recorded here
+ * because a public MUTABLE static that can switch the contact digests off is exactly the kind of
+ * thing that should be found on purpose and not by surprise.
+ *
+ * WHY IT IS ACCEPTABLE, in the order the questions get asked:
+ *  - NOTHING IN PRODUCTION CAN REACH THE FLAG'S EFFECT. The flag is inert on its own: the only
+ *    reader is the bare function in Test/Support/CsprngOverride.php, which Composer's PSR-4
+ *    cannot autoload (it is a function, not a class) and which only Test/bootstrap.php requires.
+ *    A live install never loads that file, so setting Csprng::$unavailable there changes nothing
+ *    at all.
+ *  - AND IF IT COULD, IT FAILS CLOSED. The behaviour it simulates is a salt that cannot be
+ *    minted, which makes contactDigest() return its "do not cache this" sentinel: every email
+ *    address and phone number is then verified on the Loqate API and NOTHING is stored. The cost
+ *    is extra billable verifies - never a bypass, never a weaker digest, and never a raw value in
+ *    the session. That is the same direction the class chooses for a real CSPRNG failure, which
+ *    is the whole point of the test this switch exists for.
+ *  - THE ALTERNATIVE DOES NOT ACTUALLY REMOVE IT. A Magento module is deployed as a directory, so
+ *    the file is on disk in a live install whatever composer.json says; narrowing the production
+ *    autoload would only stop the class being resolvable BY NAME, and it cannot be narrowed to
+ *    "everything except Test/" without giving up the single PSR-4 root a Magento module is
+ *    expected to have. The gain would be nil and the layout would stop being conventional.
+ * So in production the flag exists, nothing sets it, nothing reads it, and the worst case if
+ * something ever did is a larger Loqate invoice. Revisit this if Test/Support ever grows a class
+ * whose flipped state would LOOSEN a check rather than tighten one - that one would not ship.
  */
 final class Csprng
 {
