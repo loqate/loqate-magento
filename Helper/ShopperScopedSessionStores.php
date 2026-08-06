@@ -183,16 +183,29 @@ use Magento\Customer\Model\Session;
  *        the digest had kept them out of. LOQ-17149 REMOVED that call: nothing in adminhtml
  *        reads 'customer_form_data' off the customer session, so it re-populated no form. The
  *        enumeration behind that is at the old call site in Plugin\Admin\OrderSave.
- *      * WHAT IS STILL READABLE, so this is not read as more than it says. The three ADDRESS
- *        stores are not hashed and were never in LOQ-17149's scope. The two verdict caches
- *        hold a boolean and a schema version per entry, under a key that is a truncated hash
- *        of the address, so nothing is readable OUT of them - but
- *        self::CAPTURED_ADDRESSES_SESSION_KEY holds, in full, the addresses the first admin
- *        picked out of the Capture lookup (bounded to Helper\Controller::CAPTURED_ADDRESSES_LIMIT
- *        entries, flushed on a CUSTOMER change and therefore never on this path). A second
- *        admin at a shared browser can read those. That residual is LOQ-16978's, it is
- *        unchanged by this ticket in either direction, and it is named here so the bullet above
- *        cannot be read as "an admin session holds nothing about a customer".
+ *      * WHAT IS STILL READABLE, so this is not read as more than it says. ALL THREE ADDRESS
+ *        stores are readable, none of them is hashed, and none of them was in LOQ-17149's scope:
+ *          - self::CAPTURED_ADDRESSES_SESSION_KEY holds, in full, the addresses the first admin
+ *            picked out of the Capture lookup (bounded to
+ *            Helper\Controller::CAPTURED_ADDRESSES_LIMIT entries);
+ *          - self::VERIFY_CACHE_SESSION_KEY and self::BATCH_VERIFY_CACHE_SESSION_KEY hold only a
+ *            boolean and a schema version in each ENTRY, but the address is in the KEY that entry
+ *            sits under, in plaintext. Both key builders emit
+ *            '<store view>|<threshold fingerprint>|<signature>' and only the THRESHOLD segment is
+ *            hashed (Validator::buildVerifyCacheKey(), Validator::buildBatchVerifyCacheKey()); the
+ *            signature is Validator::buildVerifyCacheSignature() for BOTH caches - the two street
+ *            lines, the city, the postcode, the country, the full joined street and the region,
+ *            upper-cased, whitespace-collapsed and joined with '|'. Validator's own logging rule
+ *            states the consequence outright: it hashes that key before writing it to a log
+ *            because the address and the signature "are customer PII"
+ *            (Validator::logVerifyCacheOutcome()).
+ *        None of the three is flushed on this path - the flush needs a CUSTOMER change and
+ *        adminhtml never has one - so a second admin at a shared browser can read every address
+ *        the first one verified, imported or looked up, and not merely the captured ones. That
+ *        residual is LOQ-16978's, it is unchanged by this ticket in either direction, and it is
+ *        stated at this length so the bullets above cannot be read as "an admin session holds
+ *        nothing about a customer": what LOQ-17149 removed from this session is the readable
+ *        EMAIL ADDRESS and PHONE NUMBER, not the readable addresses.
  *    THE PRICE OF CLOSING IT, which is why it is not closed: Magento\Backend\Model\Auth\Session
  *    would have to be read here, and this class is constructed on every frontend checkout
  *    request through Helper\Validator and Plugin\AbstractPlugin. Either it becomes a required

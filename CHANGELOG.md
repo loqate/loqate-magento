@@ -185,11 +185,16 @@ predate it and are described by their git tags and commit history.
   instead: the lists only ever need to *compare*, never to read a value back. The
   salt is generated per session, never persisted or configured, and is replaced
   whenever the logged-in customer changes. Values written by earlier releases are
-  discarded the first time the list is written to. Two things in the session are
-  deliberately still readable, because hashing them would break what they are for:
-  the pending checkout email address described above, which is sent to Loqate to be
-  verified, and the `captured_addresses` store, which holds the addresses picked from
-  the Capture lookup so they can be compared field by field (LOQ-17149).
+  discarded the first time the list is written to. This covers the email address and
+  the phone number only. Four things in the session are deliberately still readable,
+  because hashing them would break what they are for: the pending checkout email
+  address described above, which is sent to Loqate to be verified; the
+  `captured_addresses` store, which holds the addresses picked from the Capture lookup
+  so they can be compared field by field; and the two verify caches
+  (`loqate_verified_addresses`, `loqate_verified_batch_addresses`), whose entries hold
+  only a verdict and a schema version but whose **keys** carry the address in plain
+  text — street, city, postcode, country and region, normalised — because a cache is
+  looked up by the thing it caches (LOQ-17149).
 - **An admin order create no longer copies the submitted order into the session.**
   When a check failed, `Plugin\Admin\OrderSave` handed the whole POST — the account
   email address, every address's telephone, the names and the streets — to Magento's
@@ -282,9 +287,11 @@ predate it and are described by their git tags and commit history.
   order create, customer-email re-check, address re-check or Capture lookup — so the
   merchant pays nothing extra and only the attribution between two admin users is
   imprecise. Since this release the two contact lists hold salted digests rather than
-  values, so no email address or phone number is inherited with it; the
-  `captured_addresses` store still holds the addresses the first admin looked up,
-  which is unchanged by this release. Closing the swap itself would mean either a
+  values, so no email address or phone number is inherited with it. The **addresses
+  are still readable**, and all three address stores are: `captured_addresses` holds
+  the addresses the first admin looked up, and the keys of the two verify caches carry
+  the addresses the first admin verified or imported, in plain text. That is unchanged
+  by this release in either direction. Closing the swap itself would mean either a
   backend dependency in a helper built on every storefront checkout request or a
   second bill for a verdict that is identical by construction.
 - For the same reason, **two successive guests on one browser are not covered
