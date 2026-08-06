@@ -26,33 +26,6 @@ use Magento\Customer\Model\Session;
  * clears third-party session attributes on an identity change, so this class does it for
  * every attribute in self::SHOPPER_SCOPED_SESSION_KEYS.
  *
- * WHY THE NAME IS "SESSION STORES" AND NOT "ADDRESS STORES" ANY MORE, and why the broad name
- * that over-promised once does not over-promise now. This class began as ShopperScopedSession
- * and the LOQ-16978 review renamed it to ShopperScopedAddressStores precisely BECAUSE that
- * broad name lied: it guarded THREE of the module's SEVEN shopper-scoped session attributes,
- * all three of them address stores, while its name claimed the session. The name promised
- * coverage the class did not have, and a 120-line docblock walking that back is not a fix -
- * the name is what a reader sees at the call site. LOQ-17149 enrols the four siblings, so the
- * ratio is now SEVEN of SEVEN. That is the whole of the argument: the name is not a promise
- * about coverage that has to be qualified any more, it is a description of a complete set.
- * "Address stores" would be the new lie, because four of the seven hold no address.
- *
- * The module's ONE remaining session attribute of its own, self::IP_COUNTRY_SESSION_KEY, is
- * not a shopper's data at all - it is derived from the request IP (see getIpCountry()) - so it
- * is not part of that denominator, and it is reachable HERE, named and excluded with its
- * reason, rather than left as an unexplained direct session access in two other classes. That
- * is what makes this file the complete map of the module's session usage instead of a list with
- * a silent omission, and it is the second half of why the name is honest: nothing is missing
- * from it that a reader would expect to find.
- *
- * The rename is safe because the old name never shipped: neither ShopperScopedSession nor
- * ShopperScopedAddressStores exists in any tag up to and including v2.0.17 (the latest at the
- * time of writing), the class is never placed in DI, and every holder keeps it in a private
- * property - so no third party can be resolving it by name and no BC alias is kept. The
- * attribute VALUES are untouched by the rename, and Controller::CAPTURED_ADDRESSES_SESSION_KEY,
- * Validator::VERIFY_CACHE_SESSION_KEY and Validator::BATCH_VERIFY_CACHE_SESSION_KEY are
- * still ALIASES of the constants below, so no live session loses a store at deploy time.
- *
  * HOW. Ownership is recorded in a sibling attribute (self::SESSION_OWNER_KEY) holding the
  * customer id the stores belong to, with 0 (self::GUEST_OWNER_ID) standing for "not logged
  * in". Every read and every write checks the live identity against that marker first, so
@@ -98,151 +71,39 @@ use Magento\Customer\Model\Session;
  * anywhere: they were bare string literals at their call sites before this ticket, so there
  * is no older name to keep resolving.
  *
- * ADOPTION, stated so it is not mistaken for a hole - and so its reach is not understated,
- * which an earlier revision of this paragraph did (LOQ-17148 mutation review). When NOTHING
- * has been recorded yet, the current identity ADOPTS whatever is in the SESSION stores
- * instead of flushing them. Two things reach that branch, not one:
- *  - data written BEFORE this class existed. A session that was already live at deploy time,
- *    in which shopper A logged out before the module's first post-release access, hands A's
- *    stores to the guest that follows. Accepted rather than defended against, on three
- *    grounds: it is exactly the pre-change behaviour, so it is not a regression this ticket
- *    introduces; it is bounded to one release and to sessions mid-flight during it; and it
- *    closes the moment ANY identity change is observed after the marker is written. The
- *    alternative - flushing on first access - would buy nothing for any session started
- *    after the deploy and would throw away every live shopper's capture bypass at deploy
- *    time;
- *  - a session storage that is EMPTIED mid-flight, which erases the marker along with the
- *    stores it describes (Magento\Framework\Session\SessionManager::clearStorage(), the
- *    destroy() inside Magento\Customer\Model\Session::logout(), or another module). That is
- *    not bounded to a release: it is reachable at any time and the identity may have changed
- *    in the same breath. Harmless for the seven SESSION stores, which were emptied too -
- *    along with self::CONTACT_DIGEST_SALT_KEY, so no surviving contact digest could be
- *    matched even if one did survive - but NOT for data DERIVED from them and held elsewhere,
- *    which is why adoption opens a new ownership epoch; see enforceOwnership() and
- *    ownershipGeneration().
+ * ADOPTION. When NOTHING has been recorded yet, the current identity ADOPTS whatever is in the
+ * stores instead of flushing them, and TWO things reach that branch, not one. Data written
+ * BEFORE this class existed - accepted rather than defended against, because it is exactly the
+ * pre-change behaviour, it is bounded to sessions mid-flight during one release, and it closes
+ * at the first identity change after the marker is written, whereas flushing on first access
+ * would throw away every live shopper's bypasses for nothing (the residual it leaves is a
+ * session in which shopper A logged out before the module's first post-release access, which
+ * hands A's stores to the guest that follows). And a session storage EMPTIED mid-flight, which
+ * is NOT bounded to a release and is the reason adoption has to open a new ownership epoch; see
+ * the increment in enforceOwnership() and ownershipGeneration().
  *
- * ACCEPTED LIMITS, stated (the style of Validator::verifyMultipleAddresses()):
- *  - THE GUARD SCOPES BY CUSTOMER IDENTITY ONLY, and LOQ-17149 DECIDED to leave it there
- *    rather than inherit the LOQ-16978 reasoning. The marker tracks
- *    Magento\Customer\Model\Session::getCustomerId() and nothing else, so an ADMIN user swap
- *    inside one browser session is not covered. That is not academic for FIVE of the seven
- *    stores, counted rather than estimated:
- *      * self::CAPTURED_ADDRESSES_SESSION_KEY - Controller\Adminhtml\Capture\Retrieve, through
- *        Helper\Controller::retrieve(), which is the same helper method the storefront
- *        controller calls;
- *      * self::VERIFY_CACHE_SESSION_KEY - Plugin\Admin\ValidateAddress, through
- *        Validator::verifyAddress();
- *      * self::BATCH_VERIFY_CACHE_SESSION_KEY - written exclusively from adminhtml
- *        (Plugin\Admin\OrderSave, Plugin\Admin\ValidateImportAddress);
- *      * self::VERIFIED_EMAIL_SESSION_KEY and self::VERIFIED_PHONE_SESSION_KEY - from adminhtml
- *        as well as from the storefront (Plugin\Admin\OrderSave via validateEmail() and
- *        validatePhone(), Plugin\Admin\ValidateCustomer, Plugin\Admin\ValidateAddress).
- *    Only self::PENDING_EMAIL_SESSION_KEY and self::BILLING_ERRORS_SESSION_KEY are
- *    storefront-only. In adminhtml the customer session holds no customer id, so the owner
- *    there is permanently self::GUEST_OWNER_ID and the flush is a NO-OP on all five.
- *    WHAT THAT COSTS, QUANTIFIED, so nobody "fixes" a non-defect and nobody mistakes it for
- *    the shopper-facing defect this class exists to close:
- *      * WHO IS EXPOSED TO WHOM: admin to admin, on one shared browser, only. The admin area
- *        runs its OWN PHP session - Magento\Backend\Model\Session\AdminConfig gives it a
- *        distinct session name and a cookie path under the admin front name - so the
- *        Magento\Customer\Model\Session reached from adminhtml is a different storage from
- *        the storefront one. A shopper can therefore never inherit an admin's entries and an
- *        admin can never inherit a shopper's; there is no admin <-> shopper contamination to
- *        scope for.
- *      * WHAT REPLAYS: an identical admin order create (Plugin\Admin\OrderSave - one email
- *        and up to two phone numbers per submission, plus the batch address verdicts), an
- *        identical customer-email re-check (Plugin\Admin\ValidateCustomer), an identical
- *        address re-check (Plugin\Admin\ValidateAddress - the phone and the single-address
- *        verdict) and an address the first admin had already picked out of the Capture lookup
- *        (Controller\Adminhtml\Capture\Retrieve). The customer import replays batch verdicts
- *        only: it writes neither contact store.
- *      * WHAT THE MERCHANT PAYS: nothing extra. The second admin is NOT billed for a verify
- *        the first already paid for, which is what the caches are FOR. What is imprecise is
- *        the ATTRIBUTION of that one call between two admins, and the module has never
- *        claimed to attribute per admin user.
- *      * WHAT IS NOT ANOTHER ADMIN'S JUDGEMENT: only PASSES are stored in the batch cache
- *        (storeBatchVerifyResult() caches nothing else) and every entry is namespaced by
- *        store view and by a fingerprint of the configured threshold
- *        (Validator::buildBatchVerifyCacheKey()), so a replayed entry is a pure function of
- *        (address, store view, threshold) - exactly the verdict the second admin would have
- *        earned by submitting that address themselves. The contact stores replay a
- *        "warned once, allowed on resubmission" decision, which is a decision about a VALUE,
- *        not about a person.
- *      * WHAT THE TWO CONTACT STORES EXPOSE: nothing readable. This is what changed the
- *        calculus for them, and it is why (b) - record the residual - is defensible there
- *        where inheriting the LOQ-16978 paragraph would not have been: since LOQ-17149 they
- *        hold salted HMAC digests and not the values (see contactDigest()), under a salt that
- *        dies with the session, so their residual is a BILLING-ATTRIBUTION one - the same
- *        class of residual LOQ-16978 already accepted for the batch cache.
- *        THAT CLAIM IS ONLY WORTH MAKING BECAUSE IT HOLDS ON THE ERROR PATH, which is the only
- *        path that stores anything and the whole reason these stores exist ("warned once,
- *        submit again"). Plugin\Admin\OrderSave used to answer a failed check by handing the
- *        entire order-create POST - the account email address, every address's telephone, the
- *        names and the streets - to Session::setCustomerFormData(), raw, in the same request
- *        that had just stored the digest, which put the values straight back into the session
- *        the digest had kept them out of. LOQ-17149 REMOVED that call: nothing in adminhtml
- *        reads 'customer_form_data' off the customer session, so it re-populated no form. The
- *        enumeration behind that is at the old call site in Plugin\Admin\OrderSave.
- *      * WHAT IS STILL READABLE, so this is not read as more than it says. ALL THREE ADDRESS
- *        stores are readable, none of them is hashed, and none of them was in LOQ-17149's scope:
- *          - self::CAPTURED_ADDRESSES_SESSION_KEY holds, in full, the addresses the first admin
- *            picked out of the Capture lookup (bounded to
- *            Helper\Controller::CAPTURED_ADDRESSES_LIMIT entries);
- *          - self::VERIFY_CACHE_SESSION_KEY and self::BATCH_VERIFY_CACHE_SESSION_KEY hold only a
- *            boolean and a schema version in each ENTRY, but the address is in the KEY that entry
- *            sits under, in plaintext. Both key builders emit
- *            '<store view>|<threshold fingerprint>|<signature>' and only the THRESHOLD segment is
- *            hashed (Validator::buildVerifyCacheKey(), Validator::buildBatchVerifyCacheKey()); the
- *            signature is Validator::buildVerifyCacheSignature() for BOTH caches - the two street
- *            lines, the city, the postcode, the country, the full joined street and the region,
- *            upper-cased, whitespace-collapsed and joined with '|'. Validator's own logging rule
- *            states the consequence outright: it hashes that key before writing it to a log
- *            because the address and the signature "are customer PII"
- *            (Validator::logVerifyCacheOutcome()).
- *        None of the three is flushed on this path - the flush needs a CUSTOMER change and
- *        adminhtml never has one - so a second admin at a shared browser can read every address
- *        the first one verified, imported or looked up, and not merely the captured ones. That
- *        residual is LOQ-16978's, it is unchanged by this ticket in either direction, and it is
- *        stated at this length so the bullets above cannot be read as "an admin session holds
- *        nothing about a customer": what LOQ-17149 removed from this session is the readable
- *        EMAIL ADDRESS and PHONE NUMBER, not the readable addresses.
- *    THE PRICE OF CLOSING IT, which is why it is not closed: Magento\Backend\Model\Auth\Session
- *    would have to be read here, and this class is constructed on every frontend checkout
- *    request through Helper\Validator and Plugin\AbstractPlugin. Either it becomes a required
- *    constructor argument - which forces an edit to every one of the seven constructors that
- *    build this class inline, breaks anything extending them, and is a backend dependency in
- *    a frontend hot path - or it becomes an optional one that is null exactly where it would
- *    be needed. Neither buys anything but a second bill for a verdict that is identical by
- *    construction.
- *  - GUEST TO GUEST ON ONE BROWSER IS NOT COVERED EITHER, and it is recorded here rather than
- *    left to be discovered because it is the case this class's own opening paragraph names.
- *    The marker holds an IDENTITY, and two successive people who never sign in present the
- *    same one: both resolve to self::GUEST_OWNER_ID, the marker matches, and nothing is
- *    flushed. So on the public terminal and the click-and-collect kiosk - where nobody logs in
- *    at all - every one of the seven stores carries over from one person to the next, INCLUDING
- *    the bypass this class exists to stop: the second guest's first submission of a value the
- *    first was warned about is accepted with no verification and no warning. This is the same
- *    residual as the admin one above but WITHOUT its consolation, because
- *    self::PENDING_EMAIL_SESSION_KEY is the one enrolled store that stays RAW (a digest cannot
- *    be put on the wire), so the second guest can also inherit a stranger's actual email
- *    address. That matters MORE after LOQ-17149 than before it, not less: this ticket is what
- *    enrolled that attribute, and enrolling it is what makes the login case safe while leaving
- *    this one exactly as it was.
- *    WHY IT IS NOT CLOSED HERE: there is no signal to close it with. "A different person is at
- *    this browser now" is not an event the application can observe when neither of them
- *    authenticates - it is the same session, the same cookie and the same identity - so no
- *    check inside this class can tell the two apart, and the only behaviour that would be safe
- *    against it is flushing on every request, which is the same as having no stores at all.
- *    What actually bounds it is outside this class and is worth knowing: the session cookie's
- *    lifetime and Magento's session lifetime end the shared session, and each store is bounded
- *    (self::VERIFIED_CONTACT_LIMIT, Helper\Controller::CAPTURED_ADDRESSES_LIMIT,
- *    Validator::VERIFY_CACHE_LIMIT, Validator::BATCH_VERIFY_CACHE_LIMIT) so nothing accumulates
- *    without limit while it lasts. A merchant running a genuinely shared terminal should shorten
- *    that lifetime; the module cannot decide it for them.
- *  - ALL UNREADABLE CUSTOMER IDS COLLAPSE ONTO ONE OWNER, see resolveOwnerId(). Two
- *    successive identities that both present an unreadable id would share the stores. It
- *    cannot collide with a guest or with a real customer, which is the collision that
- *    mattered.
+ * ACCEPTED LIMITS. Each is merchant-facing as well as developer-facing, so the quantified
+ * version - who is exposed to whom, what replays, what it costs and why closing it is refused -
+ * lives in CHANGELOG.md (the two identity limits under "Known limitations", what stays readable
+ * under "Fixed") and is not restated here:
+ *  - THE GUARD SCOPES BY CUSTOMER IDENTITY ONLY. The marker tracks
+ *    Magento\Customer\Model\Session::getCustomerId() and nothing else, so an ADMIN-USER swap
+ *    inside one browser session is not covered: adminhtml carries no customer id, the owner
+ *    there is permanently self::GUEST_OWNER_ID, and the flush is a NO-OP on the five stores
+ *    adminhtml writes - which includes self::BATCH_VERIFY_CACHE_SESSION_KEY, written from
+ *    nowhere else, and excludes only self::PENDING_EMAIL_SESSION_KEY and
+ *    self::BILLING_ERRORS_SESSION_KEY. It is admin-to-admin and never admin-to-shopper, because
+ *    the admin area runs its own PHP session (Magento\Backend\Model\Session\AdminConfig). What a
+ *    second admin inherits is a verdict identical by construction - billing ATTRIBUTION, never
+ *    an extra bill - plus every address the first one verified, imported or looked up, which the
+ *    three address stores hold readable (LOQ-17196). Not an email address or a phone number:
+ *    since LOQ-17149 those two stores hold digests, see contactDigest().
+ *  - GUEST TO GUEST ON ONE BROWSER IS NOT COVERED EITHER: two people who never sign in present
+ *    the same identity, so nothing is flushed between them and self::PENDING_EMAIL_SESSION_KEY,
+ *    the one enrolled store that must stay RAW, hands the second a stranger's email address.
+ *    There is no signal to close it with, and the only behaviour that would be safe against it -
+ *    flushing on every request - is the same as having no stores at all.
+ *  - ALL UNREADABLE CUSTOMER IDS COLLAPSE ONTO ONE OWNER, see resolveOwnerId().
  *  - CONCURRENCY: reading the marker, flushing and rewriting it are not atomic, exactly as
  *    on the caches this protects (see Validator::verifyAddress()). Two concurrent
  *    requests straddling a login can both observe the old marker; the loser re-verifies,
@@ -266,26 +127,6 @@ use Magento\Customer\Model\Session;
  * is read or written and discarding its own contents when the answer has moved on: one
  * ownership model, two mechanisms, rather than a second identity check written at a call
  * site where it would rot independently of this one.
- *
- * WHAT ELSE IS IN THE CUSTOMER SESSION, named so the next reader does not have to grep for
- * it and does not conclude the count is wrong:
- *  - self::IP_COUNTRY_SESSION_KEY, this module's one attribute that is deliberately NOT
- *    enrolled. Reachable only through getIpCountry()/setIpCountry(), which say why;
- *  - self::SESSION_OWNER_KEY and self::CONTACT_DIGEST_SALT_KEY, which this class owns and
- *    writes itself and no caller can reach at all;
- *  - 'customer_form_data' and 'address_form_data', reached through Magento's own typed
- *    setters (Session::setCustomerFormData(), Session::setAddressFormData()) from
- *    Plugin\AbstractPlugin's rememberCustomerFormData()/rememberAddressFormData(). They are
- *    CORE attributes: core writes them on its own validation failures and core reads them
- *    back with getCustomerFormData(true), which clears them. They are not verify bypasses,
- *    this module is not their only writer, and flushing an attribute whose lifetime core
- *    manages would be this module deciding core's business - so they are out of scope here
- *    and named at their accessors instead. That reasoning is about the CALL SITES, not about
- *    the attribute names: it holds for the three storefront callers, whose redirect targets
- *    core renders from the value and clears in doing so, and it did NOT hold for the one
- *    adminhtml caller, which LOQ-17149 therefore removed rather than excused (see
- *    Plugin\Admin\OrderSave). A new caller has to be checked against that, not against this
- *    paragraph.
  */
 class ShopperScopedSessionStores
 {
@@ -765,15 +606,9 @@ class ShopperScopedSessionStores
      * CHANGELOG.md as a merchant-visible change, because in that edge case the merchant pays
      * for one verification they previously did not.
      *
-     * NAMESPACED BY FIELD AND BY STORE VIEW. The field name is in the message so an email
-     * digest can never satisfy a phone lookup even if the two attributes were ever merged
-     * (they are separate today, so this is the second of two independent guards). The store
-     * view is in the message because these two stores were NOT namespaced by store view at
-     * all before LOQ-17149, unlike the address caches: one session can span store views
-     * (?___store=, a language switcher), each store view can carry its own API key and its
-     * own prevent_submit toggle, so a "warned once, now allowed" decision earned under one
-     * store view's configuration used to replay under another's. See resolveStoreScope() for
-     * how it degrades when no store can be resolved.
+     * NAMESPACED BY FIELD AND BY STORE VIEW; see self::VERIFIED_PHONE_SESSION_KEY for the field
+     * segment and resolveStoreScope() for the store-view one, including how it degrades when no
+     * store can be resolved.
      *
      * @param string $field One of self::SHOPPER_SCOPED_SESSION_KEYS - in practice
      *                      self::VERIFIED_EMAIL_SESSION_KEY or
@@ -941,26 +776,18 @@ class ShopperScopedSessionStores
      * here and reachable from nowhere but this class. Neither has a key parameter that could
      * be pointed at a store, so neither can acquire the guard's appearance.
      *
-     * Every path lets it out, including the import, and the enumeration behind that claim grew
-     * with LOQ-17149. NINETEEN statements reach this assertion: the calls to getData(), setData()
-     * and contactDigest(), which are the only three methods that make it - isContactDigest() and
-     * the getIpCountry()/setIpCountry() pair do not. They break down as EIGHT in Helper\Validator,
-     * TWO in Helper\Controller, SEVEN in Plugin\AbstractPlugin, and ONE each in
-     * Plugin\Frontend\PlaceOrder and Plugin\Frontend\PlaceOrderGuest. None of them sits inside a
-     * try. Count them again if you change this: a breakdown that does not reconcile with its own
-     * total is worse than no breakdown, because it is the total the next reader checks.
-     * The module's only broad catches are
-     * Plugin\ChangeAddressDefaultCountry's and Plugin\ChangeCheckoutDefaultCountry's, which
-     * enclose the CountryFactory lookup and start AFTER those classes' getIpCountry() /
-     * setIpCountry() calls (and those two accessors do not reach this assertion in any case);
-     * Plugin\Admin\ValidateImportAddress's, which sits after its own rethrow; and the two in
-     * Observer\QuoteSubmitBefore and Model\AdminNotification\UnverifiedAdminOrderMessage, which
-     * touch no store. ValidateImportAddress::afterValidateData() used to wrap its work in a
-     * blanket catch (\Exception), which swallowed this throw and turned it into an import that
-     * silently reported no address errors at all; that plugin now catches
-     * \InvalidArgumentException separately and rethrows it, precisely so this assertion reaches
-     * a developer. Do not restore the broad catch on the strength of an older revision of this
-     * paragraph.
+     * THE CALL SITES ARE COUNTED FROM SOURCE, PER CLASS, rather than enumerated here, by
+     * ShopperScopedSessionStoresTest::testEveryStatementThatCanTripTheEnrolmentAssertionIsAccountedForByClass().
+     * The prose enumeration that used to stand here drifted, and is not kept a second time.
+     *
+     * NOTHING SWALLOWS THE THROW TODAY, which is the half that scan cannot assert because it is
+     * a property of the CALLERS rather than of the call sites. The module's other broad catches
+     * enclose no statement that reaches here: Plugin\ChangeAddressDefaultCountry's and
+     * Plugin\ChangeCheckoutDefaultCountry's hold the CountryFactory lookup only, and
+     * Observer\QuoteSubmitBefore's and Model\AdminNotification\UnverifiedAdminOrderMessage's
+     * touch no store at all. Plugin\Admin\ValidateImportAddress's DID, which is why it now
+     * rethrows \InvalidArgumentException; read the comment at that catch before restoring
+     * anything broader there.
      *
      * Logging and continuing was the alternative and was rejected: the continue path IS the
      * unguarded access the assertion exists to prevent, so it would leave the defect in place

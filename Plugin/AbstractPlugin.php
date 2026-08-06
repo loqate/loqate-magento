@@ -43,13 +43,15 @@ use Magento\Framework\UrlInterface;
  * rememberCustomerFormData() and rememberAddressFormData() write Magento's own
  * 'customer_form_data' / 'address_form_data' through core's typed setters. They are CORE
  * attributes - core writes them on its own validation failures and core reads them back with
- * getCustomerFormData(true) / getAddressFormData(true), which clear them - so they are not
- * enrolled in this module's flush; see the closing paragraph of ShopperScopedSessionStores'
- * class docblock. That exclusion is only sound while every caller is on a path where core
- * really does read the attribute back, which is why LOQ-17149 removed the one caller that was
- * not: Plugin\Admin\OrderSave called rememberCustomerFormData() with the whole admin
- * order-create POST, and nothing in adminhtml reads that attribute off the customer session at
- * all - see the comment at that call site for the enumeration.
+ * getCustomerFormData(true) / getAddressFormData(true), which clear them. They are not verify
+ * bypasses, this module is not their only writer, and flushing an attribute whose lifetime core
+ * manages would be this module deciding core's business, so they are not enrolled in
+ * ShopperScopedSessionStores' flush and are documented here rather than there. That exclusion is
+ * only sound while every caller is on a path where core really does read the attribute back,
+ * which is why LOQ-17149 removed the one caller that was not: Plugin\Admin\OrderSave called
+ * rememberCustomerFormData() with the whole admin order-create POST, and nothing in adminhtml
+ * reads that attribute off the customer session at all - see the comment at that call site for
+ * the enumeration.
  */
 abstract class AbstractPlugin
 {

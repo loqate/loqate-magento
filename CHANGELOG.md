@@ -303,8 +303,9 @@ predate it and are described by their git tags and commit history.
   them.
 - The shopper-change flush scopes by **customer** identity, so an **admin-user swap
   within one browser session is not covered**. LOQ-17149 decided to leave it there
-  rather than read the backend session as well, and the reason is quantified in the
-  ACCEPTED LIMITS block on `Helper\ShopperScopedSessionStores`. In short: the admin
+  rather than read the backend session as well; the ACCEPTED LIMITS block on
+  `Helper\ShopperScopedSessionStores` states the mechanism and points back here for
+  what follows from it, which is quantified in the rest of this entry. The admin
   panel runs its own PHP session, separate from the storefront's, so this is
   admin-to-admin on one shared browser and never admin-to-shopper. What a second
   admin can inherit is a verification the first already paid for — an identical admin
