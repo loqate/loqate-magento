@@ -461,7 +461,7 @@ class ValidateImportAddressTest extends TestCase
      * test above its meaning.
      *
      * An \InvalidArgumentException on this path is not a runtime fault. It is
-     * ShopperScopedAddressStores::assertEnrolled() reporting that a session store was reached
+     * ShopperScopedSessionStores::assertEnrolled() reporting that a session store was reached
      * without being enrolled in the shopper-ownership flush - a bug a developer has to fix,
      * and the single signal that a store is escaping the guard that stops one shopper
      * inheriting another's verify bypass.
@@ -480,9 +480,14 @@ class ValidateImportAddressTest extends TestCase
     {
         $subject = $this->createMock(Address::class);
         $subject->method('getBehavior')->willReturn(Import::BEHAVIOR_ADD_UPDATE);
+        // 'loqate_ipcountry' because it is a REAL unenrolled attribute: it is the module's one
+        // session store that is deliberately excluded from the flush (it is derived from the
+        // request IP, not from a shopper), so it is the name that would genuinely appear in
+        // this message. It used to read 'loqate_email', which LOQ-17149 enrolled - a stand-in
+        // that has since become the opposite of an example.
         $subject->method('getSource')->willThrowException(
             new \InvalidArgumentException(
-                'Session key "loqate_email" is not enrolled in the shopper-ownership flush.'
+                'Session key "loqate_ipcountry" is not enrolled in the shopper-ownership flush.'
             )
         );
 

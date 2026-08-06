@@ -46,11 +46,20 @@ class CheckoutBillingAddress extends AbstractPlugin
                 }
             }
 
+            // THE ONLY WRITER OF THE BILLING-ERROR GATE, in both directions, and therefore
+            // the only thing that can ever clear it. Plugin\Frontend\PlaceOrder and
+            // PlaceOrderGuest read it in a BEFORE plugin on
+            // savePaymentInformationAndPlaceOrder(), so on any flow that submits the billing
+            // address with the place-order call rather than in a separate request they throw
+            // before this method runs. That is why the gate must be flushed when the shopper
+            // changes rather than merely overwritten: an inherited true is otherwise
+            // unrecoverable. Reached through AbstractPlugin::recordBillingAddressErrors()
+            // since LOQ-17149; see Helper\ShopperScopedSessionStores::BILLING_ERRORS_SESSION_KEY.
             if ($errors) {
-                $this->session->setData('loqate_billing_errors', true);
+                $this->recordBillingAddressErrors(true);
                 throw new InputException(__(implode(PHP_EOL, $errors)));
             }
-            $this->session->setData('loqate_billing_errors', false);
+            $this->recordBillingAddressErrors(false);
         }
 
         return $proceed($cartId, $address, $useForShipping);

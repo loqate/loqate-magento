@@ -89,7 +89,7 @@ class OrderSave extends AbstractPlugin
         }
 
         if ($error) {
-            $this->session->setCustomerFormData($request);
+            $this->rememberCustomerFormData($request);
             return $this->resultRedirectFactory->create()->setUrl(
                 $this->redirect->error($this->redirect->getRefererUrl())
             );

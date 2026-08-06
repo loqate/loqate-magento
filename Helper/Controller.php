@@ -24,15 +24,15 @@ class Controller
     /**
      * Session attribute holding the addresses picked from the Loqate Capture lookup.
      *
-     * An ALIAS of ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY, kept so that every
+     * An ALIAS of ShopperScopedSessionStores::CAPTURED_ADDRESSES_SESSION_KEY, kept so that every
      * existing reference to Controller::CAPTURED_ADDRESSES_SESSION_KEY still resolves. The
-     * name itself lives on ShopperScopedAddressStores because that class is what ENFORCES the
+     * name itself lives on ShopperScopedSessionStores because that class is what ENFORCES the
      * attribute's lifetime, and holding the name here instead made the dependency circular:
      * the guard's flush list pointed at this class while this class constructs the guard
      * (LOQ-16978 review). This class remains the store's only WRITER
      * (storeCapturedAddress()); Helper\Validator is its only reader.
      */
-    const CAPTURED_ADDRESSES_SESSION_KEY = ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY;
+    const CAPTURED_ADDRESSES_SESSION_KEY = ShopperScopedSessionStores::CAPTURED_ADDRESSES_SESSION_KEY;
 
     /**
      * Maximum number of captured addresses kept per session, oldest evicted first.
@@ -46,6 +46,11 @@ class Controller
      * addresses - a shipping and a billing address, plus re-picks - so 50 distinct
      * addresses is already far beyond a realistic session while keeping the session
      * payload to a few kilobytes (one entry is a serialised six-field array).
+     *
+     * ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT is SMALLER than this, at 25, and
+     * that is not an inconsistency: an email address or a phone number is one value per
+     * checkout where an address is one per address book entry, and those two stores hold a
+     * fixed 64-character digest per slot rather than a serialised address (LOQ-17149).
      *
      * The two stores are also consulted for the SAME addresses by the same verify call
      * (Validator::verifyAddress() reads this one first, then the verdict cache), so a
@@ -67,12 +72,12 @@ class Controller
     private $logger;
 
     /**
-     * @var ShopperScopedAddressStores The captured-address store, behind the shopper-ownership
+     * @var ShopperScopedSessionStores The captured-address store, behind the shopper-ownership
      *      guard. The raw customer session is deliberately NOT kept as well: keeping it
      *      would leave a way to reach the store without the guard - see
-     *      ShopperScopedAddressStores.
+     *      ShopperScopedSessionStores.
      */
-    private ShopperScopedAddressStores $shopperSession;
+    private ShopperScopedSessionStores $shopperSession;
 
     /** @var string */
     private $version = null;
@@ -89,7 +94,7 @@ class Controller
      * @param ResultFactory $resultJsonFactory
      * @param RequestInterface $request
      * @param Logger $logger
-     * @param Session $session Wrapped in a ShopperScopedAddressStores and not kept raw, so the
+     * @param Session $session Wrapped in a ShopperScopedSessionStores and not kept raw, so the
      *                         captured-address store can only be reached through the
      *                         shopper-ownership guard.
      * @param ModuleListInterface $moduleList
@@ -108,7 +113,7 @@ class Controller
         $this->resultJsonFactory = $resultJsonFactory;
         $this->request = $request;
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedAddressStores($session);
+        $this->shopperSession = new ShopperScopedSessionStores($session);
         $this->helper = $helper;
         $this->serializer = $serializer;
 
@@ -232,8 +237,10 @@ class Controller
      *    lookup, and it dies with the session;
      *  - FLUSHED when the logged-in customer changes, in either direction (login, logout,
      *    or one login straight after another): the store is reached through
-     *    ShopperScopedAddressStores, so shopper B on a shared browser cannot inherit the
-     *    verify bypass shopper A earned. Read that class before adding a fourth store.
+     *    ShopperScopedSessionStores, so shopper B on a shared browser cannot inherit the
+     *    verify bypass shopper A earned. Read that class before adding an eighth store: it
+     *    now covers all seven of this module's shopper-scoped session attributes, not just
+     *    the three address ones it started with (LOQ-17149).
      *
      * @param $result
      */

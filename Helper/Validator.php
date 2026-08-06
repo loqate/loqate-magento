@@ -112,16 +112,16 @@ class Validator
      *
      * "Per-shopper" is enforced, not merely assumed: a PHP session survives a login
      * (session_regenerate_id() changes the ID and keeps the data), so this attribute is
-     * reached through ShopperScopedAddressStores, which flushes it whenever the logged-in
+     * reached through ShopperScopedSessionStores, which flushes it whenever the logged-in
      * customer changes (LOQ-16978).
      *
-     * An ALIAS of ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY, kept so every existing
+     * An ALIAS of ShopperScopedSessionStores::VERIFY_CACHE_SESSION_KEY, kept so every existing
      * reference to Validator::VERIFY_CACHE_SESSION_KEY still resolves. The literal lives on
      * the guard because the guard is what enforces this attribute's lifetime, and holding
      * it here made the dependency circular - the guard's flush list pointed at this class
      * while this class constructs the guard.
      */
-    const VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY;
+    const VERIFY_CACHE_SESSION_KEY = ShopperScopedSessionStores::VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of verdicts kept per session, oldest evicted first.
@@ -153,16 +153,16 @@ class Validator
      *
      * Same lifetime rules as the single-address cache: a verdict is customer data, so it
      * lives in the per-shopper customer session and nowhere process- or install-wide, and
-     * it is reached through ShopperScopedAddressStores so that it is flushed when the logged-in
+     * it is reached through ShopperScopedSessionStores so that it is flushed when the logged-in
      * customer changes (LOQ-16978) - subject to the ACCEPTED LIMITS on that class, which
      * name THIS attribute specifically: it is written only from adminhtml, where the
      * customer session carries no customer id, so the guard's flush is a no-op for it and
      * an admin-user swap inside one browser session is not covered.
      *
-     * An ALIAS of ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
+     * An ALIAS of ShopperScopedSessionStores::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
      * dependency-direction reason as self::VERIFY_CACHE_SESSION_KEY above.
      */
-    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY;
+    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedSessionStores::BATCH_VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of batch verdicts kept per session, oldest evicted first.
@@ -206,7 +206,7 @@ class Validator
      *    or loosened threshold kept being answered from a rejection that outlived the request.
      *  - "RETAIN ON FULL" (freeze instead of evicting) is refused: one Check Data click on a
      *    200-row file would fill the store for the rest of that admin's browser session -
-     *    adminhtml never flushes it, see ShopperScopedAddressStores' ACCEPTED LIMITS -
+     *    adminhtml never flushes it, see ShopperScopedSessionStores' ACCEPTED LIMITS -
      *    destroying the admin-order-create win below, which is what LOQ-16976 delivered.
      *  - SIZING THE STORE TO THE FILE is refused on session I/O: Magento reads and writes the
      *    WHOLE session on every request, so a store sized to a large import is paid for on
@@ -219,7 +219,7 @@ class Validator
      *    readable and replayable by any other shopper, any other admin user, and on shared
      *    infrastructure any other install on the same backend - a bypass licence handed across
      *    identities, the leak LOQ-16978 exists to close, through a store
-     *    ShopperScopedAddressStores cannot see. Doing it safely needs an identity in the key, a
+     *    ShopperScopedSessionStores cannot see. Doing it safely needs an identity in the key, a
      *    tag and lifetime policy, and a decision on whether an address verdict may live outside
      *    the session at all. Its own ticket, tracked separately - record the id here when it is
      *    raised.
@@ -255,12 +255,12 @@ class Validator
     private $logger;
 
     /**
-     * @var ShopperScopedAddressStores The captured-address store and the two verdict caches,
+     * @var ShopperScopedSessionStores The captured-address store and the two verdict caches,
      *      behind the shopper-ownership guard. The raw customer session is deliberately
      *      NOT kept as well: keeping it would leave a way to reach those stores without
-     *      the guard - see ShopperScopedAddressStores.
+     *      the guard - see ShopperScopedSessionStores.
      */
-    private ShopperScopedAddressStores $shopperSession;
+    private ShopperScopedSessionStores $shopperSession;
 
     /**
      * Batch verdicts earned by THIS instance, keyed exactly as the session store is
@@ -301,13 +301,13 @@ class Validator
     private array $runScopedBatchVerdicts = [];
 
     /**
-     * The ShopperScopedAddressStores ownership epoch self::$runScopedBatchVerdicts was earned
+     * The ShopperScopedSessionStores ownership epoch self::$runScopedBatchVerdicts was earned
      * under, or null before this instance has asked (LOQ-17148, LOQ-16978).
      *
      * The map holds licences to skip a billable verify, so it must have the same OWNERSHIP
      * lifetime as the session verdict stores and not merely the same request - see
      * discardRunScopedVerdictsIfShopperChanged() for why, and
-     * ShopperScopedAddressStores::ownershipGeneration() for what the epoch means.
+     * ShopperScopedSessionStores::ownershipGeneration() for what the epoch means.
      *
      * STARTS AT NULL, WHICH IS NOT AN EPOCH, and that is deliberate: the guard's counter is an
      * int from its very first answer, so "I have not asked yet" has to be a value it can never
@@ -330,7 +330,7 @@ class Validator
      * Validator construct
      *
      * @param Logger $logger
-     * @param Session $session Wrapped in a ShopperScopedAddressStores and not kept raw, so the
+     * @param Session $session Wrapped in a ShopperScopedSessionStores and not kept raw, so the
      *                         captured-address store and both verdict caches can only be
      *                         reached through the shopper-ownership guard.
      * @param RegionFactory $regionFactory
@@ -347,7 +347,7 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedAddressStores($session);
+        $this->shopperSession = new ShopperScopedSessionStores($session);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
@@ -1940,16 +1940,16 @@ class Validator
      * NOTE THE POLARITY, because it is the safe one and it is easy to invert by accident: the
      * map is KEPT only on a positive answer from the guard - an unmoved ownership epoch - and
      * discarded in every other case, including the ones that flushed nothing. See
-     * ShopperScopedAddressStores::ownershipGeneration() for what the epoch counts and why an
+     * ShopperScopedSessionStores::ownershipGeneration() for what the epoch counts and why an
      * adoption (no marker recorded, so nothing to flush) advances it just as a flush does.
      *
      * The map is verdict data, so it has the OWNERSHIP lifetime of the session verdict stores
      * and not merely the request's: one Validator can outlive a mid-request identity change,
      * and a plain request-scoped map would then answer the new shopper out of the previous
-     * shopper's verdicts while the guard had just flushed the three stores beside it - reopening
-     * exactly the leak ShopperScopedAddressStores exists to close, through a store that class
+     * shopper's verdicts while the guard had just flushed the seven stores beside it - reopening
+     * exactly the leak ShopperScopedSessionStores exists to close, through a store that class
      * cannot see. Pinned by
-     * ShopperScopedAddressStoresTest::testABatchVerdictDoesNotSurviveALogin().
+     * ShopperScopedSessionStoresTest::testABatchVerdictDoesNotSurviveALogin().
      *
      * ASKING IS WHAT ENFORCES IT: ownershipGeneration() runs the ownership check itself before
      * reporting, so this is correct even on the import path, where $checkForCaptured is false

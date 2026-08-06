@@ -589,8 +589,8 @@ class ValidatorVerifyCacheTest extends TestCase
      * doing so - that is the belief LOQ-16978 exists to correct. Magento calls
      * session_regenerate_id() on login and on logout, which changes the session ID while
      * PRESERVING every value in $_SESSION, so the cache emphatically DOES survive both.
-     * What clears it there is Helper\ShopperScopedAddressStores, not PHP; the logout and login
-     * cases are covered by ShopperScopedAddressStoresTest::testACachedVerdictDoesNotSurviveALogin()
+     * What clears it there is Helper\ShopperScopedSessionStores, not PHP; the logout and login
+     * cases are covered by ShopperScopedSessionStoresTest::testACachedVerdictDoesNotSurviveALogin()
      * and its siblings.
      */
     public function testCachedVerdictDoesNotSurviveASessionReset(): void
@@ -3445,9 +3445,9 @@ class ValidatorVerifyCacheTest extends TestCase
      * cached can be read back.
      *
      * NOT a logout and NOT a session-id regeneration. Magento regenerates the session id on
-     * both login and logout and the DATA survives that (see Helper\ShopperScopedAddressStores);
+     * both login and logout and the DATA survives that (see Helper\ShopperScopedSessionStores);
      * emptying the store here would be the wrong model of either. The identity-change cases
-     * are ShopperScopedAddressStoresTest's subject - testACachedVerdictDoesNotSurviveALogin()
+     * are ShopperScopedSessionStoresTest's subject - testACachedVerdictDoesNotSurviveALogin()
      * covers the logout/login hand-off, where the guard does the clearing that PHP does not.
      */
     private function startBrandNewSession(array $shopper): void

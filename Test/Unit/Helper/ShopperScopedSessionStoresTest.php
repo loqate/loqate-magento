@@ -5,9 +5,11 @@ namespace Loqate\ApiIntegration\Test\Unit\Helper;
 use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Helper\Controller;
 use Loqate\ApiIntegration\Helper\Data;
-use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
+use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Plugin\Frontend\PlaceOrder;
+use Loqate\ApiIntegration\Plugin\Frontend\PlaceOrderGuest;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
@@ -24,22 +26,29 @@ use ReflectionProperty;
 use stdClass;
 
 /**
- * Unit tests for Helper\ShopperScopedAddressStores: the one seam through which this module
- * reaches the three session attributes that can make an address SKIP a billable Loqate
- * verify, and the guard that keeps them belonging to ONE shopper (LOQ-16978).
+ * Unit tests for Helper\ShopperScopedSessionStores: the one seam through which this module
+ * reaches every session attribute that gates one shopper's submission, and the guard that
+ * keeps them belonging to ONE shopper (LOQ-16978, LOQ-17149).
  *
- * THE DEFECT. All three stores - Controller::CAPTURED_ADDRESSES_SESSION_KEY (the Capture
- * bypass), Validator::VERIFY_CACHE_SESSION_KEY and
- * Validator::BATCH_VERIFY_CACHE_SESSION_KEY (the LOQ-16969/LOQ-16976 verdict caches) -
- * live in the customer session, and a PHP session OUTLIVES a login: Magento calls
- * session_regenerate_id() on login and on logout, which changes the session ID while
- * PRESERVING every value in $_SESSION. Nothing in Magento clears a third-party session
- * attribute on an identity change. So on a shared browser - a family device, a public
- * terminal, a click-and-collect kiosk - shopper B could inherit shopper A's bypasses and
- * check out an address that was never verified against B's own submission. Every entry in
- * these stores is a licence to skip a verification, which is why they share a lifetime and
- * are flushed TOGETHER: flushing two of the three still leaves the third granting B a
- * bypass A earned.
+ * THE DEFECT. All seven stores live in the customer session, and a PHP session OUTLIVES a
+ * login: Magento calls session_regenerate_id() on login and on logout, which changes the
+ * session ID while PRESERVING every value in $_SESSION. Nothing in Magento clears a
+ * third-party session attribute on an identity change. So on a shared browser - a family
+ * device, a public terminal, a click-and-collect kiosk - shopper B could inherit shopper A's
+ * bypasses and check out data that was never verified against B's own submission. Six of the
+ * seven are a licence to skip a verification:
+ *  - Controller::CAPTURED_ADDRESSES_SESSION_KEY (the Capture bypass),
+ *    Validator::VERIFY_CACHE_SESSION_KEY and Validator::BATCH_VERIFY_CACHE_SESSION_KEY (the
+ *    LOQ-16969/LOQ-16976 address verdict caches);
+ *  - ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY and ::VERIFIED_PHONE_SESSION_KEY
+ *    (the LOQ-17149 contact bypass lists, which on the shipped default configuration skip
+ *    both the billable verify AND the warning), and ::PENDING_EMAIL_SESSION_KEY (one email
+ *    address awaiting a billable verify inside whoever's checkout runs next).
+ * The seventh, ::BILLING_ERRORS_SESSION_KEY, is here for the OPPOSITE reason and that
+ * asymmetry is deliberate: a stale true DENIES the next shopper a checkout they cannot
+ * unblock, because the only thing that clears it runs after the plugins that read it. They
+ * share one lifetime and are flushed TOGETHER: flushing six of the seven still leaves the
+ * seventh granting B a bypass A earned, or refusing B an order A caused.
  *
  * WHAT IS PINNED HERE, and in which direction:
  *  - the flush fires on EVERY identity change, in all three directions a browser can take
@@ -67,11 +76,15 @@ use stdClass;
  *    REGRESSION test, not a completeness one: mapping an unreadable customer id onto the
  *    guest id made "a customer whose id we cannot read" and "nobody is logged in" compare
  *    EQUAL, so a logout out of that state did not flush and the guest that followed
- *    inherited all three bypass stores - the exact hand-off this class exists to stop;
+ *    inherited every bypass store - the exact hand-off this class exists to stop;
  *  - the ENROLMENT assertion: an attribute missing from the flush list is refused by both
  *    getData() and setData() rather than quietly reached through the guard without ever
  *    being flushed, see testAnUnenrolledAttributeIsRejectedByBothGetDataAndSetData() and
- *    its mirror testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData();
+ *    its mirror testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData(). Note which
+ *    keys the first of those now drives: the four it used to name are ENROLLED since
+ *    LOQ-17149 and have moved to the mirror, and what is left out is the IP-country cache
+ *    (not one shopper's data), the contact-digest salt (this class's own) and the owner
+ *    marker;
  *  - a session storage EMPTIED mid-request, which is the one door the owner marker cannot
  *    hold shut, because the wipe takes the marker with the stores it describes - the
  *    destroy() inside Magento\Customer\Model\Session::logout() and
@@ -87,25 +100,32 @@ use stdClass;
  *    "unchanged" is the answer that licenses a caller to keep derived data and a guard that
  *    can never give it re-bills every repeated row of every import.
  *
- * The end of the chain - that the two helpers really do reach those attributes only through
- * this class - is asserted behaviourally for all three stores
+ * The end of the chain - that the module's helpers really do reach those attributes only
+ * through this class - is asserted behaviourally for the three address stores
  * (testACapturedAddressBypassDoesNotSurviveALogin(), testACachedVerdictDoesNotSurviveALogin(),
  * testABatchVerdictDoesNotSurviveALogin()) and structurally
  * (testNeitherHelperKeepsAReferenceToTheRawCustomerSession()), because a single raw
  * $session->getData() left anywhere in Controller or Validator re-opens the defect while
- * every test in this file still passes.
+ * every test in this file still passes. The same structural property for the FOUR LOQ-17149
+ * stores lives one layer up, in Plugin\AbstractPlugin, whose $session became private in that
+ * ticket precisely because a protected raw session on the base class of ten plugins is the
+ * same hole seen from Plugin\ rather than from Helper\.
  *
- * ONE STORE IS ONLY NOMINALLY COVERED IN PRODUCTION, and that is pinned here rather than
+ * THREE STORES ARE ONLY NOMINALLY COVERED IN PRODUCTION, and that is pinned here rather than
  * left to the class docblock: the BATCH verdict cache is written exclusively from adminhtml,
- * where the customer session carries no customer id, so its owner is permanently the guest
- * and the flush is a no-op on that path. The guard machinery works for it - proved by
+ * and the two contact bypass lists are written from adminhtml as well as from the storefront
+ * (Plugin\Admin\OrderSave, ValidateCustomer, ValidateAddress). In adminhtml the customer
+ * session carries no customer id, so the owner is permanently the guest and the flush is a
+ * no-op on that path. The guard machinery works for them - proved by
  * testABatchVerdictDoesNotSurviveALogin(), which drives a real customer identity change
- * through verifyMultipleAddresses() - but on the path that actually writes it there is no
- * identity to change. See
+ * through verifyMultipleAddresses() - but on the paths that actually write them from the admin
+ * panel there is no identity to change. See
  * testOnTheAdminhtmlPathTheBatchCacheIsOwnedByTheGuestAndTheFlushIsANoOp(), which pins that
- * ACCEPTED LIMIT as documented behaviour so it cannot change silently in either direction.
+ * ACCEPTED LIMIT as documented behaviour so it cannot change silently in either direction, and
+ * the ACCEPTED LIMITS block on ShopperScopedSessionStores, where LOQ-17149 quantified the
+ * residual for the contact stores rather than inheriting the batch cache's argument.
  */
-class ShopperScopedAddressStoresTest extends TestCase
+class ShopperScopedSessionStoresTest extends TestCase
 {
     /** The serializer double, shared with every other harness that reads a payload back. */
     use ProductionSerializerDouble;
@@ -131,8 +151,30 @@ class ShopperScopedAddressStoresTest extends TestCase
     /** Session attribute the batch verdict cache lives under. */
     private const BATCH_VERIFY_CACHE_SESSION_KEY = 'loqate_verified_batch_addresses';
 
+    /** Session attribute the email bypass list lives under (LOQ-17149). */
+    private const VERIFIED_EMAIL_SESSION_KEY = 'loqate_email';
+
+    /** Session attribute the phone bypass list lives under (LOQ-17149). */
+    private const VERIFIED_PHONE_SESSION_KEY = 'loqate_phone';
+
+    /** Session attribute the single pending email address lives under (LOQ-17149). */
+    private const PENDING_EMAIL_SESSION_KEY = 'loqate_email_to_validate';
+
+    /** Session attribute the billing-error gate lives under (LOQ-17149). */
+    private const BILLING_ERRORS_SESSION_KEY = 'loqate_billing_errors';
+
     /**
-     * The second identity source ShopperScopedAddressStores deliberately does NOT read.
+     * The module's one session attribute that is deliberately NOT enrolled (LOQ-17149).
+     *
+     * Pinned as a literal because it is what the exclusion is ABOUT: it is derived from the
+     * request's IP address, so two shoppers on one browser share it by construction, and it
+     * is reachable only through ShopperScopedSessionStores' named getIpCountry()/setIpCountry()
+     * pair - never through the generic accessors, which must refuse it.
+     */
+    private const IP_COUNTRY_SESSION_KEY = 'loqate_ipcountry';
+
+    /**
+     * The second identity source ShopperScopedSessionStores deliberately does NOT read.
      *
      * Held as a STRING and never imported: this class is a backend one, it is not among the
      * handful stubbed under Test/stubs, and the harness runs without Magento installed - so a
@@ -151,7 +193,7 @@ class ShopperScopedAddressStoresTest extends TestCase
     ];
 
     /**
-     * Build a ShopperScopedAddressStores over a customer session double whose data persists and
+     * Build a ShopperScopedSessionStores over a customer session double whose data persists and
      * whose logged-in identity can be changed between calls, exactly as a login or a logout
      * changes it between two requests.
      *
@@ -161,10 +203,15 @@ class ShopperScopedAddressStoresTest extends TestCase
      *
      * @param array<string, mixed> $data Session attributes present before the first access.
      * @param int|string|null $customerId Logged-in customer, null for a guest.
-     * @return array{guard: ShopperScopedAddressStores, session: ArrayObject, identity: ArrayObject,
+     * @param int|null $storeId Store view contactDigest() must namespace by, or null to
+     *                          construct the guard WITHOUT a Helper\Data at all - which is how
+     *                          Controller, Validator and the plugins that never compute a
+     *                          digest construct it, the argument being optional so that
+     *                          LOQ-17149 needed no change to any of their constructors.
+     * @return array{guard: ShopperScopedSessionStores, session: ArrayObject, identity: ArrayObject,
      *     writes: ArrayObject}
      */
-    private function createGuard(array $data = [], $customerId = null): array
+    private function createGuard(array $data = [], $customerId = null, ?int $storeId = null): array
     {
         $sessionStore = new ArrayObject($data);
         $identity = new ArrayObject(['customerId' => $customerId]);
@@ -172,8 +219,14 @@ class ShopperScopedAddressStoresTest extends TestCase
 
         $sessionMock = $this->createSessionDouble($sessionStore, $identity, $writes);
 
+        $helper = null;
+        if ($storeId !== null) {
+            $helper = $this->createMock(Data::class);
+            $helper->method('getCurrentStore')->willReturn($storeId);
+        }
+
         return [
-            'guard' => new ShopperScopedAddressStores($sessionMock),
+            'guard' => new ShopperScopedSessionStores($sessionMock, $helper),
             'session' => $sessionStore,
             'identity' => $identity,
             'writes' => $writes,
@@ -277,7 +330,7 @@ class ShopperScopedAddressStoresTest extends TestCase
             $this->assertNull(
                 $harness['session'][$key] ?? null,
                 sprintf(
-                    'Session attribute "%s" survived an identity change. All three stores are verify '
+                    'Session attribute "%s" survived an identity change. All seven stores are verify '
                     . 'bypasses, so they must be flushed TOGETHER: leaving any one of them lets the new '
                     . 'shopper check out an address that was only ever verified for the previous one.',
                     $key
@@ -318,7 +371,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * wired into only one of those entry points would leave the other two stores intact on
      * exactly the requests that do not go through it.
      *
-     * Driven from the production list of managed keys, so a fourth store added to it is
+     * Driven from the production list of managed keys, so an eighth store added to it is
      * covered by this test automatically.
      *
      * @param string $touched Managed session key the request reads first.
@@ -337,7 +390,7 @@ class ShopperScopedAddressStoresTest extends TestCase
             $this->assertNull(
                 $harness['session'][$key] ?? null,
                 sprintf(
-                    'Reading "%s" after an identity change must flush "%s" as well: the three stores are one '
+                    'Reading "%s" after an identity change must flush "%s" as well: the seven stores are one '
                     . 'shopper\'s data and have one lifetime.',
                     $touched,
                     $key
@@ -363,13 +416,20 @@ class ShopperScopedAddressStoresTest extends TestCase
     }
 
     /**
-     * The coverage gate on the flush list itself: it must name exactly the three attributes
-     * that grant a verify bypass, reached through the names Controller and Validator publish.
+     * The coverage gate on the flush list itself: it must name exactly the SEVEN attributes
+     * that gate one shopper's submission, reached through the names the module publishes.
      *
      * This is the one thing the behavioural tests cannot see. Reading or writing an attribute
-     * through ShopperScopedAddressStores does NOT enrol it in the flush - only this list does - so
-     * a fourth store could be added, reached through the guard, and still be inherited by the
-     * next shopper with every other test in this file green.
+     * through ShopperScopedSessionStores does NOT enrol it in the flush - only this list does -
+     * so an eighth store could be added, reached through the guard, and still be inherited by
+     * the next shopper with every other test in this file green.
+     *
+     * SEVEN, not three, since LOQ-17149: the three ADDRESS stores plus the two contact bypass
+     * lists, the single pending email address and the billing-error gate. The last one is the
+     * odd member and belongs here for the opposite reason to the others - a stale true DENIES
+     * the next shopper a checkout rather than granting them a bypass - which is why the
+     * assertion message below talks about "gates one shopper's submission" rather than only
+     * about bypasses.
      *
      * The literals are asserted alongside the list because the attribute names MOVED onto
      * this class in the LOQ-16978 review (Controller::CAPTURED_ADDRESSES_SESSION_KEY and
@@ -379,6 +439,9 @@ class ShopperScopedAddressStoresTest extends TestCase
      * aliases must still resolve, because every other reference in the module and in three
      * other test files goes through them, and the VALUES must be unchanged, or every live
      * session loses its stores at deploy time and every shopper mid-checkout is re-billed.
+     * The four names LOQ-17149 added have no aliases to check: they were bare literals at
+     * their call sites before that ticket, so the only thing to pin is the VALUE, which is
+     * what the second assertion does for all seven.
      */
     public function testTheFlushListNamesExactlyTheStoresThatGrantAVerifyBypass(): void
     {
@@ -389,33 +452,47 @@ class ShopperScopedAddressStoresTest extends TestCase
                 Controller::CAPTURED_ADDRESSES_SESSION_KEY,
                 Validator::VERIFY_CACHE_SESSION_KEY,
                 Validator::BATCH_VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+                ShopperScopedSessionStores::VERIFIED_PHONE_SESSION_KEY,
+                ShopperScopedSessionStores::PENDING_EMAIL_SESSION_KEY,
+                ShopperScopedSessionStores::BILLING_ERRORS_SESSION_KEY,
             ],
             $managed,
-            'Every session attribute that can make an address skip the billable Loqate verify must be in the '
-            . 'flush list: the Capture bypass and BOTH verdict caches. One left out is one bypass a shopper '
-            . 'can inherit from whoever used the browser before them.'
+            'Every session attribute that gates one shopper\'s submission must be in the flush list: the '
+            . 'Capture bypass, BOTH address verdict caches, BOTH contact bypass lists, the pending email '
+            . 'address and the billing-error gate. One left out is either a bypass the next shopper inherits '
+            . 'or - for the gate - an order they can never place.'
         );
         $this->assertSame(
             [
                 self::CAPTURED_ADDRESSES_SESSION_KEY,
                 self::VERIFY_CACHE_SESSION_KEY,
                 self::BATCH_VERIFY_CACHE_SESSION_KEY,
+                self::VERIFIED_EMAIL_SESSION_KEY,
+                self::VERIFIED_PHONE_SESSION_KEY,
+                self::PENDING_EMAIL_SESSION_KEY,
+                self::BILLING_ERRORS_SESSION_KEY,
             ],
             [
                 Controller::CAPTURED_ADDRESSES_SESSION_KEY,
                 Validator::VERIFY_CACHE_SESSION_KEY,
                 Validator::BATCH_VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+                ShopperScopedSessionStores::VERIFIED_PHONE_SESSION_KEY,
+                ShopperScopedSessionStores::PENDING_EMAIL_SESSION_KEY,
+                ShopperScopedSessionStores::BILLING_ERRORS_SESSION_KEY,
             ],
-            'The three attribute NAMES are unchanged by the constants moving onto ShopperScopedAddressStores. They '
-            . 'are the keys of live customer sessions: renaming one silently empties that store for every '
-            . 'shopper mid-checkout at deploy time, which re-bills every address they have already had '
-            . 'verified.'
+            'The seven attribute NAMES are unchanged by the constants moving onto '
+            . 'ShopperScopedSessionStores and by the LOQ-17149 rename of that class. They are the keys of '
+            . 'live customer sessions: renaming one silently empties that store for every shopper '
+            . 'mid-checkout at deploy time, which re-bills every address they have already had verified '
+            . 'and - for the billing-error gate - would change which shoppers are blocked.'
         );
         $this->assertSame(
             [
-                ShopperScopedAddressStores::CAPTURED_ADDRESSES_SESSION_KEY,
-                ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY,
-                ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedSessionStores::CAPTURED_ADDRESSES_SESSION_KEY,
+                ShopperScopedSessionStores::VERIFY_CACHE_SESSION_KEY,
+                ShopperScopedSessionStores::BATCH_VERIFY_CACHE_SESSION_KEY,
             ],
             [
                 Controller::CAPTURED_ADDRESSES_SESSION_KEY,
@@ -426,6 +503,14 @@ class ShopperScopedAddressStoresTest extends TestCase
             . 'guard. The guard owns them because the guard is what enforces their lifetime, but every other '
             . 'reference in the module still goes through the old names - and an alias that drifts from what '
             . 'it aliases is two attributes with one meaning, of which only one is in the flush list.'
+        );
+        $this->assertNotContains(
+            self::IP_COUNTRY_SESSION_KEY,
+            $managed,
+            'The IP-country cache must stay OUT of the flush list. It is derived from the request IP, so two '
+            . 'shoppers on one browser share it by construction and flushing it would protect nobody from '
+            . 'anything - it would only re-run the lookup. It is reached through getIpCountry()/setIpCountry(), '
+            . 'which carry that reasoning; if it is ever enrolled, delete those and say why here.'
         );
         $this->assertSame(
             count($managed),
@@ -467,7 +552,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * LOQ-16976 - every checkout would be re-billed - and would do it with the rest of the
      * suite green, because "the cache never hits" looks exactly like "the cache is safe" to a
      * test that only asserts nothing is over-shared. The write assertion is the second half:
-     * this check runs on EVERY access to any of the three stores, so the matching case has to
+     * this check runs on EVERY access to any of the seven stores, so the matching case has to
      * be reads only - the owner marker and the customer id, two of them - and not a rewrite of
      * four attributes per lookup.
      */
@@ -655,7 +740,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $this->assertSame(
             $this->seededStores(),
             $this->managedAttributes($harness),
-            'Adoption must leave all three stores intact.'
+            'Adoption must leave every one of the shopper-scoped stores intact.'
         );
         $this->assertSame(
             $expectedOwner,
@@ -669,7 +754,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $harness['guard']->getData(self::CAPTURED_ADDRESSES_SESSION_KEY);
 
         $this->assertSame(
-            [null, null, null],
+            $this->everyStoreFlushed(),
             array_values($this->managedAttributes($harness)),
             'Adopted data must still be flushed when the shopper changes: adoption applies to the FIRST '
             . 'access only, and must not become a permanent exemption from the check.'
@@ -712,7 +797,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $harness['guard']->getData(self::CAPTURED_ADDRESSES_SESSION_KEY);
 
         $this->assertSame(
-            [null, null, null],
+            $this->everyStoreFlushed(),
             array_values($this->managedAttributes($harness)),
             'An owner marker that cannot be read as a customer id cannot be shown to belong to this shopper, '
             . 'so the stores must be flushed rather than trusted.'
@@ -747,7 +832,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * so "the session answered a customer id we cannot understand" and "nobody is logged in"
      * produced the SAME owner, 0. Two genuinely different identities therefore compared equal
      * and no flush fired between them. The logout direction is the damaging one: a shopper
-     * whose id could not be read earns bypasses in all three stores, logs out, and the guest
+     * whose id could not be read earns bypasses in every store, logs out, and the guest
      * at the browser next inherits every one of them - precisely the shared-browser hand-off
      * this class exists to stop. The login direction is the same defect seen from the other
      * side.
@@ -798,7 +883,7 @@ class ShopperScopedAddressStoresTest extends TestCase
                 $harness['session'][$key] ?? null,
                 sprintf(
                     'Session attribute "%s" survived the move between a guest and a customer whose id could '
-                    . 'not be read. Those are two different identities, so all three bypass stores must be '
+                    . 'not be read. Those are two different identities, so every bypass store must be '
                     . 'flushed; folding the unreadable id onto the guest id makes them compare equal and hands '
                     . 'one shopper\'s bypasses to the next person at the browser.',
                     $key
@@ -859,7 +944,7 @@ class ShopperScopedAddressStoresTest extends TestCase
             $unreadable,
             'The unreadable-id sentinel must not equal the guest id. That collision IS the defect: it made a '
             . 'logout out of an unreadable identity look like no change at all, so the stores were not '
-            . 'flushed and the guest inherited all three bypasses.'
+            . 'flushed and the guest inherited every bypass.'
         );
         $this->assertLessThan(
             0,
@@ -876,28 +961,37 @@ class ShopperScopedAddressStoresTest extends TestCase
      * reading and not for writing.
      *
      * WHY THIS IS WORTH A TEST. Reading a new attribute through the guard LOOKS protected -
-     * the call site is identical to the three that are - while the attribute is never
+     * the call site is identical to the seven that are - while the attribute is never
      * actually flushed, which silently keeps the defect LOQ-16978 exists to close. The throw
      * is what makes "reachable through this class" and "flushed by this class" the same set;
      * without it they drift apart at the first new call site and every test in this file
      * stays green.
      *
-     * Both directions are asserted because only setData() is enrolled-checked by the writer
-     * and only getData() by the reader: a check added to one and forgotten on the other
-     * leaves half the hole open.
+     * ALL THREE key-taking accessors are asserted, not two: only setData() is
+     * enrolled-checked by the writer and only getData() by the reader, so a check added to one
+     * and forgotten on the other leaves half the hole open - and contactDigest() takes a key
+     * too, which is why LOQ-17149 gave it the same assertion. Its field argument is only a
+     * namespace segment, but the digest it returns is only ever STORED under that field, so
+     * requiring the field to be enrolled is requiring that the store the digest lands in is
+     * one this class flushes.
      *
      * The "nothing was written" assertion pins the ORDERING inside the guard. assertEnrolled()
      * runs BEFORE enforceOwnership(), so a rejected call must not have written the owner
-     * marker either - a rejected access must leave the session exactly as it found it.
+     * marker either - and, for contactDigest(), not the digest salt either. A rejected access
+     * must leave the session exactly as it found it.
      *
      * @param string $key Attribute that is not enrolled in the flush.
      */
     #[DataProvider('unenrolledSessionKeyProvider')]
-    public function testAnUnenrolledAttributeIsRejectedByBothGetDataAndSetData(string $key): void
+    public function testAnUnenrolledAttributeIsRejectedByEveryKeyTakingAccessor(string $key): void
     {
         $calls = [
-            'getData()' => static fn (ShopperScopedAddressStores $guard) => $guard->getData($key),
-            'setData()' => static fn (ShopperScopedAddressStores $guard) => $guard->setData($key, 'a new value'),
+            'getData()' => static fn (ShopperScopedSessionStores $guard) => $guard->getData($key),
+            'setData()' => static fn (ShopperScopedSessionStores $guard) => $guard->setData($key, 'a new value'),
+            'contactDigest()' => static fn (ShopperScopedSessionStores $guard) => $guard->contactDigest(
+                $key,
+                'shopper@example.com'
+            ),
         ];
 
         foreach ($calls as $label => $call) {
@@ -954,29 +1048,29 @@ class ShopperScopedAddressStoresTest extends TestCase
     /**
      * Attributes that must NOT be reachable through the guard.
      *
-     * The first four are the module's real un-enrolled session attributes, named in the
-     * ShopperScopedAddressStores class docblock as deliberately out of scope for LOQ-16978. They
-     * are the ones a future edit is most likely to route through this class by analogy, which
-     * is exactly the mistake the throw exists to catch: they would gain the guard's
-     * appearance without ever being added to the flush.
-     *
-     * The owner marker is included because it is the one attribute this class writes itself
-     * and must never expose - flushing it would erase the identity just recorded - and the
-     * last two cover a near-miss typo and the empty key.
+     * The list SHRANK in LOQ-17149 and that is the point of the ticket: the four siblings it
+     * used to name - 'loqate_email', 'loqate_phone', 'loqate_email_to_validate' and
+     * 'loqate_billing_errors' - are now ENROLLED, so they moved to managedStoreProvider() and
+     * are covered by testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData(). What is
+     * left is the set that must stay out, each for its own reason:
+     *  - the IP-country cache, which is not one shopper's data at all (two shoppers on one
+     *    browser share the IP address) and is reached through getIpCountry()/setIpCountry();
+     *  - the contact-digest salt, which this class mints and rotates itself and which nothing
+     *    outside it may read - reaching it through the generic accessors would also FLUSH it,
+     *    silently invalidating every digest in the session;
+     *  - the owner marker, the one attribute whose flush would erase the identity just
+     *    recorded, so the very next access would flush the stores all over again;
+     *  - a near-miss typo of an enrolled name, and the empty key.
      *
      * @return array<string, array{0: string}>
      */
     public static function unenrolledSessionKeyProvider(): array
     {
         return [
-            // Plugin\AbstractPlugin::shouldVerify() - unbounded lists of verified emails and
-            // phone numbers, bypasses of the same kind but out of scope for this ticket.
-            'the email bypass list' => ['loqate_email'],
-            'the phone bypass list' => ['loqate_phone'],
-            // Plugin\Frontend\AccountManagement / CheckoutShippingInformation.
-            'the pending email address' => ['loqate_email_to_validate'],
-            // Plugin\Frontend\CheckoutBillingAddress, read by PlaceOrder/PlaceOrderGuest.
-            'the billing error gate' => ['loqate_billing_errors'],
+            // Plugin\ChangeAddressDefaultCountry / ChangeCheckoutDefaultCountry, through the
+            // named accessors only.
+            'the IP-country cache' => [self::IP_COUNTRY_SESSION_KEY],
+            'the contact digest salt' => [self::readPrivateKeyConstant('CONTACT_DIGEST_SALT_KEY')],
             'the ownership marker itself' => [self::readOwnerKey()],
             'a near miss of an enrolled name' => ['captured_address'],
             'the empty key' => [''],
@@ -987,7 +1081,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * The mirror of the rejection, and the half that stops the assertion being tightened into
      * a wall: every attribute that IS enrolled must go through untouched, in both directions.
      *
-     * Driven from the production flush list, so a fourth store added to it is exercised here
+     * Driven from the production flush list, so an eighth store added to it is exercised here
      * automatically - and a store added to the list but somehow unreachable through the guard
      * is reported as a failure rather than as silence.
      *
@@ -1014,7 +1108,218 @@ class ShopperScopedAddressStoresTest extends TestCase
     }
 
     /**
-     * End to end on the Capture bypass, which is the oldest and widest of the three stores:
+     * The digest's SECOND namespace segment, pinned on its own because the store separation
+     * hides it.
+     *
+     * contactDigest() puts the FIELD in the HMAC message so an email digest can never satisfy a
+     * phone lookup. Today the two stores are separate session attributes as well, so a
+     * behavioural test through validateEmail()/validatePhone() passes whether or not the field
+     * is in the message - which makes it exactly the shape of test that "passes for the wrong
+     * reason". Asserted here directly, so the claim on contactDigest() that there are TWO
+     * independent guards is true of the tests and not only of the prose, and so the guard
+     * survives somebody merging the two attributes into one map.
+     */
+    public function testTheSameValueDigestsDifferentlyForTheEmailAndThePhoneStore(): void
+    {
+        // A value that is plausible in both fields, so the test cannot be dismissed as
+        // hypothetical: a numeric string is a phone number and could be typed into an email box.
+        $value = '0123456789';
+        $harness = $this->createGuard([], 7, 1);
+
+        $asEmail = $harness['guard']->contactDigest(
+            ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+            $value
+        );
+        $asPhone = $harness['guard']->contactDigest(
+            ShopperScopedSessionStores::VERIFIED_PHONE_SESSION_KEY,
+            $value
+        );
+
+        $this->assertNotSame(
+            '',
+            $asEmail,
+            'Fixture guard: a scalar value under a salt that can be minted must produce a digest, or the '
+            . 'inequality below would hold for two empty strings.'
+        );
+        $this->assertNotSame(
+            $asEmail,
+            $asPhone,
+            'One value must digest differently in the two stores. The field is in the HMAC message precisely '
+            . 'so that a value warned about as a PHONE number cannot be accepted unverified as an EMAIL '
+            . 'address, and that guard must not depend on the two stores happening to be separate session '
+            . 'attributes today.'
+        );
+    }
+
+    /**
+     * The digest must be a FULL-LENGTH salted HMAC, not a truncated fingerprint and not a bare
+     * hash of the value.
+     *
+     * Three separate properties, and each has a specific "fix" it exists to prevent:
+     *  - 64 hex characters, because Validator::buildVerifyCacheKey() truncates ITS SHA-256 to
+     *    12 and somebody will eventually make these "consistent". 12 hex characters is 48 bits,
+     *    and 48 bits of a hash of an email address is not a secret against anyone holding a
+     *    candidate list;
+     *  - not equal to hash('sha256', $value), i.e. genuinely keyed. An unsalted digest of an
+     *    email address is a GLOBAL identifier for that address - identical in every session on
+     *    every installation - so digests could be matched across sessions or against a
+     *    precomputed table;
+     *  - different in two different sessions, which is what makes the salt per-session rather
+     *    than a module-lifetime secret. A config-persisted key would restore exactly the
+     *    cross-session linkability the per-session salt removes.
+     */
+    public function testADigestIsAFullLengthPerSessionSaltedHmacAndNotATruncatedHash(): void
+    {
+        $value = 'shopper.a@example.com';
+        $field = ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY;
+
+        $first = $this->createGuard([], 7, 1);
+        $digest = $first['guard']->contactDigest($field, $value);
+
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $digest,
+            'The digest must be the full 64 hex characters of a SHA-256 HMAC. Do NOT truncate it to 12 the way '
+            . 'the address cache keys are truncated: those are namespace separators inside one session, where '
+            . 'a collision costs a re-verify, while this is a one-way image of the customer\'s email address.'
+        );
+        $this->assertNotSame(
+            hash('sha256', $value),
+            $digest,
+            'The digest must be KEYED, not a bare hash of the value: an unsalted digest of an email address is '
+            . 'the same everywhere, so it identifies the address globally and can be looked up in a '
+            . 'precomputed table.'
+        );
+
+        $second = $this->createGuard([], 7, 1);
+
+        $this->assertNotSame(
+            $digest,
+            $second['guard']->contactDigest($field, $value),
+            'Two SESSIONS must digest the same address differently. The salt is minted per session and dies '
+            . 'with it, deliberately: a module-lifetime or config-persisted secret would make the digests '
+            . 'linkable across sessions, which is the property the hashing exists to remove.'
+        );
+    }
+
+    /**
+     * A salt of the wrong shape must be REPLACED, not hashed under.
+     *
+     * The attribute is a bare session key like every other, so a truncated payload or another
+     * module can leave anything in it. Hashing under a two-character "salt" would silently
+     * weaken every digest in the session while looking exactly like a working one - the failure
+     * mode that has no symptom. Re-minting invalidates the digests already stored, which costs
+     * one extra billable verify each and grants nothing: the same direction enforceOwnership()
+     * takes with an unreadable owner marker.
+     *
+     * @param mixed $planted Value found in the salt attribute.
+     */
+    #[DataProvider('unusableSaltProvider')]
+    public function testASaltOfTheWrongShapeIsReplacedRatherThanHashedUnder($planted): void
+    {
+        $saltKey = self::readPrivateKeyConstant('CONTACT_DIGEST_SALT_KEY');
+        $harness = $this->createGuard([$saltKey => $planted], 7, 1);
+
+        $digest = $harness['guard']->contactDigest(
+            ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+            'shopper.a@example.com'
+        );
+
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $harness['session'][$saltKey] ?? null,
+            'An unusable salt must be replaced with a freshly minted one. Keeping it would hash every digest '
+            . 'in this session under a value that is not a 256-bit secret, which is indistinguishable from '
+            . 'working and is therefore the one failure with no symptom.'
+        );
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $digest,
+            'And the digest must still be produced: re-minting is a recovery, not a refusal, so it costs a '
+            . 'cache miss rather than a billable verify with nothing recorded.'
+        );
+    }
+
+    /**
+     * @return array<string, array{0: mixed}>
+     */
+    public static function unusableSaltProvider(): array
+    {
+        return [
+            'an empty string' => [''],
+            'too short' => ['0123456789abcdef'],
+            'the right length but not hex' => [str_repeat('z', 64)],
+            'not a string at all' => [12345],
+            'an array' => [['0123456789abcdef']],
+        ];
+    }
+
+    /**
+     * A value that cannot be digested must be reported as "do not cache this", never as a
+     * digest of something.
+     *
+     * Reachable from a crafted POST - `email[]=a` makes $request['email'] an array, and both
+     * Plugin\Frontend\CustomerAccountCreate and OrderSave hand that straight through. Casting
+     * it to a string would digest every array to the same value, which would be a genuine
+     * cross-value bypass; '' propagates to shouldVerify(), which verifies and stores nothing.
+     *
+     * @param mixed $value
+     */
+    #[DataProvider('undigestableValueProvider')]
+    public function testAValueThatCannotBeDigestedYieldsTheDoNotCacheSentinel($value): void
+    {
+        $harness = $this->createGuard([], 7, 1);
+
+        $this->assertSame(
+            '',
+            $harness['guard']->contactDigest(ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY, $value),
+            'A non-scalar value must yield the empty "do not cache" sentinel. Digesting its string cast would '
+            . 'give every array the same digest, so one array-valued submission would grant a bypass to every '
+            . 'other - the opposite of what these stores are for.'
+        );
+    }
+
+    /**
+     * @return array<string, array{0: mixed}>
+     */
+    public static function undigestableValueProvider(): array
+    {
+        return [
+            'an array, as a crafted email[]= POST produces' => [['a@example.com']],
+            'an empty array' => [[]],
+            'an object' => [new stdClass()],
+        ];
+    }
+
+    /**
+     * The degenerate scalars must keep behaving exactly as the loose in_array() they replace.
+     *
+     * null and '' were ALREADY equal under the old comparison - null == '' is true - so the
+     * (string) cast in contactDigest() is not a new equivalence, it is the preservation of an
+     * existing one. Pinned because it is the one case where the digest is deliberately NOT
+     * narrower than the comparison it replaces, and a reader tightening it to distinguish them
+     * would be changing behaviour rather than fixing anything.
+     */
+    public function testNullAndTheEmptyStringDigestIdenticallyExactlyAsTheyComparedBefore(): void
+    {
+        $harness = $this->createGuard([], 7, 1);
+        $field = ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY;
+
+        $this->assertTrue(
+            // @phpstan-ignore-next-line - the loose comparison IS the premise being preserved.
+            null == '',
+            'Fixture guard: null and \'\' must be loose-equal, or this test is not preserving anything.'
+        );
+        $this->assertSame(
+            $harness['guard']->contactDigest($field, null),
+            $harness['guard']->contactDigest($field, ''),
+            'null and \'\' must digest identically, because the loose in_array() this replaces already treated '
+            . 'them as the same value. (string)null === \'\' is what carries that across.'
+        );
+    }
+
+    /**
+     * End to end on the Capture bypass, which is the oldest and widest of the seven stores:
      * an address shopper A picked from the Loqate lookup must not let shopper B check the
      * same address out unverified.
      *
@@ -1187,7 +1492,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * NO flush ever happens - the whole chunk is served from the old identity's memory.
      *
      * That is a licence to skip a billable verify being handed to a shopper who never earned it,
-     * which is precisely what ShopperScopedAddressStores exists to prevent, arriving through a
+     * which is precisely what ShopperScopedSessionStores exists to prevent, arriving through a
      * store this class cannot see. Asserted here because the batch tests one layer up cannot see
      * it either: the run map answers them identically either way.
      */
@@ -1248,14 +1553,14 @@ class ShopperScopedAddressStoresTest extends TestCase
      *
      * WHY THIS IS REACHABLE, and not a thought experiment.
      * Magento\Customer\Model\Session::logout() calls destroy(), whose default 'clear_storage'
-     * option is TRUE, so a logout empties EVERY attribute of the session storage - the three
+     * option is TRUE, so a logout empties EVERY attribute of the session storage - the seven
      * shopper-scoped stores and, sitting beside them, the ownership marker that names who they
      * belonged to. Magento\Framework\Session\SessionManager::clearStorage() does the same for
      * any other module that calls it. The next access therefore finds NO marker, which is the
      * ADOPTION branch, not the flush branch: nothing is flushed, because the storage the flush
      * would have cleared is already empty.
      *
-     * WHY THAT IS NOT HARMLESS. It is harmless for the three SESSION stores - they went with
+     * WHY THAT IS NOT HARMLESS. It is harmless for the seven SESSION stores - they went with
      * the marker - but Validator::verifyMultipleAddresses() also remembers this run's batch
      * verdicts in a plain map on the Validator INSTANCE, which the storage wipe does not
      * touch. That map is a set of licences to skip a billable Cleansing call, so its lifetime
@@ -1345,7 +1650,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * PINNED SO IT CANNOT BE "FIXED" QUIETLY. The obvious way to make this one call cheaper is
      * to stop opening a new epoch on adoption - and that is exactly the defect the test above
      * exists to catch, so the two must be read together. The same price is already paid by the
-     * three session stores the wipe emptied; this only says the derived map pays it too.
+     * seven session stores the wipe emptied; this only says the derived map pays it too.
      */
     public function testEmptyingTheStorageUnderOneIdentityRebillsWhatThatRunHadRemembered(): void
     {
@@ -1506,7 +1811,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      * whichever admin submitted first.
      *
      * THIS IS NOT A FAILING TEST AND IT IS NOT A WORKAROUND. It is the documented limit on
-     * ShopperScopedAddressStores, asserted so it cannot change in either direction unnoticed - if
+     * ShopperScopedSessionStores, asserted so it cannot change in either direction unnoticed - if
      * someone injects the backend auth session and closes it, this test fails and says so; if
      * someone assumes it is already closed, this test is the counter-example. It is
      * deliberately accepted upstream: the admin panel is a trusted, authenticated, non-shared
@@ -1540,7 +1845,7 @@ class ShopperScopedAddressStoresTest extends TestCase
             $this->ownerConstant('GUEST_OWNER_ID'),
             $shopper['session'][$this->ownerKey()] ?? null,
             'On the adminhtml path the customer session carries no customer id, so the batch cache is owned '
-            . 'by the GUEST. This is the documented ACCEPTED LIMIT on ShopperScopedAddressStores: the guard scopes '
+            . 'by the GUEST. This is the documented ACCEPTED LIMIT on ShopperScopedSessionStores: the guard scopes '
             . 'by customer identity only, and there is no customer identity here to scope by.'
         );
 
@@ -1560,7 +1865,7 @@ class ShopperScopedAddressStoresTest extends TestCase
             . 'view and AQI threshold and only passes are stored, so it is the same verdict the second admin '
             . 'would have earned. Accepted upstream (the admin panel is trusted, authenticated and not '
             . 'shared); if this assertion ever fails because the backend auth session was injected, that is an '
-            . 'improvement - update this test and the ACCEPTED LIMITS note on ShopperScopedAddressStores together.'
+            . 'improvement - update this test and the ACCEPTED LIMITS note on ShopperScopedSessionStores together.'
         );
 
         // The structural half of the same limit, and the reason the behavioural half above
@@ -1575,10 +1880,10 @@ class ShopperScopedAddressStoresTest extends TestCase
             1,
             $identitySources,
             sprintf(
-                'ShopperScopedAddressStores must read exactly ONE identity source. Holding a %s alongside the '
+                'ShopperScopedSessionStores must read exactly ONE identity source. Holding a %s alongside the '
                 . 'customer session would mean the admin-swap limit asserted above has been closed, which is '
                 . 'an improvement but makes the assertion above wrong: change both together, and the ACCEPTED '
-                . 'LIMITS note on ShopperScopedAddressStores with them. Note that this counts SESSIONS only - the '
+                . 'LIMITS note on ShopperScopedSessionStores with them. Note that this counts SESSIONS only - the '
                 . 'guard is free to acquire other collaborators (a logger is the standing candidate, named on '
                 . 'assertEnrolled()) without touching what it can see about identity. Found: %s.',
                 self::BACKEND_AUTH_SESSION,
@@ -1648,13 +1953,25 @@ class ShopperScopedAddressStoresTest extends TestCase
 
     /**
      * The structural half of the same property, and the one that stops the whole scheme being
-     * quietly bypassed: neither helper may keep a reference to the raw customer session.
+     * quietly bypassed: none of these classes may keep a reference to the raw customer session.
      *
-     * Both are handed a Magento\Customer\Model\Session by DI and wrap it in a
-     * ShopperScopedAddressStores. If either also retained the raw object, a future edit could read
-     * or write any of the three attributes directly - no flush, no marker, and every
+     * Each is handed a Magento\Customer\Model\Session by DI and wraps it in a
+     * ShopperScopedSessionStores. If one also retained the raw object, a future edit could read
+     * or write any of the seven attributes directly - no flush, no marker, and every
      * behavioural test in this file still green, because they only exercise the paths that DO
      * go through the guard.
+     *
+     * FOUR CLASSES, not two, since LOQ-17149: Plugin\Frontend\PlaceOrder and PlaceOrderGuest
+     * read the billing-error gate and were holding a raw private Session to do it. They are the
+     * READERS of the store whose stale value denies the next shopper a checkout, so a raw
+     * session there is the same hole as a raw session in Validator.
+     *
+     * Plugin\AbstractPlugin is deliberately NOT in this list, and that exclusion is argued
+     * rather than convenient: it still holds a raw Session, because
+     * rememberCustomerFormData()/rememberAddressFormData() write CORE attributes through core's
+     * own typed setters and cannot go through the seam. What LOQ-17149 changed there is the
+     * VISIBILITY - the property went from protected, reachable from ten subclasses, to private,
+     * reachable from two named methods that touch no module store.
      */
     public function testNeitherHelperKeepsAReferenceToTheRawCustomerSession(): void
     {
@@ -1667,7 +1984,7 @@ class ShopperScopedAddressStoresTest extends TestCase
                     $value,
                     sprintf(
                         '%s::$%s holds the raw customer session. The captured-address store and both verdict '
-                        . 'caches must be reachable only through ShopperScopedAddressStores, or one direct '
+                        . 'caches must be reachable only through ShopperScopedSessionStores, or one direct '
                         . 'getData() re-opens LOQ-16978 with the whole suite green.',
                         $label,
                         $name
@@ -1675,11 +1992,11 @@ class ShopperScopedAddressStoresTest extends TestCase
                 );
             }
 
-            $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedAddressStores);
+            $guards = array_filter($held, static fn ($value): bool => $value instanceof ShopperScopedSessionStores);
             $this->assertCount(
                 1,
                 $guards,
-                sprintf('%s must hold exactly one ShopperScopedAddressStores to reach its session stores.', $label)
+                sprintf('%s must hold exactly one ShopperScopedSessionStores to reach its session stores.', $label)
             );
         }
     }
@@ -1718,6 +2035,10 @@ class ShopperScopedAddressStoresTest extends TestCase
                 $helper,
                 $serializer
             ),
+            // The two readers of the billing-error gate. Neither extends AbstractPlugin, so
+            // each builds its own seam inline from the Session it is given (LOQ-17149).
+            'Plugin\Frontend\PlaceOrder' => new PlaceOrder($sessionMock),
+            'Plugin\Frontend\PlaceOrderGuest' => new PlaceOrderGuest($sessionMock),
         ];
     }
 
@@ -1765,7 +2086,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $helper->method('getCurrentStore')->willReturn(0);
 
         // Fails the way the PRODUCTION serializer fails - see the trait. It matters here because
-        // the flush this class exists to perform writes null over the three stores, and null is
+        // the flush this class exists to perform writes null over all seven stores, and null is
         // one of the values the production serializer REJECTS outright rather than decoding: a
         // lenient double would let a reader that lost its guard look safe.
         $serializer = $this->createSerializerDouble();
@@ -1825,6 +2146,17 @@ class ShopperScopedAddressStoresTest extends TestCase
             self::CAPTURED_ADDRESSES_SESSION_KEY => ['captured'],
             self::VERIFY_CACHE_SESSION_KEY => ['cached' => 'verdict'],
             self::BATCH_VERIFY_CACHE_SESSION_KEY => ['cached' => 'batch verdict'],
+            // The LOQ-17149 stores, in their production shapes: two lists of digests, one
+            // scalar and one boolean. Seeded with recognisable values rather than realistic
+            // ones - the guard is shape-agnostic, and a failure message naming
+            // "the previous shopper's email digest" is worth more than a real SHA-256.
+            self::VERIFIED_EMAIL_SESSION_KEY => ['the previous shopper\'s email digest'],
+            self::VERIFIED_PHONE_SESSION_KEY => ['the previous shopper\'s phone digest'],
+            self::PENDING_EMAIL_SESSION_KEY => 'previous.shopper@example.com',
+            // TRUE specifically. A stale false grants nothing, so seeding false would let the
+            // flush pass this store by unnoticed; true is the value that denies the next
+            // shopper a checkout they can never unblock.
+            self::BILLING_ERRORS_SESSION_KEY => true,
         ];
     }
 
@@ -1835,6 +2167,20 @@ class ShopperScopedAddressStoresTest extends TestCase
      * @param array $harness Harness from createGuard().
      * @return array<string, mixed>
      */
+    /**
+     * What managedAttributes() must look like once every store has been flushed.
+     *
+     * Derived from seededStores() rather than written out, so enrolling an eighth store does
+     * not leave a hard-coded [null, null, null] silently asserting the flush over three of
+     * eight attributes - which is precisely what LOQ-17149 found when it enrolled four.
+     *
+     * @return array<int, null>
+     */
+    private function everyStoreFlushed(): array
+    {
+        return array_fill(0, count($this->seededStores()), null);
+    }
+
     private function managedAttributes(array $harness): array
     {
         $values = [];
@@ -1855,7 +2201,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $keys = self::readManagedKeys();
         if ($keys === []) {
             $this->fail(
-                'ShopperScopedAddressStores::SHOPPER_SCOPED_SESSION_KEYS is missing or empty: that list IS the '
+                'ShopperScopedSessionStores::SHOPPER_SCOPED_SESSION_KEYS is missing or empty: that list IS the '
                 . 'flush, so an empty one means no store is ever cleared when the shopper changes.'
             );
         }
@@ -1870,7 +2216,7 @@ class ShopperScopedAddressStoresTest extends TestCase
      */
     private static function readManagedKeys(): array
     {
-        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
+        $reflection = new ReflectionClass(ShopperScopedSessionStores::class);
         if (!$reflection->hasConstant('SHOPPER_SCOPED_SESSION_KEYS')) {
             return [];
         }
@@ -1887,7 +2233,7 @@ class ShopperScopedAddressStoresTest extends TestCase
         $key = self::readOwnerKey();
         if ($key === '') {
             $this->fail(
-                'ShopperScopedAddressStores::SESSION_OWNER_KEY is not defined: the identity the shopper-scoped '
+                'ShopperScopedSessionStores::SESSION_OWNER_KEY is not defined: the identity the shopper-scoped '
                 . 'stores belong to has to be recorded somewhere, or no identity change can be detected.'
             );
         }
@@ -1900,11 +2246,25 @@ class ShopperScopedAddressStoresTest extends TestCase
      */
     private static function readOwnerKey(): string
     {
-        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
+        return self::readPrivateKeyConstant('SESSION_OWNER_KEY');
+    }
 
-        return $reflection->hasConstant('SESSION_OWNER_KEY')
-            ? (string)$reflection->getConstant('SESSION_OWNER_KEY')
-            : '';
+    /**
+     * One of the guard's PRIVATE session-attribute constants, by name.
+     *
+     * Read by reflection rather than mirrored as a literal so these tests describe the real
+     * attribute rather than a guess at it. Answers '' for a constant that does not exist,
+     * which the callers all treat the same way they treat any other unenrolled key: it must
+     * be refused. That degradation is deliberate - a renamed private constant should not make
+     * this file fatal before it can report anything.
+     *
+     * @param string $name 'SESSION_OWNER_KEY' or 'CONTACT_DIGEST_SALT_KEY'.
+     */
+    private static function readPrivateKeyConstant(string $name): string
+    {
+        $reflection = new ReflectionClass(ShopperScopedSessionStores::class);
+
+        return $reflection->hasConstant($name) ? (string)$reflection->getConstant($name) : '';
     }
 
     /**
@@ -1920,10 +2280,10 @@ class ShopperScopedAddressStoresTest extends TestCase
      */
     private function ownerConstant(string $name): int
     {
-        $reflection = new ReflectionClass(ShopperScopedAddressStores::class);
+        $reflection = new ReflectionClass(ShopperScopedSessionStores::class);
         if (!$reflection->hasConstant($name)) {
             $this->fail(sprintf(
-                'ShopperScopedAddressStores::%s is not defined. The guard needs three DISJOINT owner classes - a '
+                'ShopperScopedSessionStores::%s is not defined. The guard needs three DISJOINT owner classes - a '
                 . 'positive customer id, the guest, and "the session answered an id we cannot read" - or two '
                 . 'different identities compare equal and the stores are not flushed between them.',
                 $name

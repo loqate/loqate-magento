@@ -39,7 +39,7 @@ use Magento\Framework\Serialize\SerializerInterface;
  * @see \Loqate\ApiIntegration\Test\Unit\Helper\CapturedAddressStoreTest
  * @see \Loqate\ApiIntegration\Test\Unit\Helper\ValidatorBatchVerifyCacheTest
  * @see \Loqate\ApiIntegration\Test\Unit\Helper\ValidatorImportRunDedupeTest
- * @see \Loqate\ApiIntegration\Test\Unit\Helper\ShopperScopedAddressStoresTest
+ * @see \Loqate\ApiIntegration\Test\Unit\Helper\ShopperScopedSessionStoresTest
  * @see \Loqate\ApiIntegration\Test\Unit\Plugin\Admin\ValidateImportAddressRowAttributionTest
  */
 trait ProductionSerializerDouble

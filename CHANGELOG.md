@@ -85,6 +85,36 @@ predate it and are described by their git tags and commit history.
   runtime faults — transport, connector, unreadable source file — are still absorbed
   as before.
 
+- **"Submit again to use this email address / phone number" is now remembered per
+  shopper, per store view and for the 25 most recent values.** With "Prevent
+  Submit" set to No — the shipped default — the module warns once about an invalid
+  email address or phone number and accepts it on resubmission. That "already
+  warned" list was kept for the whole session with no limit, was shared across a
+  logout/login on the same browser, and was shared across store views. Four
+  consequences, all of them **one extra billable verification** in the affected
+  case and never a skipped check (LOQ-17149):
+
+  - a shopper who signs in or out mid-session is warned once more about an address
+    or number they had already resubmitted;
+  - the same address or number used under two store views is verified once per
+    store view, because each store view can carry its own API key and its own
+    "Prevent Submit" setting;
+  - only the 25 most recently submitted values per session are remembered, so a
+    shopper who works through more than 25 different email addresses (or phone
+    numbers) in one session is warned again about the earliest ones;
+  - sessions that were already open when this release was deployed are warned once
+    more about each value they had remembered, because the stored form changed.
+
+- **Two phone numbers that differ only by a leading `0`, `00` or `+` are now
+  treated as different numbers.** They were compared with PHP's loose comparison,
+  which compares two numeric strings as NUMBERS — so `0123456789` and `123456789`,
+  or `+4412345` and `4412345`, counted as the same number and the second was
+  accepted with no verification and no warning on the strength of the first. They
+  are now verified separately: **one extra billable verification** for a shopper who
+  submits both spellings, and no genuinely different number is skipped any more.
+  Identical values are still recognised and still skipped, which is what the list is
+  for.
+
 ### Fixed
 
 - Repeated billable `/Cleansing/International/Batch` requests for the same address
@@ -123,6 +153,53 @@ predate it and are described by their git tags and commit history.
   and its verify bypass survived a logout/login on a shared browser. It is now
   bounded to 50 entries with FIFO eviction, and it and both verdict caches are
   flushed when the logged-in customer changes (LOQ-16978).
+- **A shopper could be permanently unable to place an order, with the message
+  "Please check the error again before continuing." and nothing on the page to
+  correct.** A failed billing-address validation set a session flag that only a
+  fresh billing-address submission could clear — but the flag is checked *before*
+  the place-order call assigns the billing address, so on a checkout flow that
+  submits the two together the check always fired first and the flag was never
+  cleared. Combined with the flag surviving a logout/login on a shared browser,
+  one shopper's validation failure could block the next shopper's checkout
+  indefinitely. The flag is now cleared when the logged-in customer changes
+  (LOQ-17149).
+- **An email address left behind by an abandoned checkout was verified inside the
+  next shopper's checkout.** The pending address is cleared only on a successful
+  verification, so a guest who typed an email and left it behind left it in the
+  session. The next shopper's shipping-address save then spent a billable email
+  verification on it and, if it failed, blocked their checkout with a message about
+  an address that appeared nowhere on their form. It is now cleared when the
+  logged-in customer changes (LOQ-17149).
+- **Customer email addresses and phone numbers are no longer kept in the session.**
+  The "already warned about" lists held the values in plain text for the whole life
+  of the session. They now hold a salted, full-length HMAC-SHA-256 digest instead:
+  the lists only ever need to *compare*, never to read a value back. The salt is
+  generated per session, never persisted or configured, and is replaced whenever the
+  logged-in customer changes. Values written by earlier releases are discarded the
+  first time the list is written to. The one email address that must stay readable is
+  the pending checkout address described above, because it is sent to Loqate to be
+  verified; it is cleared on success and now also when the shopper changes
+  (LOQ-17149).
+
+### Changed — for developers extending this module
+
+- **`Plugin\AbstractPlugin::$session` is now `private`.** It was `protected` on the
+  base class of ten plugins, which meant any of them — or any third-party subclass —
+  could read or write the module's session stores directly and bypass the bounding
+  and the shopper-change flush described above. Subclasses now use the narrow named
+  accessors on the base class (`shouldVerify()`, `pendingEmailAddress()`,
+  `rememberPendingEmailAddress()`, `clearPendingEmailAddress()`,
+  `recordBillingAddressErrors()`, `rememberCustomerFormData()`,
+  `rememberAddressFormData()`). A subclass that used `$this->session` will no longer
+  compile; that is the intended effect, because such a subclass was reaching the
+  stores without the guard. The constructor signature is unchanged, so no
+  `di.xml` and no subclass constructor needs editing (LOQ-17149).
+- **`Helper\ShopperScopedAddressStores` is now `Helper\ShopperScopedSessionStores`.**
+  It guards seven session stores rather than the three address ones it started with,
+  so the old name had become inaccurate. The class has never appeared in a tagged
+  release, is never registered in DI and is held only in private properties, so no
+  alias is kept. Every session attribute *value* is unchanged, so open sessions keep
+  their stores across the upgrade (LOQ-17149).
 
 ### Known limitations
 
@@ -174,8 +251,16 @@ predate it and are described by their git tags and commit history.
   billed, with no bound. The alternative is worse: one shared key would file every
   unidentifiable address under the same entry and replay one row's verdict for all of
   them.
-- `loqate_email`, `loqate_phone`, `loqate_email_to_validate` and
-  `loqate_billing_errors` are still unbounded session stores and are not covered by
-  the shopper-change flush (LOQ-17149).
-- The shopper-change flush scopes by **customer** identity, so an admin-user swap
-  within one browser session is not covered. Decided as part of LOQ-17149.
+- The shopper-change flush scopes by **customer** identity, so an **admin-user swap
+  within one browser session is not covered**. LOQ-17149 decided to leave it there
+  rather than read the backend session as well, and the reason is quantified in the
+  ACCEPTED LIMITS block on `Helper\ShopperScopedSessionStores`. In short: the admin
+  panel runs its own PHP session, separate from the storefront's, so this is
+  admin-to-admin on one shared browser and never admin-to-shopper. What a second
+  admin can inherit is one identical admin order create, customer-email re-check or
+  address phone re-check that the first already paid for — the merchant pays nothing
+  extra, only the attribution between two admin users is imprecise — and since the
+  contact stores now hold salted digests rather than values, nothing readable is
+  inherited with it. Closing it would mean either a backend dependency in a helper
+  built on every storefront checkout request or a second bill for a verdict that is
+  identical by construction.

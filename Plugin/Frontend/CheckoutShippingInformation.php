@@ -44,13 +44,18 @@ class CheckoutShippingInformation extends AbstractPlugin
                 }
             }
 
+            // The pending address is read through the shopper-ownership guard since
+            // LOQ-17149, so an address left behind by an abandoned checkout cannot be
+            // verified - billably - inside the NEXT shopper's checkout, nor block them with a
+            // message about an address that is nowhere on their form. Cleared only on a
+            // successful verify, which is why the flush is what covers the abandoned case.
             if ($this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
-            && ($email = $this->session->getData('loqate_email_to_validate'))) {
+            && ($email = $this->pendingEmailAddress())) {
                 $errorMessage = $this->validateEmail($email);
                 if ($errorMessage) {
                     $errors[] = $errorMessage;
                 } else {
-                    $this->session->setData('loqate_email_to_validate', '');
+                    $this->clearPendingEmailAddress();
                 }
             }
 
