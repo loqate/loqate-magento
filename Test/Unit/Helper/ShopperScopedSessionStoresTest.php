@@ -80,9 +80,9 @@ use stdClass;
  *    inherited every bypass store - the exact hand-off this class exists to stop;
  *  - the ENROLMENT assertion: an attribute missing from the flush list is refused by both
  *    getData() and setData() rather than quietly reached through the guard without ever
- *    being flushed, see testAnUnenrolledAttributeIsRejectedByBothGetDataAndSetData() and
- *    its mirror testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData(). Note which
- *    keys the first of those now drives: the four it used to name are ENROLLED since
+ *    being flushed, see testAnAttributeThatWouldNeverBeFlushedCannotBeReachedThroughTheGuardAtAll()
+ *    and its mirror testEveryStoreThatIsFlushedCanStillBeReadAndWrittenByItsOwnShopper(). Note
+ *    which keys the first of those now drives: the four it used to name are ENROLLED since
  *    LOQ-17149 and have moved to the mirror, and what is left out is the IP-country cache
  *    (not one shopper's data), the contact-digest salt (this class's own) and the owner
  *    marker;
@@ -105,12 +105,14 @@ use stdClass;
  * through this class - is asserted behaviourally for the three address stores
  * (testACapturedAddressBypassDoesNotSurviveALogin(), testACachedVerdictDoesNotSurviveALogin(),
  * testABatchVerdictDoesNotSurviveALogin()) and structurally
- * (testNeitherHelperKeepsAReferenceToTheRawCustomerSession()), because a single raw
+ * (testNothingThatReachesAShopperScopedStoreCanBypassTheOwnershipGuard()), because a single raw
  * $session->getData() left anywhere in Controller or Validator re-opens the defect while
  * every test in this file still passes. The same structural property for the FOUR LOQ-17149
- * stores lives one layer up, in Plugin\AbstractPlugin, whose $session became private in that
- * ticket precisely because a protected raw session on the base class of ten plugins is the
- * same hole seen from Plugin\ rather than from Helper\.
+ * stores lives one layer up and is asserted there rather than here, by
+ * AbstractPluginContactStoresTest::testNoPluginCanReachAShopperScopedStoreWithoutTheOwnershipGuard():
+ * Plugin\AbstractPlugin's $session became private in that ticket precisely because a protected
+ * raw session on the base class of ten plugins is the same hole seen from Plugin\ rather than
+ * from Helper\.
  *
  * THREE STORES ARE ONLY NOMINALLY COVERED IN PRODUCTION, and that is pinned here rather than
  * left to the class docblock: the BATCH verdict cache is written exclusively from adminhtml,
@@ -984,7 +986,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * @param string $key Attribute that is not enrolled in the flush.
      */
     #[DataProvider('unenrolledSessionKeyProvider')]
-    public function testAnUnenrolledAttributeIsRejectedByEveryKeyTakingAccessor(string $key): void
+    public function testAnAttributeThatWouldNeverBeFlushedCannotBeReachedThroughTheGuardAtAll(string $key): void
     {
         $calls = [
             'getData()' => static fn (ShopperScopedSessionStores $guard) => $guard->getData($key),
@@ -1052,7 +1054,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * The list SHRANK in LOQ-17149 and that is the point of the ticket: the four siblings it
      * used to name - 'loqate_email', 'loqate_phone', 'loqate_email_to_validate' and
      * 'loqate_billing_errors' - are now ENROLLED, so they moved to managedStoreProvider() and
-     * are covered by testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData(). What is
+     * are covered by testEveryStoreThatIsFlushedCanStillBeReadAndWrittenByItsOwnShopper(). What is
      * left is the set that must stay out, each for its own reason:
      *  - the IP-country cache, which is not one shopper's data at all (two shoppers on one
      *    browser share the IP address) and is reached through getIpCountry()/setIpCountry();
@@ -1089,7 +1091,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * @param string $key A managed session key.
      */
     #[DataProvider('managedStoreProvider')]
-    public function testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData(string $key): void
+    public function testEveryStoreThatIsFlushedCanStillBeReadAndWrittenByItsOwnShopper(string $key): void
     {
         $harness = $this->createGuard([$key => 'already here'], 7);
 
@@ -2034,7 +2036,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * VISIBILITY - the property went from protected, reachable from ten subclasses, to private,
      * reachable from two named methods that touch no module store.
      */
-    public function testNeitherHelperKeepsAReferenceToTheRawCustomerSession(): void
+    public function testNothingThatReachesAShopperScopedStoreCanBypassTheOwnershipGuard(): void
     {
         foreach ($this->helpersHoldingShopperScopedStores() as $label => $helper) {
             $held = $this->propertyValues($helper);
