@@ -1151,6 +1151,78 @@ class ShopperScopedAddressStoresTest extends TestCase
     }
 
     /**
+     * The same identity change on the IMPORT shape of the call - verifyMultipleAddresses($batch,
+     * FALSE) - where NOTHING else in the request touches a shopper-scoped attribute first.
+     *
+     * NOT A DUPLICATE OF THE TEST ABOVE, and the difference is the whole point. That one passes
+     * $checkForCaptured at its default of true, so the captured-address read happens BEFORE any
+     * verdict is looked up, and that read runs the ownership check as a side effect. Every later
+     * lookup in the request therefore sees a generation taken AFTER the flush no matter how the
+     * generation is obtained - which means it cannot distinguish a guard that enforces ownership
+     * from one that merely reports a stale counter.
+     *
+     * Plugin\Admin\ValidateImportAddress::afterValidateData() passes FALSE. On that path the
+     * run-scoped verdict map is consulted before a single session attribute is read, so the
+     * ownership check has to happen INSIDE the generation lookup itself; if it does not, the
+     * first address of the request is answered out of the previous shopper's verdicts, and
+     * because a hit short-circuits before the session store is read, no attribute is touched and
+     * NO flush ever happens - the whole chunk is served from the old identity's memory.
+     *
+     * That is a licence to skip a billable verify being handed to a shopper who never earned it,
+     * which is precisely what ShopperScopedAddressStores exists to prevent, arriving through a
+     * store this class cannot see. Asserted here because the batch tests one layer up cannot see
+     * it either: the run map answers them identically either way.
+     */
+    public function testABatchVerdictDoesNotSurviveALoginOnTheImportPathThatReadsNoCapturedStore(): void
+    {
+        $shopper = $this->createShopper();
+        $batch = [0 => self::ADDRESS];
+
+        $first = $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            [0 => true],
+            $first,
+            'The address must pass on its own AQI first, or this test is measuring a rejection rather than a '
+            . 'remembered verdict.'
+        );
+        $this->assertSame(1, $this->apiCallCount($shopper), 'The first chunk must be billed.');
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            1,
+            $this->apiCallCount($shopper),
+            'A repeated address must be remembered for the shopper who earned it, or the flush asserted '
+            . 'below is indistinguishable from a memory that never answers.'
+        );
+
+        $shopper['identity']['customerId'] = 7;
+        $afterLogin = $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'On the import shape of the call NOTHING touches a shopper-scoped attribute before the verdict '
+            . 'is looked up, so the identity change must be detected by the lookup itself. A generation '
+            . 'reported without enforcing ownership hands the new identity the previous one\'s verdict, and '
+            . 'the hit short-circuits before any session attribute is read - so the stores are never '
+            . 'flushed either, and the entire chunk is answered from the old shopper\'s memory.'
+        );
+        $this->assertSame([0 => true], $afterLogin, 'The re-verified chunk stands on its own verdict.');
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'And the new shopper\'s own verdicts must then be remembered as usual: a guard that discarded '
+            . 'the map on every lookup would re-bill every repeated row of every import, which is the '
+            . 'saving LOQ-17148 exists to deliver.'
+        );
+    }
+
+    /**
      * THE ACCEPTED LIMIT, pinned as documented behaviour rather than left implicit: on the
      * only path that writes the batch cache in production, the flush is a NO-OP.
      *
