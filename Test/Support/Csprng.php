@@ -29,6 +29,15 @@ namespace Loqate\ApiIntegration\Test\Support;
  * WHAT IT IS NOT. It is not a mock of the class under test and it does not reach inside it: the
  * class is still built through its real constructor and still calls random_bytes() itself. The
  * only thing replaced is the PLATFORM capability, which is the thing the guarantee is about.
+ *
+ * IT DOES SHIP, and that is worth knowing rather than fixing here: composer.json maps
+ * "Loqate\\ApiIntegration\\": "" under the production autoload section (the module root is the
+ * PSR-4 root, which is how a Magento module is laid out), so this class is autoloadable in a
+ * live install even though the Test\ prefix is also mapped under autoload-dev. Nothing calls it
+ * there - it is one public static bool and one static method, no constructor, no state that
+ * outlives a call - and the FUNCTION that reads it (Test/Support/CsprngOverride.php) is a bare
+ * function that Composer's PSR-4 cannot autoload at all and that only Test/bootstrap.php
+ * requires. So in production the flag exists, nothing sets it, and nothing reads it.
  */
 final class Csprng
 {

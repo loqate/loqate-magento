@@ -712,12 +712,23 @@ class ShopperScopedSessionStores
      * shouldVerify() used a LOOSE in_array($value, $storedData); comparing digests is
      * strict. The relation is pinned by the (string) cast below, and the change can only ever
      * be in one direction: two values produce the same digest if and only if their string
-     * casts are identical, and identical string casts imply loose equality, so strict digest
-     * equality is a SUBSET of what loose in_array() matched. A match can therefore become a
-     * miss - one extra billable verify and one extra warning - and a miss can NEVER become a
-     * match, so no new bypass is reachable through this change. The cast also keeps the two
-     * degenerate cases behaving exactly as before, because (string)null === '' and null == ''
-     * was already true.
+     * casts are identical, and OVER THE DOMAIN THAT REACHES THIS METHOD identical string casts
+     * imply loose equality - so strict digest equality is a SUBSET of what loose in_array()
+     * matched. A match can therefore become a miss - one extra billable verify and one extra
+     * warning - and a miss can NEVER become a match, so no new bypass is reachable through this
+     * change. The cast also keeps the two degenerate cases behaving exactly as before, because
+     * (string)null === '' and null == '' was already true.
+     *
+     * THE DOMAIN IS NAMED RATHER THAN ASSUMED, because the implication is not universal and
+     * this paragraph is the safety argument for the whole change. Every $value that reaches
+     * here is an email address or a phone number taken straight out of the request - a string,
+     * or null when the field was absent - and for strings and null the implication holds
+     * outright. It does NOT hold for floats: at the default precision=14 two distinct doubles
+     * can share a (string) cast while comparing unequal, which would make digest equality a
+     * WIDENING there rather than a subset. That is unreachable from $_POST and no call site
+     * constructs one, which is why the claim is safe; it is stated because "identical casts
+     * imply loose equality", left unqualified, is a false sentence that a later reader could
+     * carry somewhere it matters.
      *
      * The one case where the relation genuinely narrows is a FIX and is implemented
      * deliberately: PHP 8 compares two numeric strings NUMERICALLY, so in_array() treated
