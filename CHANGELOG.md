@@ -66,6 +66,15 @@ predate it and are described by their git tags and commit history.
   old check was reached only after a readable quality index had been found in the
   response.
 
+- **The broken-threshold log line has been reworded**, so anything matching on its
+  text needs updating. It reports the configuration fault only and no longer claims an
+  outcome, because it is now emitted once per batch and a batch can be answered
+  entirely by the captured-address bypass without a single row being refused. It ends
+  `…; no address can pass a quality bar that cannot be read. Set it to one of A, B, C,
+  D, E.` where it previously ended `…; rejecting the address. Set it to one of A, B,
+  C, D, E.`; the leading `Loqate: address_quality_index is not a recognised quality
+  index (<value> of type <type>)` is unchanged.
+
 - **A customer import can now fail where it previously continued silently.** The
   import plugin used to absorb every exception and hand back an untouched result,
   which meant a misconfiguration inside the module surfaced as an import reporting

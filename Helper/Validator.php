@@ -600,7 +600,11 @@ class Validator
      * sent is answered false, no request is made and nothing is remembered. It is a PRE-FLIGHT
      * decision and only that: it depends on configuration alone, never on the response, so no
      * response-side judgement is moved forward. The captured-address guard still answers first,
-     * unchanged, because a captured address never consults the AQI at all.
+     * unchanged, because a captured address never consults the AQI at all - which is why the
+     * broken-threshold line reports the CONFIGURATION rather than a count of refusals: it is
+     * emitted once for any batch verified under an unreadable bar, including one whose rows are
+     * all captured and none of which is refused. See readableQualityIndexThreshold() for the
+     * wording and for why the alternative - staying quiet on such a batch - is worse.
      *
      * RETURN SHAPE - load-bearing in two ways, do not "simplify" either:
      *  - one entry per input address, under the INPUT's OWN KEY.
@@ -738,8 +742,11 @@ class Validator
         // PRE-FLIGHT, READ ONCE PER BATCH AND BEFORE ANY PAYLOAD IS ASSEMBLED: a threshold that
         // cannot be read as a grade decides every row before Loqate is asked, so asking is paying
         // per address for a refusal already made. Same rule and same log line as the response
-        // side, because readableQualityIndexThreshold() is the single site of both. See the
-        // docblock's "A BROKEN QUALITY BAR COSTS NOTHING" paragraph.
+        // side, because readableQualityIndexThreshold() is the single site of both - and reading
+        // it here LOGS, on every batch verified under a broken bar, whether or not this batch goes
+        // on to refuse anything (an all-captured batch refuses nothing). That is why the line
+        // reports the configuration and never an outcome. See the docblock's "A BROKEN QUALITY BAR
+        // COSTS NOTHING" paragraph.
         $thresholdIsReadable = $this->readableQualityIndexThreshold() !== null;
 
         $result = [];
@@ -1124,6 +1131,27 @@ class Validator
      * frequency - once per verified batch rather than once per verdict - and the CHANGELOG says
      * so.
      *
+     * WHY THE MESSAGE REPORTS THE CONFIGURATION AND NOT AN OUTCOME. It is written from what this
+     * method actually knows - that the configured value is not a grade, and that nothing can
+     * therefore clear the bar - and deliberately not as "rejecting the address", which is what it
+     * used to say. That older sentence was true of the RESPONSE-side caller, which always has an
+     * address in hand, and false of the batch pre-flight, which runs once per batch BEFORE any row
+     * is decided: a batch whose every row is a captured address is answered entirely by the
+     * captured guard, so the line was emitted while ZERO rows were rejected. Support reads this
+     * out of a log file, so a sentence that names an outcome that did not happen sends them
+     * looking for refused rows that do not exist. The wording holds at both call sites and at
+     * neither does it assert more than the configuration.
+     *
+     * AND WHY IT IS NOT INSTEAD EMITTED ONLY WHEN A ROW IS ACTUALLY REFUSED. That would make a
+     * CONFIGURATION diagnostic conditional on the composition of whatever batch happened to run:
+     * the all-captured batch above would go silent, and a merchant would keep a broken quality bar
+     * with nothing in the log until a row that is not captured happens along - the same shape of
+     * hole as the all-empty-'Matches' file this branch just closed, arriving through a different
+     * door. It would also need the readability rule to grow a second, non-logging entry point for
+     * the pre-flight to consult first, which is exactly the single-siting this method exists to
+     * hold. The fault is worth reporting on every batch that ran under it; only the sentence
+     * needed correcting.
+     *
      * REACHABLE FROM THE ADMIN UI SINCE LOQ-17148: etc/adminhtml/system.xml exposes
      * address_quality_index as a SELECT over Model\Config\Source\AddressQualityIndex, whose
      * option values are derived from self::VALID_QUALITY_INDEXES, so nothing a merchant can
@@ -1153,7 +1181,7 @@ class Validator
 
         $this->logger->info(sprintf(
             'Loqate: address_quality_index is not a recognised quality index (%s of type %s); '
-            . 'rejecting the address. Set it to one of %s.',
+            . 'no address can pass a quality bar that cannot be read. Set it to one of %s.',
             var_export($configIndex, true),
             gettype($configIndex),
             implode(', ', self::VALID_QUALITY_INDEXES)
