@@ -61,6 +61,13 @@ class AdminContactStoresTest extends TestCase
     private const PHONE = '+44 20 7946 0000';
 
     /**
+     * The SECOND number one admin order can carry: Plugin\Admin\OrderSave verifies the telephone
+     * on the billing address and on the shipping address, so a single submission writes two
+     * entries to the phone store before anything can be resubmitted.
+     */
+    private const SECOND_PHONE = '+44 20 7946 0999';
+
+    /**
      * The rest of what an admin order-create POST carries, and what used to be copied into the
      * session with it: the two contact stores hold only an email address and a phone number, but
      * the attribute this module wrote on a rejected submission held the entire form.
@@ -228,6 +235,68 @@ class AdminContactStoresTest extends TestCase
 
         $this->assertEveryEntryIsADigest($harness, self::VERIFIED_EMAIL_SESSION_KEY);
         $this->assertEveryEntryIsADigest($harness, self::VERIFIED_PHONE_SESSION_KEY);
+    }
+
+    /**
+     * An order carrying TWO rejected phone numbers can actually be submitted again - which is
+     * what the bound has to leave room for, and what a bound of 1 or 2 quietly takes away.
+     *
+     * WHY THIS IS A BEHAVIOURAL TEST AND NOT AN ASSERTION ON THE CONSTANT. The store is a FIFO
+     * list, so "big enough" is not a property of the number on its own: it is a property of the
+     * number against what ONE submission writes. Plugin\Admin\OrderSave loops every address on
+     * the order, so a submission with a shipping and a billing telephone writes TWO entries
+     * before the operator can resubmit anything - and if the second write evicts the first, the
+     * resubmission warns about the number the first write was supposed to have remembered, the
+     * next one warns about the other, and with prevent_submit off (the shipped default) the
+     * order can never be placed at all. Nothing on the page tells the operator why. This test
+     * fails on any limit that cannot hold one submission; the floor asserted in
+     * AbstractPluginContactStoresTest names it as the reason it exists.
+     */
+    public function testBothPhoneNumbersOnOneOrderSurviveTheSameSubmission(): void
+    {
+        $harness = $this->createAdminSession(false);
+        $order = $this->orderSave($harness);
+        $request = $this->postValue([
+            'order' => [
+                'billing_address' => ['telephone' => self::PHONE, 'country_id' => 'GB'],
+                'shipping_address' => ['telephone' => self::SECOND_PHONE, 'country_id' => 'GB'],
+                'account' => ['email' => self::EMAIL],
+            ],
+        ]);
+
+        $rejected = $order->aroundExecute($request, static fn () => 'order saved');
+
+        $this->assertNotSame(
+            'order saved',
+            $rejected,
+            'Fixture guard: Loqate rejects both numbers, so the first submission must be refused - that is the '
+            . 'submission whose warnings the second one is allowed to proceed on.'
+        );
+        $this->assertSame(
+            [self::PHONE, self::SECOND_PHONE],
+            iterator_to_array($harness['phoneRequests']),
+            'Fixture guard: ONE submission must have verified BOTH numbers, which is what fills two slots of '
+            . 'the store in a single pass and is the whole premise of this test.'
+        );
+
+        // The operator submits the identical order again, which is exactly what the warning
+        // "Submit again to use this phone number" instructs them to do.
+        $accepted = $order->aroundExecute($request, static fn () => 'order saved');
+
+        $this->assertSame(
+            'order saved',
+            $accepted,
+            'The resubmission must go through. Both numbers were warned about on the first pass, so both must '
+            . 'still be remembered on the second - if the store cannot hold one submission\'s worth of values, '
+            . 'each pass evicts the entry the next one needs and the operator is warned forever about an order '
+            . 'they have already confirmed, with no way to place it and nothing on the page to correct.'
+        );
+        $this->assertCount(
+            2,
+            $harness['phoneRequests'],
+            'And neither number may be re-verified on that second pass: the whole submission was already paid '
+            . 'for once.'
+        );
     }
 
     /**

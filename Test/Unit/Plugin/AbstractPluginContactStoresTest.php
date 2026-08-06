@@ -3,7 +3,6 @@
 namespace Loqate\ApiIntegration\Test\Unit\Plugin;
 
 use ArrayObject;
-use Loqate\ApiIntegration\Helper\Controller;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
 use Loqate\ApiIntegration\Helper\Validator;
@@ -56,15 +55,38 @@ class AbstractPluginContactStoresTest extends TestCase
     /**
      * The largest number of contact digests per store this module could defend keeping.
      *
-     * Tied to Helper\Controller::CAPTURED_ADDRESSES_LIMIT rather than invented: that is the
-     * bound on the OTHER store a shopper fills interactively, and
+     * 50, which is Helper\Controller::CAPTURED_ADDRESSES_LIMIT's shipped value - the bound on
+     * the OTHER store a shopper fills interactively - because
      * ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT's own docblock says it is deliberately
-     * SMALLER than its siblings, because no import writes these two lists and one interactive
-     * checkout presents one email address and at most two phone numbers. Asserted as "no
-     * larger than" rather than as the exact figure, so tuning 25 up or down within what a
-     * session can carry is not a test failure while abandoning the bound is.
+     * SMALLER than its siblings: no import writes these two lists, and one interactive checkout
+     * presents one email address and at most two phone numbers. Asserted as "no larger than"
+     * rather than as the exact figure, so tuning 25 up or down within what a session can carry
+     * is not a test failure while abandoning the bound is.
+     *
+     * A LITERAL RATHER THAN THAT CONSTANT, deliberately. Deriving the ceiling from a sibling
+     * constant means raising the SIBLING silently relaxes this one, and the two are not the same
+     * decision: the captured-address store holds addresses a shopper picked from a lookup, these
+     * hold digests of contact details. A ceiling that moves when something else moves is not a
+     * ceiling. If Controller::CAPTURED_ADDRESSES_LIMIT and this figure should stay equal, that is
+     * an argument for saying so here in prose - which this does - rather than for coupling them.
      */
-    private const LARGEST_DEFENSIBLE_CONTACT_LIMIT = Controller::CAPTURED_ADDRESSES_LIMIT;
+    private const LARGEST_DEFENSIBLE_CONTACT_LIMIT = 50;
+
+    /**
+     * The fewest contact digests per store this module can actually function on.
+     *
+     * NOT DECORATION, AND NOT AN ARBITRARY FLOOR: below this the "warned once, submit again"
+     * contract stops terminating, and it does so silently. ONE SUBMISSION CAN CARRY TWO DISTINCT
+     * PHONE NUMBERS - Plugin\Admin\OrderSave loops every address on the order, and a checkout
+     * writes the shipping number from Plugin\Frontend\CheckoutShippingInformation and the billing
+     * one from CheckoutBillingAddress - so with a limit of 2 the store is exactly full after one
+     * pass, and the moment a THIRD value is alive in the session (a corrected number, a second
+     * order) each submission evicts the entry the next one needs. With both prevent_submit
+     * toggles off, which is the shipped default, that is not a re-verify: the shopper is warned
+     * about a value they have already resubmitted, every time, and can never get through. 3 is
+     * the smallest figure that survives one correction; the shipped value is 25.
+     */
+    private const SMALLEST_WORKABLE_CONTACT_LIMIT = 3;
 
     /**
      * Characters one stored digest occupies: hash_hmac('sha256', ...) in lowercase hex.
@@ -350,6 +372,14 @@ class AbstractPluginContactStoresTest extends TestCase
      * covered by the same rule for the same reason - a protected ShopperScopedSessionStores
      * would hand all seven enrolled stores to ten subclasses, which is wider than any of them
      * needs and wider than the named accessors this class exposes.
+     *
+     * AND THE SAME RULE OVER METHODS, which is the half a property-only check misses. A
+     * `protected function session(): Session` on AbstractPlugin re-opens the hole exactly as a
+     * protected property does - the ten subclasses get the raw session back - while leaving
+     * every property private and this test green. That is the same class of miss as the
+     * survivor LOQ-17149 was written to remove, so it is closed here rather than left to be
+     * found again: no non-private member of the class, of either kind, may hand out a Session
+     * or a ShopperScopedSessionStores.
      */
     public function testNoPluginCanReachAShopperScopedStoreWithoutTheOwnershipGuard(): void
     {
@@ -384,13 +414,76 @@ class AbstractPluginContactStoresTest extends TestCase
             );
         }
 
-        $this->assertSame(
+        $this->assertEqualsCanonicalizing(
             ['session', 'seam'],
             array_values(array_unique($found)),
             'Fixture guard: the plugin must really hold both a raw customer session and a '
             . 'ShopperScopedSessionStores, or the visibility assertions above passed over an empty list and '
-            . 'proved nothing.'
+            . 'proved nothing. Canonicalizing because declaredProperties() walks in DECLARATION order, and '
+            . 'swapping the two property declarations on AbstractPlugin is not a defect - failing here for '
+            . 'that would report a hole in the guard that does not exist.'
         );
+
+        $this->assertSame(
+            [],
+            $this->membersHandingOutTheSession($harness['plugin']),
+            'A non-private METHOD that hands out the raw session or the seam is the same hole as a non-private '
+            . 'property, and it is the half a check over properties alone does not see: ten plugins extend this '
+            . 'class, so any of them could then reach the contact bypass lists, the pending email address or '
+            . 'the billing-error gate with no flush, no bound and no hashing. Expose a NARROW named accessor '
+            . 'for the one thing the subclass needs instead, the way shouldVerify() and pendingEmailAddress() '
+            . 'do.'
+        );
+    }
+
+    /**
+     * Every non-private method of a plugin that hands a caller the raw session or the seam.
+     *
+     * TWO WAYS OF LOOKING, because either alone leaves the hole open. A declared return type is
+     * read from reflection, which catches `protected function session(): Session` without
+     * running anything. An UNTYPED accessor - the same method with the type in a docblock, which
+     * is this module's prevailing style - is caught by actually calling every non-private method
+     * that needs no arguments and looking at what comes back. Anything that throws is skipped:
+     * it did not return a session.
+     *
+     * @param object $plugin Built through the real constructor, so the values are production's.
+     * @return string[] One sentence per offender, empty when there are none.
+     */
+    private function membersHandingOutTheSession(object $plugin): array
+    {
+        $exposed = [];
+        for ($class = new ReflectionClass($plugin); $class !== false; $class = $class->getParentClass()) {
+            foreach ($class->getMethods() as $method) {
+                if ($method->isPrivate() || $method->isStatic() || $method->isConstructor()) {
+                    continue;
+                }
+
+                $label = sprintf('%s::%s()', $method->getDeclaringClass()->getShortName(), $method->getName());
+                $returns = $method->getReturnType();
+                if ($returns instanceof \ReflectionNamedType
+                    && in_array($returns->getName(), [Session::class, ShopperScopedSessionStores::class], true)
+                ) {
+                    $exposed[$label] = sprintf('%s declares it returns %s', $label, $returns->getName());
+                    continue;
+                }
+
+                if ($method->getNumberOfParameters() > 0) {
+                    continue;
+                }
+
+                try {
+                    $value = $method->invoke($plugin);
+                } catch (\Throwable $exception) {
+                    continue;
+                }
+
+                if (is_a($value, Session::class) || $value instanceof ShopperScopedSessionStores) {
+                    $exposed[$label] = sprintf('%s returned a %s', $label, get_class($value));
+                }
+            }
+        }
+
+        return array_values($exposed);
     }
 
     /**
@@ -807,10 +900,20 @@ class AbstractPluginContactStoresTest extends TestCase
 
         $limit = (int)$reflection->getConstant('VERIFIED_CONTACT_LIMIT');
         $this->assertGreaterThanOrEqual(
-            1,
+            self::SMALLEST_WORKABLE_CONTACT_LIMIT,
             $limit,
-            'ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT must leave room for at least one entry, or the '
-            . 'two stores can never remember anything and every resubmission is billed and warned about again.'
+            sprintf(
+                'ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT is %d, and below %d this module stops '
+                . 'terminating rather than merely losing a saving. One submission can carry a SHIPPING and a '
+                . 'BILLING phone number, so at 2 the store is full after a single pass and any third value '
+                . 'alive in the session makes each submission evict the entry the next one needs - and with '
+                . 'prevent_submit off (the shipped default) the shopper is then warned about a value they have '
+                . 'already resubmitted, forever, with nothing on the page to correct. See '
+                . 'testBothPhoneNumbersOnOneOrderSurviveTheSameSubmission() in the adminhtml contact-store '
+                . 'tests for the behaviour this floor protects.',
+                $limit,
+                self::SMALLEST_WORKABLE_CONTACT_LIMIT
+            )
         );
         $this->assertLessThanOrEqual(
             self::LARGEST_DEFENSIBLE_CONTACT_LIMIT,
