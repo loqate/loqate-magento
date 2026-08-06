@@ -290,8 +290,8 @@ class Validator
     private array $runScopedBatchVerdicts = [];
 
     /**
-     * The ShopperScopedAddressStores generation self::$runScopedBatchVerdicts was earned under,
-     * or null before this instance has asked (LOQ-17148, LOQ-16978).
+     * The ShopperScopedAddressStores ownership epoch self::$runScopedBatchVerdicts was earned
+     * under, or null before this instance has asked (LOQ-17148, LOQ-16978).
      *
      * The map holds the same kind of data as the session verdict stores - licences to skip a
      * billable verify - so it must have the same OWNERSHIP lifetime, not merely the same
@@ -301,6 +301,10 @@ class Validator
      * map is enrolled in the guard's own ownership model rather than checked ad hoc at the call
      * site: see ShopperScopedAddressStores::ownershipGeneration() and
      * discardRunScopedVerdictsIfShopperChanged().
+     *
+     * STARTS AT NULL, WHICH IS NOT AN EPOCH, and that is deliberate: the guard's counter is an
+     * int from its very first answer, so "I have not asked yet" has to be a value it can never
+     * report, or an instance that had never looked would compare equal to an epoch it never saw.
      *
      * @var int|null
      */
@@ -1842,8 +1846,14 @@ class Validator
     }
 
     /**
-     * Discard this run's remembered verdicts if the shopper-scoped stores have been flushed
-     * since they were earned (LOQ-17148, LOQ-16978).
+     * Discard this run's remembered verdicts unless the shopper-scoped stores have demonstrably
+     * belonged to one identity ever since they were earned (LOQ-17148, LOQ-16978).
+     *
+     * NOTE THE POLARITY, because it is the safe one and it is easy to invert by accident: the
+     * map is KEPT only on a positive answer from the guard - an unmoved ownership epoch - and
+     * discarded in every other case, including the ones that flushed nothing. See
+     * ShopperScopedAddressStores::ownershipGeneration() for what the epoch counts and why an
+     * adoption (no marker recorded, so nothing to flush) advances it just as a flush does.
      *
      * The map is verdict data, so it has the OWNERSHIP lifetime of the session verdict stores
      * and not merely the request's: one Validator can outlive a mid-request identity change,
@@ -1869,9 +1879,10 @@ class Validator
             return;
         }
 
-        // Either the first lookup of this instance (nothing to discard) or a genuine flush.
-        // Both are answered by starting from empty, which is why no special case is needed for
-        // the null the property starts out holding.
+        // The first lookup of this instance (nothing to discard), or ownership re-established
+        // since the last one - a flush, or an adoption after the session storage was emptied
+        // under us. All are answered by starting from empty, which is why no special case is
+        // needed for the null the property starts out holding.
         $this->runScopedBatchVerdicts = [];
         $this->runScopedVerdictsGeneration = $generation;
     }
