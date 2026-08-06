@@ -221,8 +221,7 @@ class Validator
      *    identities, the leak LOQ-16978 exists to close, through a store
      *    ShopperScopedSessionStores cannot see. Doing it safely needs an identity in the key, a
      *    tag and lifetime policy, and a decision on whether an address verdict may live outside
-     *    the session at all. Its own ticket, tracked separately - record the id here when it is
-     *    raised.
+     *    the session at all. Its own ticket, tracked separately as LOQ-17197.
      *
      * RESIDUAL EXPOSURE, stated plainly rather than left to be rediscovered from an invoice.
      * CROSS-RUN dedupe is not delivered for a file with more than this many distinct addresses:

@@ -281,7 +281,7 @@ predate it and are described by their git tags and commit history.
   using the same cache backend, which is the bypass-across-identities leak LOQ-16978
   was raised to close. Doing it safely needs an identity in the key, a cache tag and
   lifetime policy, and a decision on whether an address verdict may live outside the
-  session at all. That is its own ticket, raised separately — record its id here.
+  session at all. That is its own ticket, raised separately as **LOQ-17197**.
 - The same address repeated **within the chunk in which it first appears** is billed
   once per copy: nothing is remembered until the response returns, so every copy in
   that chunk misses and every copy is sent. The bound is therefore the **chunk size**
