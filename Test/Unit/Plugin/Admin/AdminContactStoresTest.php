@@ -239,7 +239,7 @@ class AdminContactStoresTest extends TestCase
 
     /**
      * An order carrying TWO rejected phone numbers can actually be submitted again - which is
-     * what the bound has to leave room for, and what a bound of 1 or 2 quietly takes away.
+     * what the bound has to leave room for, and what a bound of 1 quietly takes away.
      *
      * WHY THIS IS A BEHAVIOURAL TEST AND NOT AN ASSERTION ON THE CONSTANT. The store is a FIFO
      * list, so "big enough" is not a property of the number on its own: it is a property of the
@@ -248,9 +248,10 @@ class AdminContactStoresTest extends TestCase
      * before the operator can resubmit anything - and if the second write evicts the first, the
      * resubmission warns about the number the first write was supposed to have remembered, the
      * next one warns about the other, and with prevent_submit off (the shipped default) the
-     * order can never be placed at all. Nothing on the page tells the operator why. This test
-     * fails on any limit that cannot hold one submission; the floor asserted in
-     * AbstractPluginContactStoresTest names it as the reason it exists.
+     * order can never be placed at all. Nothing on the page tells the operator why. Eviction is
+     * evict-then-append, so one submission's own values are always the newest entries and a limit
+     * of exactly 2 still holds them: this test therefore goes red at 1, and the floor asserted in
+     * AbstractPluginContactStoresTest is that demonstrated 2 plus a margin of one.
      */
     public function testBothPhoneNumbersOnOneOrderSurviveTheSameSubmission(): void
     {

@@ -81,12 +81,21 @@ class AbstractPluginContactStoresTest extends TestCase
      * contract stops terminating, and it does so silently. ONE SUBMISSION CAN CARRY TWO DISTINCT
      * PHONE NUMBERS - Plugin\Admin\OrderSave loops every address on the order, and a checkout
      * writes the shipping number from Plugin\Frontend\CheckoutShippingInformation and the billing
-     * one from CheckoutBillingAddress - so with a limit of 2 the store is exactly full after one
-     * pass, and the moment a THIRD value is alive in the session (a corrected number, a second
-     * order) each submission evicts the entry the next one needs. With both prevent_submit
-     * toggles off, which is the shipped default, that is not a re-verify: the shopper is warned
-     * about a value they have already resubmitted, every time, and can never get through. 3 is
-     * the smallest figure that survives one correction; the shipped value is 25.
+     * one from CheckoutBillingAddress - so a limit that cannot hold BOTH of them at once means
+     * each pass evicts the entry the next pass needs. With both prevent_submit toggles off,
+     * which is the shipped default, that is not a re-verify: the operator is warned about a value
+     * they have already resubmitted, every time, and can never place the order at all, with
+     * nothing on the page to correct. That is what
+     * AdminContactStoresTest::testBothPhoneNumbersOnOneOrderSurviveTheSameSubmission() drives.
+     *
+     * WHAT THAT TEST ACTUALLY DEMONSTRATES IS A FLOOR OF 2, NOT OF 3, and this figure is stated
+     * as a MARGIN OF ONE over it rather than as a scenario. Eviction is evict-then-append
+     * (AbstractPlugin::shouldVerify()), so the values of the submission being written are
+     * always the newest entries and a two-value submission survives at a limit of exactly 2; that
+     * test therefore goes red at 1. 3 buys one slot beyond the largest single submission, which
+     * is what covers a value still alive in the session from an earlier pass (a corrected number,
+     * a previous order) - a sequence no test in this suite interleaves. The shipped value is 25,
+     * so the margin the module actually runs on is far wider than either figure.
      */
     private const SMALLEST_WORKABLE_CONTACT_LIMIT = 3;
 
