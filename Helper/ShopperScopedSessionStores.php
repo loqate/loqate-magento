@@ -880,9 +880,14 @@ class ShopperScopedSessionStores
      * be pointed at a store, so neither can acquire the guard's appearance.
      *
      * Every path lets it out, including the import, and the enumeration behind that claim grew
-     * with LOQ-17149 - it is now NINETEEN statements, the ten in Helper\Validator and two in
-     * Helper\Controller plus seven in Plugin\AbstractPlugin, Plugin\Frontend\PlaceOrder and
-     * PlaceOrderGuest. None of them sits inside a try. The module's only broad catches are
+     * with LOQ-17149. NINETEEN statements reach this assertion: the calls to getData(), setData()
+     * and contactDigest(), which are the only three methods that make it - isContactDigest() and
+     * the getIpCountry()/setIpCountry() pair do not. They break down as EIGHT in Helper\Validator,
+     * TWO in Helper\Controller, SEVEN in Plugin\AbstractPlugin, and ONE each in
+     * Plugin\Frontend\PlaceOrder and Plugin\Frontend\PlaceOrderGuest. None of them sits inside a
+     * try. Count them again if you change this: a breakdown that does not reconcile with its own
+     * total is worse than no breakdown, because it is the total the next reader checks.
+     * The module's only broad catches are
      * Plugin\ChangeAddressDefaultCountry's and Plugin\ChangeCheckoutDefaultCountry's, which
      * enclose the CountryFactory lookup and start AFTER those classes' getIpCountry() /
      * setIpCountry() calls (and those two accessors do not reach this assertion in any case);

@@ -118,7 +118,7 @@ class ValidateImportAddress extends AbstractPlugin
                 }
             } catch (\InvalidArgumentException $exception) {
                 // Deliberately NOT swallowed. The \InvalidArgumentException this is FOR is
-                // ShopperScopedAddressStores::assertEnrolled() reporting that a session store
+                // ShopperScopedSessionStores::assertEnrolled() reporting that a session store
                 // was reached without being enrolled in the shopper-ownership flush - a
                 // programming error a developer has to fix, not a runtime failure to absorb.
                 // It is not provably the only source; see the third paragraph.
