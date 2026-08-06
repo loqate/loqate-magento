@@ -28,9 +28,25 @@ predate it and are described by their git tags and commit history.
   accepting all of them.** The threshold is compared as a string, so any value
   sorting above `E` — a lowercase `c`, a `C+`, or any stray text — previously passed
   every address on the batch paths, including the worst grade Loqate returns. Valid
-  values are `A` to `E`; anything else is refused and logged. The setting has no
-  admin field, so this only affects installs that wrote it via a data patch,
-  `config:set`, or direct SQL.
+  values are `A` to `E`; anything else is refused and logged. Only installs that
+  wrote the value via a data patch, `config:set` or direct SQL can be affected — the
+  new admin field below cannot produce such a value.
+
+- **"Minimum Address Quality Index" is now configurable in the admin**, under
+  Stores → Configuration → Loqate → Address Verification - General (LOQ-17148). It
+  was previously reachable only through the shipped default, a data patch or
+  `bin/magento config:set`. It is a select over `A`–`E` ("Excellent" to "Bad"), whose
+  options are derived from the verifier's own accepted list so the two cannot drift,
+  and it is shown at **default scope only**: the setting is read by admin order create
+  and customer import, and neither names the store view of the order or the customers
+  it is judging — so a website or store-view override could not be relied on to be the
+  value applied, and offering one would be a knob whose effect the form could not
+  predict.
+
+  **The shipped default is unchanged (`A`, "Excellent") and no install's behaviour
+  changes on upgrade.** Loosening the threshold accepts addresses that were
+  previously rejected, so it is a deliberate merchant decision and not a default this
+  release makes for anybody.
 
 - **No change to which import rows are rejected.** `checkQualityIndex()` now
   distinguishes "readable quality index that misses the threshold" from "quality

@@ -63,6 +63,48 @@
                     <label>Enable on Customer Import (ADMIN)</label>
                     <source_model>Magento\Config\Model\Config\Source\Yesno</source_model>
                 </field>
+                <!--
+                    LOQ-17148: the Address Quality Index threshold, exposed here for the first
+                    time. It was previously reachable only through etc/config.xml's default, a
+                    data patch or bin/magento config:set, while the verifier compares it as a
+                    STRING - so a value sorting above "E" accepted every address and one below
+                    "A" rejected every address, either of them set (and only discoverable) by
+                    whoever knew the config path. A SELECT over the module's own source model,
+                    whose values are derived from Helper\Validator::VALID_QUALITY_INDEXES, is
+                    what stops what the merchant is OFFERED drifting from what the verifier
+                    ACCEPTS.
+
+                    DEFAULT SCOPE ONLY (showInWebsite="0" showInStore="0"), matching the three
+                    ADMIN toggles above rather than the 1/1/1 of the AVC thresholds below, and
+                    this is a deliberate choice rather than a copied line.
+
+                    Both callers of Validator::checkQualityIndex() are adminhtml plugins -
+                    Plugin\Admin\OrderSave (admin order create) and
+                    Plugin\Admin\ValidateImportAddress (customer import) - and BOTH read the
+                    threshold through Helper\Data::getConfigValue(), which is a SCOPE_STORE read
+                    with NO STORE NAMED. Neither names the store view of the order it is judging
+                    or of the customers being imported; OrderSave has the order in hand and still
+                    does not. So whatever store the admin area resolves as current is what
+                    decides the value - see Helper\Data::getConfigValueForStore(), which exists
+                    precisely because a per-store-view override is invisible to getConfigValue()
+                    from the admin. Offering a per-website or per-store-view override here would
+                    therefore be a knob that either does nothing or silently applies to a
+                    different store view than the merchant set it against, which is the same
+                    class of defect - a setting whose effect cannot be predicted from the form -
+                    that this ticket closes.
+
+                    (Validator::buildBatchVerifyCacheKey() still namespaces cached verdicts per
+                    store view. That is because getConfigValue() is a SCOPE_STORE read in general
+                    and one browser session can span store views, NOT a claim that this field is
+                    per-view. If the AQI is ever judged on a frontend path, or if these plugins
+                    are ever changed to name their store, widen this field then - the cache key
+                    already accommodates it.)
+                -->
+                <field id="address_quality_index" translate="label" type="select" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Minimum Address Quality Index</label>
+                    <source_model>Loqate\ApiIntegration\Model\Config\Source\AddressQualityIndex</source_model>
+                    <comment>The poorest address quality Loqate may report for an address to be accepted on the ADMIN batch paths - Create Order (Admin) and Customer Import (Admin). An address graded worse than this is reported as invalid, and on an import that blocks the file. "Excellent" is the strictest setting and the one shipped by default, so loosening it accepts addresses that were previously rejected. Checkout and the customer account are judged against the AVC thresholds below instead, not against this setting.</comment>
+                </field>
             </group>
             <group id="verify_threshold_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">
                 <label>Address Verification - Thresholds</label>
