@@ -14,10 +14,11 @@ use Magento\Framework\Data\OptionSourceInterface;
  * configured threshold to be in - and only the LABELS live here. This class used to spell A-E
  * out itself, which was a second copy of that list, free to drift in either direction, and both
  * directions are merchant-facing defects:
- *  - a value offered here that the verifier does not accept makes checkQualityIndex() refuse to
- *    judge at all, so EVERY address is rejected. The merchant sets a quality bar, watches every
- *    import row come back "Invalid address at row #N", and finds nothing anywhere saying the
- *    value they just chose was the problem;
+ *  - a value offered here that the verifier does not accept makes Validator::
+ *    readableQualityIndexThreshold() refuse to judge at all, so EVERY address is rejected. The
+ *    merchant sets a quality bar and watches every import row come back "Invalid address at row
+ *    #N", with only a log line - which merchants do not read - saying the value they chose was
+ *    the problem;
  *  - a value the verifier accepts but this class does not offer is a threshold only a data
  *    patch, direct SQL or bin/magento config:set can select - which is the state the setting
  *    was in before LOQ-17148, when etc/adminhtml/system.xml exposed no field for it.
@@ -66,7 +67,12 @@ class AddressQualityIndex implements OptionSourceInterface
     }
 
     /**
-     * Get options in "key-value" format
+     * Get options as a LIST of single-entry [grade => label] maps.
+     *
+     * NOT a grade-keyed lookup, despite the name Magento's own source models give this method:
+     * the outer array is a 0..N-1 list, so toArray()[$grade] finds nothing. The shape is
+     * deliberately identical to the module's sibling sources (Model\Config\Source\*), because
+     * anything that iterates them iterates this one too; do not "fix" it here alone.
      *
      * @return array<int, array<string, \Magento\Framework\Phrase>>
      */

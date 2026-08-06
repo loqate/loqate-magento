@@ -48,12 +48,23 @@ predate it and are described by their git tags and commit history.
   previously rejected, so it is a deliberate merchant decision and not a default this
   release makes for anybody.
 
+  **If you already set this path at website or store-view scope** (`bin/magento
+  config:set --scope=stores …`, a data patch or direct SQL), that row stays in effect
+  and keeps overriding the default for the scope it was written for — the new field is
+  default-scope only, so it can neither display nor clear it. Remove it with
+  `bin/magento config:set --scope=stores --scope-code=<code> …` set back to the value
+  you want, or by deleting the `core_config_data` row, and then set the value here.
+
 - **No change to which import rows are rejected.** `checkQualityIndex()` now
   distinguishes "readable quality index that misses the threshold" from "quality
   index or threshold that could not be read", because the first is a verdict worth
-  remembering and the second is a fault report. Both still reject the row, an
-  unreadable threshold still rejects every row including grade `E`, and it is still
-  logged every time.
+  remembering and the second is a fault report. Both still reject the row, and an
+  unreadable threshold still rejects every row including grade `E`. What did change is
+  the logging: the "not a recognised quality index" line is now emitted once per
+  verified batch, from the pre-flight check described under Fixed, instead of once per
+  verdict — and it is emitted for files that produced none of it before, because the
+  old check was reached only after a readable quality index had been found in the
+  response.
 
 - **A customer import can now fail where it previously continued silently.** The
   import plugin used to absorb every exception and hand back an untouched result,
@@ -76,13 +87,22 @@ predate it and are described by their git tags and commit history.
   single request, and the session cache holds passing verdicts only — so a REJECTED
   address was re-sent, and re-billed, in every chunk it appeared in, which on a
   default install (strictest threshold) is most of a file. Verdicts of both polarities
-  are now remembered for the length of the run, so every repeated address costs one
-  billed address however often it appears and however large the file: **29% fewer
-  billed addresses on a 1000-row file holding 700 distinct addresses, 58.8% on 1000
-  rows holding 400.** The run-scoped memory is never persisted — a rejection never
-  outlives the request, so correcting the file or loosening the threshold always
-  re-verifies — and a quality index or threshold that could not be READ is remembered
-  nowhere, so one connector fault cannot mark every matching row invalid.
+  are now remembered for the length of the run, so **an address repeated in a LATER
+  chunk of the same run costs nothing**, however large the file. Measured on the
+  branch's own acceptance fixture (260 rows, 210 distinct addresses, repeats across
+  chunk boundaries): **19.2% fewer billed addresses**. Two documented cases are not
+  covered and are listed under Known limitations below — copies of an address WITHIN
+  the chunk it first appears in, and a row whose quality index could not be read. The
+  run-scoped memory is never persisted — a rejection never outlives the request, so
+  correcting the file or loosening the threshold always re-verifies.
+- A customer import no longer pays for a verification whose answer is already
+  decided (LOQ-17148). When "Minimum Address Quality Index" holds a value that is not
+  a grade, every row is rejected whatever Loqate answers — so the threshold is now
+  checked BEFORE the request is assembled, every row is rejected without one being
+  made, and the "not a recognised quality index" line is logged once per batch. It
+  previously billed the whole file, on every Check Data click, for an answer that
+  could not change the outcome, and logged nothing at all when the responses were
+  themselves unreadable.
 - Multi-address verification results were collapsed onto the first row, so one
   address's verdict could be reported against another's (LOQ-16977).
 - A cached verify success could be replayed for a region that was never verified
@@ -102,10 +122,10 @@ predate it and are described by their git tags and commit history.
   holds 200 entries and evicts oldest-first, so a second Check Data click or a second
   import of a larger file re-bills essentially every row: a sequential scan through a
   smaller FIFO cache has a ~0% hit rate. For a programmatic, CLI or cron-driven import
-  it is 0% **by construction** — each process starts a fresh session, so nothing one
-  run writes is ever found by the next.
+  it is 0% — each process starts a fresh session, so nothing one run writes is ever
+  found by the next, and no cache *size* changes that.
 
-  Three apparent fixes were measured and rejected, so they are not quietly retried.
+  Four apparent fixes were considered and rejected, so they are not quietly retried.
   *Caching failures in the session store* is a regression on the target workload: at a
   5% pass rate it takes a second run from 950 billed addresses to 1000 (1000 distinct
   rows) and from 475 to 500 (500 rows), because failures crowd out the sparse passes
@@ -115,14 +135,36 @@ predate it and are described by their git tags and commit history.
   file* costs ~147 bytes per entry (~141 KB at 1000 entries, ~712 KB at 5000), and
   Magento reads and writes the whole session on every request — ~1.4 MB of session I/O
   on every unrelated admin page load, ~278 MB over 200 page loads, for a re-run that
-  may never happen.
-- The same address repeated **within one 100-row chunk** is still billed twice on that
-  address's first appearance in the run: nothing is remembered until the response
-  returns, so both copies miss. Every later appearance — in that chunk or any other —
-  is answered from memory, so the cost is bounded at one duplicate charge per distinct
-  address per run rather than one per occurrence. Tracked as LOQ-17015, separately from
-  LOQ-17148 and **not resolved by it**, because collapsing duplicates changes the
-  payload row arithmetic and has to be done together with the response-row-count guard.
+  may never happen. Those three are all session-store variants and none of them moves
+  the CLI/cron figure at all; the one option that would is a **non-session store**
+  (`Magento\Framework\App\CacheInterface`, keyed on the threshold- and
+  store-view-namespaced hash the module already builds). It is rejected here rather
+  than overlooked, and the risk being declined is stated plainly: a verdict held
+  outside the session is not shopper-specific, so it can be read and replayed for
+  another shopper, another admin user, or — on shared infrastructure — another install
+  using the same cache backend, which is the bypass-across-identities leak LOQ-16978
+  was raised to close. Doing it safely needs an identity in the key, a cache tag and
+  lifetime policy, and a decision on whether an address verdict may live outside the
+  session at all. That is its own ticket, raised separately — record its id here.
+- The same address repeated **within the chunk in which it first appears** is billed
+  once per copy: nothing is remembered until the response returns, so every copy in
+  that chunk misses and every copy is sent. The bound is therefore the **chunk size**
+  — 100 identical rows in one chunk cost 100 billed addresses — not one duplicate
+  charge per address. Every appearance in a LATER chunk is free. Tracked as LOQ-17015,
+  separately from LOQ-17148 and **not resolved by it**, because collapsing duplicates
+  changes the payload row arithmetic and has to be done together with the
+  response-row-count guard.
+- A row whose **quality index could not be read** is rejected and remembered nowhere,
+  so it is billed again on every occurrence, for the whole run and every run after it.
+  `'Matches' => []` is Loqate's ordinary answer for an address it cannot match, so on a
+  poorly-matching file that is most of the file. Deliberate: remembering it would let
+  one connector fault or one bad credential mark every matching row invalid for the
+  rest of the run, sending the merchant to correct rows Loqate never rejected.
+- Rows whose address columns are **empty or unusable** produce no identifiable
+  signature, and are deduplicated by neither memory — every occurrence is sent and
+  billed, with no bound. The alternative is worse: one shared key would file every
+  unidentifiable address under the same entry and replay one row's verdict for all of
+  them.
 - `loqate_email`, `loqate_phone`, `loqate_email_to_validate` and
   `loqate_billing_errors` are still unbounded session stores and are not covered by
   the shopper-change flush (LOQ-17149).

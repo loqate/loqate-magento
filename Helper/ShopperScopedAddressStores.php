@@ -70,12 +70,11 @@ use Magento\Customer\Model\Session;
  *    time;
  *  - a session storage that is EMPTIED mid-flight, which erases the marker along with the
  *    stores it describes (Magento\Framework\Session\SessionManager::clearStorage(), the
- *    destroy() inside Magento\Customer\Model\Session::logout(), or another module doing
- *    either). Nothing about that is bounded to a release: it is reachable at any time, and
- *    the identity may well have changed in the same breath. For the three SESSION stores it
- *    is harmless - they were emptied too, so there is nothing left to hand over - but for
- *    data DERIVED from them and held elsewhere it is not, which is why adoption counts as a
- *    new ownership epoch; see enforceOwnership() and ownershipGeneration().
+ *    destroy() inside Magento\Customer\Model\Session::logout(), or another module). That is
+ *    not bounded to a release: it is reachable at any time and the identity may have changed
+ *    in the same breath. Harmless for the three SESSION stores, which were emptied too, but
+ *    NOT for data DERIVED from them and held elsewhere - which is why adoption opens a new
+ *    ownership epoch; see enforceOwnership() and ownershipGeneration().
  *
  * ACCEPTED LIMITS, stated (the style of Validator::verifyMultipleAddresses()):
  *  - THE GUARD SCOPES BY CUSTOMER IDENTITY ONLY. The marker tracks
@@ -224,28 +223,19 @@ class ShopperScopedAddressStores
      * How many OWNERSHIP EPOCHS this instance has seen: the number of times ownership of the
      * stores has been established or re-established since it was constructed.
      *
-     * NOT A FLUSH COUNT, and the distinction is the whole point (LOQ-17148 mutation review).
-     * enforceOwnership() advances this whenever it WRITES the owner marker - on a flush, and
-     * equally on an ADOPTION, where the marker was absent and nothing was flushed. Both mean
-     * the same thing to a reader: the stores are now owned by an identity that is not
-     * demonstrably the one any previously derived data was earned under. Counting flushes only
-     * would miss the case where the session storage is emptied mid-request - see
-     * enforceOwnership() for the concrete mechanism - which erases the marker and so turns the
-     * NEXT identity change into an adoption that no flush is counted for.
+     * NOT A FLUSH COUNT, and the distinction is the whole point (LOQ-17148 mutation review):
+     * enforceOwnership() advances it whenever it WRITES the owner marker - on a flush, and
+     * equally on an ADOPTION, where the marker was absent and nothing was flushed. The contract
+     * a reader depends on is stated on ownershipGeneration(); the mechanism, and why adoption
+     * has to count, at the increment in enforceOwnership().
      *
-     * A COUNTER RATHER THAN A BOOLEAN, and per instance rather than per session: it is read
-     * by holders of data that is derived from these stores but does not live in them (see
-     * ownershipGeneration()), and such a holder has to be able to tell "same epoch as when I
-     * last looked" from "two epochs have passed since I last looked". A boolean cannot, and a
-     * flag that had to be cleared by its reader would be wrong the moment there were two
-     * readers. A counter also beats reporting the OWNER ID itself, which was the other
-     * candidate: an A -> B -> A cycle inside one request returns to the same id while the
-     * stores were genuinely flushed in between, so an id would say "unchanged" where the
-     * counter says "two epochs on".
+     * A COUNTER RATHER THAN A BOOLEAN OR AN OWNER ID: a reader has to tell "same epoch as when
+     * I last looked" from "two epochs have passed", a flag cleared by its reader would be wrong
+     * as soon as there were two readers, and an A -> B -> A cycle within one request returns to
+     * the same owner id while the stores were genuinely flushed in between.
      *
      * Not persisted anywhere, deliberately. It describes THIS request's view of the stores,
-     * which is the only lifetime the derived data it protects has; written to the session it
-     * would grow without bound and mean nothing to the next request.
+     * which is the only lifetime the derived data it protects has.
      */
     private int $ownershipGeneration = 0;
 
@@ -310,36 +300,26 @@ class ShopperScopedAddressStores
      * that licenses a caller to KEEP derived data.
      *
      * WHAT PROBLEM THIS SOLVES. Validator::verifyMultipleAddresses() remembers batch verdicts
-     * for the length of one import run in a plain map on the Validator instance, because a
-     * run chunks at 100 rows inside ONE request and the session store cannot serve it (it is
-     * bounded and holds passes only - see Validator::BATCH_VERIFY_CACHE_LIMIT). That map holds
-     * exactly the same kind of data as self::BATCH_VERIFY_CACHE_SESSION_KEY - licences to skip
-     * a billable verify - so it must have the same OWNERSHIP lifetime. A plain request-scoped
-     * map does not: one Validator can outlive a mid-request identity change (a login handled
-     * by the same PHP request), and the map would then answer the new shopper with the old
-     * shopper's verdicts while the three session stores beside it had just been flushed. That
-     * is precisely the hand-off this class exists to stop, arriving through a store this class
-     * could not see.
+     * for one import run in a plain map on the Validator instance, and that map holds the same
+     * kind of data as self::BATCH_VERIFY_CACHE_SESSION_KEY - licences to skip a billable verify
+     * - so it must have the same OWNERSHIP lifetime, which a plain request-scoped map does not
+     * give it. See Validator::$runScopedBatchVerdicts and
+     * Validator::discardRunScopedVerdictsIfShopperChanged() for that side of it.
      *
-     * WHY A GENERATION RATHER THAN A CALLBACK OR A FLUSH LIST. This class holds no reference
-     * to its holders and must not start holding one: it is constructed inside Controller's and
-     * Validator's constructors and reaching back into them would invert that dependency and
-     * make the flush order matter. A monotonic counter inverts the responsibility instead -
-     * the guard states a fact about the stores, and each holder decides what its own derived
-     * data means when that fact changes. It also composes: any number of holders can read it
-     * independently, and none of them can consume the signal from under another.
+     * WHY A GENERATION RATHER THAN A CALLBACK OR A FLUSH LIST. This class holds no reference to
+     * its holders and must not start holding one: it is constructed inside Controller's and
+     * Validator's constructors, so reaching back into them would invert that dependency and make
+     * the flush order matter. A counter inverts the responsibility instead - the guard states a
+     * fact, each holder decides what its own derived data means when that fact changes - and it
+     * composes, since no reader can consume the signal from under another.
      *
-     * ENFORCES OWNERSHIP ITSELF, and that is the load-bearing half. A caller that consulted
-     * its own map BEFORE touching any session attribute - which is exactly what the run map
-     * does on the import path, where the captured-address read is skipped - would otherwise
-     * read a generation from before the flush and serve a stale verdict on the first address
-     * of the request. Asking through this method makes the check happen at the moment the
-     * derived data is used, on the same terms as getData()/setData().
+     * ENFORCES OWNERSHIP ITSELF, and that is the load-bearing half. A caller that consulted its
+     * own map BEFORE touching any session attribute - exactly what the run map does on the import
+     * path, where the captured-address read is skipped - would otherwise read a generation from
+     * before the flush and serve a stale verdict on the first address of the request.
      *
-     * NO KEY, AND THEREFORE NO assertEnrolled() CALL. There is no attribute to enrol: this
-     * reports on the whole flush unit named by self::SHOPPER_SCOPED_SESSION_KEYS, all of
-     * which are flushed together. The assertion still governs every attribute reachable
-     * through this class, which is what it is for.
+     * NO KEY, AND THEREFORE NO assertEnrolled() CALL: there is no attribute to enrol, this
+     * reports on the whole flush unit named by self::SHOPPER_SCOPED_SESSION_KEYS.
      *
      * @return int The ownership epoch as of this call. Compare it against the value seen last
      *             time; ANY difference means ownership was re-established in between - by a
@@ -467,25 +447,17 @@ class ShopperScopedAddressStores
         // A NEW OWNERSHIP EPOCH, counted for the flush branch above AND for the adoption that
         // falls straight through to here, because both end with ownership being (re)established
         // by a write of the marker. Counting only the flush was a defect (LOQ-17148 mutation
-        // review), not a conservative choice: if anything EMPTIES the session storage
-        // mid-request - Magento\Framework\Session\SessionManager::clearStorage(), the
-        // destroy() inside Magento\Customer\Model\Session::logout(), or another module - the
-        // marker is erased along with the stores. The next access then finds no marker, so it
-        // is an ADOPTION rather than a flush; with the counter tied to the flush alone, a
-        // holder of derived data (see ownershipGeneration()) reads an unmoved generation and
-        // goes on serving the PREVIOUS identity's verdicts to the one that follows. Measured
-        // on the batch path as one billable call where two are owed - i.e. one shopper served
-        // a verdict earned under another identity, the exact hand-off this class exists to
-        // stop.
+        // review): anything that EMPTIES the session storage mid-request - clearStorage(), the
+        // destroy() inside Magento\Customer\Model\Session::logout(), another module - erases the
+        // marker along with the stores, so the next access is an ADOPTION rather than a flush,
+        // and a holder of derived data (see ownershipGeneration()) would read an unmoved
+        // generation and go on serving the PREVIOUS identity's verdicts to the one that follows.
+        // Measured on the batch path as one billable call where two are owed.
         //
-        // AND IT COSTS NOTHING IT SHOULD NOT. The worry it replaces was that bumping on
-        // adoption would discard valid derived data on the first access of every session. It
-        // cannot: a holder starts out having recorded NO generation at all, so its first
-        // lookup fails the comparison and resets whatever it has regardless of this counter -
-        // and what it has at that point is empty, because a holder cannot have derived
-        // anything from stores it has not read yet. The only case that pays is a storage wipe
-        // under an UNCHANGED identity, which re-earns some verdicts of the run in progress:
-        // billing, not correctness, and the same price the wiped session stores already pay.
+        // AND IT COSTS NOTHING IT SHOULD NOT: a holder that has recorded no generation yet resets
+        // regardless of this counter, and what it holds then is empty. The only case that pays is
+        // a storage wipe under an UNCHANGED identity, which re-earns some verdicts of the run in
+        // progress - billing, not correctness, and the price the wiped stores already pay.
         $this->ownershipGeneration++;
 
         $this->session->setData(self::SESSION_OWNER_KEY, $owner);
