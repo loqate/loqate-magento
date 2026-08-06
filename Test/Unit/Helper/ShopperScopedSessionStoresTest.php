@@ -1155,6 +1155,93 @@ class ShopperScopedSessionStoresTest extends TestCase
     }
 
     /**
+     * A digest earned with NO RESOLVABLE STORE VIEW can never be replayed as store view 0.
+     *
+     * resolveStoreScope() answers Helper\Data::getCurrentStore() when this class was given a
+     * Data, and its own marker - a character getCurrentStore() cannot return, since that method
+     * answers an int - when it was not. The second case is the whole subject here. The Data
+     * argument is OPTIONAL, precisely so Helper\Controller, Helper\Validator and the plugins
+     * that never compute a digest needed no constructor change in LOQ-17149, so "constructed
+     * without one" is a supported state and not a fault.
+     *
+     * WHY THE MARKER MUST NOT BE A STORE ID. getCurrentStore() already swallows
+     * NoSuchEntityException and degrades to 0, so 0 is the id an installation answers when it
+     * CANNOT resolve a store as well as the id of a real store view. If the no-Data branch
+     * degraded to '0' too, a digest computed by a holder that has no Data at all would collide
+     * with one computed under store view 0 - and the collision is in the UNSAFE direction: a
+     * "warned once, now allowed" decision earned under an unknown configuration would satisfy a
+     * lookup made under store view 0's API key and prevent_submit toggle. An unrecognised scope
+     * must cost a re-verify instead, which is the direction every other degradation in this
+     * class takes.
+     *
+     * WHY IT IS PINNED THOUGH NOTHING TRIPS IT TODAY. Only Plugin\AbstractPlugin computes
+     * digests and it always passes its Data, so the null branch is currently unreachable and
+     * changing the marker to '0' leaves the rest of the suite green - which is exactly what
+     * makes an untested safe-direction property worth an assertion rather than a paragraph. The
+     * optional argument exists so that a future holder need not pass a Data; on the day one
+     * takes that option, this is the test that says whether its digests are separated.
+     *
+     * The EQUALITY half is not decoration. Both guards are given the same well-formed salt, so
+     * the store scope is the only input that differs, and the two no-Data digests are asserted
+     * IDENTICAL first: without that, a resolveStoreScope() that returned something random would
+     * satisfy the inequality below while making every digest a permanent cache miss.
+     */
+    public function testADigestEarnedWithNoResolvableStoreViewCanNeverBeReplayedAsStoreViewZero(): void
+    {
+        $value = 'shopper.a@example.com';
+        $field = ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY;
+        // A well-formed salt planted in every session below, so all four digests are computed
+        // under ONE key and the only thing that can separate them is the store scope. Minted
+        // salts differ per session by design (see the test above), which would make any
+        // inequality here true for the wrong reason.
+        $salt = str_repeat('a1b2c3d4', 8);
+        $saltKey = self::readPrivateKeyConstant('CONTACT_DIGEST_SALT_KEY');
+
+        $noStore = $this->createGuard([$saltKey => $salt], 7, null)['guard']->contactDigest($field, $value);
+        $noStoreAgain = $this->createGuard([$saltKey => $salt], 7, null)['guard']->contactDigest($field, $value);
+        $storeZero = $this->createGuard([$saltKey => $salt], 7, 0)['guard']->contactDigest($field, $value);
+        $storeOne = $this->createGuard([$saltKey => $salt], 7, 1)['guard']->contactDigest($field, $value);
+
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $noStore,
+            'Fixture guard: a holder constructed WITHOUT a Helper\Data must still produce a digest. Refusing '
+            . 'to digest at all would be a different design - it would cost a billable verify on every '
+            . 'contact detail such a holder sees - and it would make the inequalities below hold between '
+            . 'empty strings.'
+        );
+        $this->assertSame(
+            $noStore,
+            $noStoreAgain,
+            'The no-store marker must be STABLE: two holders with no resolvable store view, one salt and one '
+            . 'value must agree, or the scope segment is not a namespace but noise, and the store that is '
+            . 'meant to be a cache would never hit.'
+        );
+        $this->assertNotSame(
+            $storeZero,
+            $noStore,
+            'A digest computed with NO resolvable store view must not equal one computed under store view 0. '
+            . 'Store 0 is what Helper\Data::getCurrentStore() answers when it cannot resolve a store at all, '
+            . 'so degrading the no-Data branch to \'0\' would merge "we do not know the scope" with a real '
+            . 'store view: a bypass earned under an unknown API key and prevent_submit toggle would then '
+            . 'satisfy a lookup made under store 0\'s. The marker must be a value getCurrentStore() cannot '
+            . 'return, so the two can never collide.'
+        );
+        $this->assertNotSame(
+            $storeOne,
+            $noStore,
+            'Nor under any other store view. The marker is not merely "not 0" - it is outside the range of '
+            . 'store ids entirely, so no installation can be configured into a collision with it.'
+        );
+        $this->assertNotSame(
+            $storeZero,
+            $storeOne,
+            'And the scope segment must genuinely separate two real store views, or the assertions above '
+            . 'would be pinning a marker that no store id is ever compared against.'
+        );
+    }
+
+    /**
      * The digest must be a FULL-LENGTH salted HMAC, not a truncated fingerprint and not a bare
      * hash of the value.
      *
