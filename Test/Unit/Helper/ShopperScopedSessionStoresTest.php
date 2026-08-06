@@ -10,6 +10,7 @@ use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Plugin\Frontend\PlaceOrder;
 use Loqate\ApiIntegration\Plugin\Frontend\PlaceOrderGuest;
+use Loqate\ApiIntegration\Test\Support\Csprng;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
@@ -1289,6 +1290,66 @@ class ShopperScopedSessionStoresTest extends TestCase
             'an empty array' => [[]],
             'an object' => [new stdClass()],
         ];
+    }
+
+    /**
+     * On a host with no usable CSPRNG, no email address or phone number is remembered AT ALL -
+     * rather than being remembered under a key that is not a secret.
+     *
+     * WHAT THE OTHER BRANCH WOULD LOOK LIKE, which is why this is worth forcing. hash_hmac()
+     * accepts an empty key perfectly happily and returns a well-formed 64-character digest, so
+     * an implementation that let a failed salt through would be indistinguishable from a working
+     * one by inspection - and every property the hashing exists for would be gone: the same
+     * address would digest IDENTICALLY in every session on every installation, which is exactly
+     * the global identifier for an email address the per-session salt removes, and it would be
+     * looked up in a precomputed table by anyone holding the session payload. Returning the
+     * "do not cache this" sentinel instead costs a billable verify and stores nothing, which is
+     * the fail-CLOSED direction: nothing is bypassed and nothing is retained.
+     *
+     * THE SALT ATTRIBUTE ASSERTION IS THE SECOND HALF. A '' salt must not be WRITTEN either,
+     * or the session carries an attribute that resolveContactDigestSalt() would then reject on
+     * every subsequent request anyway - and it would look, to anyone reading the payload, like
+     * a salt that had been used.
+     */
+    public function testWithNoUsableCsprngNoContactValueIsRememberedAtAll(): void
+    {
+        $saltKey = self::readPrivateKeyConstant('CONTACT_DIGEST_SALT_KEY');
+        $harness = $this->createGuard([], 7, 1);
+
+        $digest = Csprng::failing(
+            static fn (): string => $harness['guard']->contactDigest(
+                ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+                'shopper.a@example.com'
+            )
+        );
+
+        $this->assertSame(
+            '',
+            $digest,
+            'With no CSPRNG behind the salt, the digest must be the empty "do not cache this" sentinel. Hashing '
+            . 'under an empty key would return a perfectly well-formed digest that is the SAME in every session '
+            . 'on every installation - a global identifier for the address, and a bypass any other session '
+            . 'could present.'
+        );
+        $this->assertNull(
+            $harness['session'][$saltKey] ?? null,
+            'No salt may be written when none could be generated. Storing the empty string - or anything else '
+            . 'that is not 64 hex characters - would leave the session carrying something that reads like a '
+            . 'salt that was used, and it would be rejected and re-minted on every later request anyway.'
+        );
+
+        // ...and the failure is not sticky: a host that recovers mints a salt normally, so one
+        // transient failure does not disable the store for the rest of the session.
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $harness['guard']->contactDigest(
+                ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
+                'shopper.a@example.com'
+            ),
+            'Once the platform can generate entropy again the digests must resume: the failure path is a miss, '
+            . 'not a permanent refusal, or one blip costs the merchant every verification for the rest of the '
+            . 'session.'
+        );
     }
 
     /**

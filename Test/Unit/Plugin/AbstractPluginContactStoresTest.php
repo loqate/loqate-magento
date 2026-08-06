@@ -8,6 +8,7 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Plugin\AbstractPlugin;
+use Loqate\ApiIntegration\Test\Support\Csprng;
 use Magento\Customer\Model\Session;
 use Magento\Framework\App\Action\Context;
 use Magento\Framework\Controller\Result\JsonFactory;
@@ -446,6 +447,62 @@ class AbstractPluginContactStoresTest extends TestCase
             ),
             'After the flush the store must hold ONLY the new shopper\'s own entry, not theirs plus the '
             . 'previous shopper\'s.'
+        );
+    }
+
+    /**
+     * On a host with no usable CSPRNG, every submission is checked against Loqate and nothing
+     * is written to the session - the merchant pays, and no bypass is granted.
+     *
+     * THE DIRECTION IS THE WHOLE POINT, and it is the direction that costs money rather than
+     * the one that costs a customer. Without a salt there is no digest that is worth anything:
+     * hash_hmac() would accept an empty key and hand back a well-formed 64-character value that
+     * is the SAME in every session on every installation, so it would both identify the address
+     * globally and let one session's entry answer another's lookup. The class refuses to
+     * produce it, shouldVerify() answers the refusal by verifying, and the store stays empty.
+     * That is one extra billable call per submission on a host that cannot generate entropy,
+     * which cannot happen on anything that can run Magento - and if it ever does, an extra
+     * verify is the failure worth having.
+     *
+     * This is asserted at the PLUGIN layer as well as on the seam because the seam only returns
+     * a sentinel: what turns that sentinel into "verify and store nothing" is shouldVerify(),
+     * and a caller that treated '' as a cache key would put every value into one shared slot.
+     */
+    public function testWithNoUsableCsprngEverySubmissionIsVerifiedAndNothingIsRemembered(): void
+    {
+        $harness = $this->createPlugin();
+
+        Csprng::failing(function () use ($harness): void {
+            $harness['plugin']->checkEmail(self::EMAIL);
+            $harness['plugin']->checkEmail(self::EMAIL);
+            $harness['plugin']->checkPhone(self::PHONE);
+            $harness['plugin']->checkPhone(self::PHONE);
+        });
+
+        $this->assertSame(
+            2,
+            $this->emailCalls($harness),
+            'With no salt to key the digest with, the SECOND submission of the same address must be verified '
+            . 'again. Skipping it would mean a bypass was granted on the strength of an entry stored under an '
+            . 'empty key - a value that is identical in every session on every installation.'
+        );
+        $this->assertSame(2, $this->phoneCalls($harness), 'The same holds for the phone number.');
+        $this->assertSame(
+            [],
+            (array)($harness['session'][self::VERIFIED_EMAIL_SESSION_KEY] ?? []),
+            'Nothing may be stored when no usable digest can be produced: an unsalted entry is a global '
+            . 'identifier for the customer\'s address AND a bypass any other session could present.'
+        );
+        $this->assertSame(
+            [],
+            (array)($harness['session'][self::VERIFIED_PHONE_SESSION_KEY] ?? []),
+            'And nothing may be stored for the phone number, for the same reason.'
+        );
+        $this->assertStringNotContainsString(
+            self::EMAIL,
+            json_encode(iterator_to_array($harness['session'])),
+            'The address must not appear anywhere in the session either. "No digest could be produced" must '
+            . 'never degrade into "keep the raw value instead".'
         );
     }
 
