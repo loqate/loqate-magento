@@ -448,14 +448,40 @@ class AbstractPluginContactStoresTest extends TestCase
     }
 
     /**
+     * Methods this check reads but must NEVER CALL, because calling them changes the session.
+     *
+     * The untyped half below INVOKES every non-private method that can be called with no
+     * arguments, and some of those are writers, not accessors: clearPendingEmailAddress() puts
+     * '' into the pending-email store. Today that is harmless - this check runs on a plugin of
+     * its own and no later assertion reads that attribute - but it is harmless BY LUCK, and the
+     * next no-arg method added to AbstractPlugin could as easily be one that costs money or one
+     * whose write a later assertion does read. Anything listed here is still examined by its
+     * DECLARED RETURN TYPE, which is the half that needs no call at all, so listing a method
+     * narrows the check rather than switching it off.
+     *
+     * ADD A METHOD HERE THE MOMENT IT WRITES ANYTHING OR CALLS A CONNECTOR.
+     */
+    private const METHODS_THIS_CHECK_MUST_NOT_CALL = ['clearPendingEmailAddress'];
+
+    /**
      * Every non-private method of a plugin that hands a caller the raw session or the seam.
      *
      * TWO WAYS OF LOOKING, because either alone leaves the hole open. A declared return type is
      * read from reflection, which catches `protected function session(): Session` without
-     * running anything. An UNTYPED accessor - the same method with the type in a docblock, which
-     * is this module's prevailing style - is caught by actually calling every non-private method
-     * that needs no arguments and looking at what comes back. Anything that throws is skipped:
+     * running anything - and every part of a union or intersection type is read, not just a
+     * plain named one, so `?Session` and `Session|null` are caught as readily as `Session`. An
+     * UNTYPED accessor - the same method with the type in a docblock, which is this module's
+     * prevailing style - is caught by actually calling every non-private method that CAN be
+     * called with no arguments and looking at what comes back. Anything that throws is skipped:
      * it did not return a session.
+     *
+     * TWO THINGS THIS DOES NOT SEE, stated rather than left to be discovered. A method with a
+     * REQUIRED parameter and no declared return type cannot be called here (there is no value to
+     * pass that would be production's), so an untyped `protected function session($unused)` would
+     * slip through; the typed half still catches the same method the moment it declares what it
+     * returns. And self::METHODS_THIS_CHECK_MUST_NOT_CALL is not invoked, for the reason given
+     * there. Optional parameters are fine - getNumberOfRequiredParameters() is what is tested -
+     * so an accessor that grew a defaulted argument stays covered.
      *
      * @param object $plugin Built through the real constructor, so the values are production's.
      * @return string[] One sentence per offender, empty when there are none.
@@ -470,15 +496,18 @@ class AbstractPluginContactStoresTest extends TestCase
                 }
 
                 $label = sprintf('%s::%s()', $method->getDeclaringClass()->getShortName(), $method->getName());
-                $returns = $method->getReturnType();
-                if ($returns instanceof \ReflectionNamedType
-                    && in_array($returns->getName(), [Session::class, ShopperScopedSessionStores::class], true)
-                ) {
-                    $exposed[$label] = sprintf('%s declares it returns %s', $label, $returns->getName());
+                $declared = array_intersect(
+                    $this->namedTypesIn($method->getReturnType()),
+                    [Session::class, ShopperScopedSessionStores::class]
+                );
+                if ($declared !== []) {
+                    $exposed[$label] = sprintf('%s declares it returns %s', $label, implode('|', $declared));
                     continue;
                 }
 
-                if ($method->getNumberOfParameters() > 0) {
+                if ($method->getNumberOfRequiredParameters() > 0
+                    || in_array($method->getName(), self::METHODS_THIS_CHECK_MUST_NOT_CALL, true)
+                ) {
                     continue;
                 }
 
@@ -495,6 +524,36 @@ class AbstractPluginContactStoresTest extends TestCase
         }
 
         return array_values($exposed);
+    }
+
+    /**
+     * Every class name a declared type mentions, flattened.
+     *
+     * A return type is not necessarily a ReflectionNamedType: `Session|null` and
+     * `Session&Countable` are a union and an intersection, and matching only the named case
+     * would let either hand the session out untouched. PHP does not nest these further than one
+     * level (a DNF type's parts are themselves intersections of NAMED types), so one level of
+     * recursion covers every shape the language can express.
+     *
+     * @param \ReflectionType|null $type
+     * @return string[] Possibly empty; never contains a null.
+     */
+    private function namedTypesIn(?\ReflectionType $type): array
+    {
+        if ($type instanceof \ReflectionNamedType) {
+            return [$type->getName()];
+        }
+
+        if ($type instanceof \ReflectionUnionType || $type instanceof \ReflectionIntersectionType) {
+            $names = [];
+            foreach ($type->getTypes() as $part) {
+                $names = array_merge($names, $this->namedTypesIn($part));
+            }
+
+            return $names;
+        }
+
+        return [];
     }
 
     /**
