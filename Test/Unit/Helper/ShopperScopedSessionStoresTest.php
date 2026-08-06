@@ -22,6 +22,9 @@ use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use RecursiveCallbackFilterIterator;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 use ReflectionClass;
 use ReflectionProperty;
 use stdClass;
@@ -175,6 +178,29 @@ class ShopperScopedSessionStoresTest extends TestCase
      * pair - never through the generic accessors, which must refuse it.
      */
     private const IP_COUNTRY_SESSION_KEY = 'loqate_ipcountry';
+
+    /**
+     * Every production file that reaches ShopperScopedSessionStores' three key-taking
+     * accessors, and how many statements in it do.
+     *
+     * Kept as a per-file breakdown rather than a single total because a total alone cannot say
+     * WHICH class grew a call site, and because one moving up while another moves down is
+     * exactly the drift the prose version of this list shipped with. See
+     * testEveryStatementThatCanTripTheEnrolmentAssertionIsAccountedForByClass().
+     */
+    private const GUARDED_ACCESSOR_CALL_SITES = [
+        'Helper/Controller.php' => 2,
+        'Helper/Validator.php' => 8,
+        'Plugin/AbstractPlugin.php' => 7,
+        'Plugin/Frontend/PlaceOrder.php' => 1,
+        'Plugin/Frontend/PlaceOrderGuest.php' => 1,
+    ];
+
+    /**
+     * The size of the set above, held SEPARATELY and asserted against its own sum, so that a
+     * breakdown which no longer reconciles with its total cannot pass as it did once before.
+     */
+    private const GUARDED_ACCESSOR_CALL_SITE_TOTAL = 19;
 
     /**
      * The second identity source ShopperScopedSessionStores deliberately does NOT read.
@@ -1078,6 +1104,216 @@ class ShopperScopedSessionStoresTest extends TestCase
             'a near miss of an enrolled name' => ['captured_address'],
             'the empty key' => [''],
         ];
+    }
+
+    /**
+     * The enrolment assertion's BLAST RADIUS, counted from the production source instead of
+     * enumerated in a paragraph.
+     *
+     * assertEnrolled() throws, and a throw inside checkout is only acceptable because the set of
+     * statements that can reach it is small, known, and reviewed. That set is the calls to the
+     * three key-taking accessors - getData(), setData() and contactDigest(); isContactDigest()
+     * and the getIpCountry()/setIpCountry() pair do not reach it - and its size is what a
+     * reviewer checks before accepting "unreachable for correct code".
+     *
+     * WHY A TEST AND NOT THE PROSE THAT USED TO CARRY THIS. The enumeration was hand-maintained
+     * and HAS ALREADY DRIFTED: an earlier revision claimed ten call sites in Helper\Validator
+     * and seven in Plugin\AbstractPlugin, which totalled to the right number by coincidence
+     * while the truth was eight, seven, and one each in Plugin\Frontend\PlaceOrder and
+     * PlaceOrderGuest. A breakdown that does not reconcile with its own total is worse than no
+     * breakdown, because the total is what the next reader checks. So both halves are asserted,
+     * and the fixture's own arithmetic is asserted first - the coincidence that hid the last
+     * drift cannot hide the next one.
+     *
+     * WHY BY SOURCE SCAN. There is nothing to reflect on: these are call sites, not a value. The
+     * scan is modelled on ValidatorImportRunDedupeTest::importChunkSize() and takes the same
+     * line on ambiguity - anything it cannot recognise FAILS rather than being guessed at or
+     * quietly counted as zero, because a scan that silently matches nothing is a test that
+     * passes hardest exactly when the thing it guards has been renamed out from under it. The
+     * whole module is walked rather than the five known files, so a SIXTH class that starts
+     * reaching a shopper-scoped store shows up here as a new key, named, instead of being
+     * invisible.
+     *
+     * WHY COMMENTS ARE STRIPPED FIRST. This module's docblocks discuss these call sites at
+     * length, in a file this very test is a fixture for; counting prose would make the number
+     * move when someone edits an explanation.
+     *
+     * THE OTHER HALF OF THE OLD PARAGRAPH - "none of them sits inside a try" - IS DELIBERATELY
+     * NOT ASSERTED HERE. What matters is not whether a call is lexically inside a try in its own
+     * file but whether any CALLER swallows the throw, and the one time this actually broke it
+     * broke across files: Plugin\Admin\ValidateImportAddress::afterValidateData() wrapped its
+     * whole run in catch (\Exception) and turned this throw into an import that silently
+     * reported no address errors at all. A lexical in-file check would have been green
+     * throughout that defect while looking like coverage of it. The property that matters is
+     * pinned behaviourally where the defect was, in
+     * Test/Unit/Plugin/Admin/ValidateImportAddressTest.php, which asserts that an
+     * \InvalidArgumentException raised under afterValidateData() reaches the caller; a
+     * whole-module version would need a call graph and is not cheaply assertable.
+     */
+    public function testEveryStatementThatCanTripTheEnrolmentAssertionIsAccountedForByClass(): void
+    {
+        $this->assertSame(
+            self::GUARDED_ACCESSOR_CALL_SITE_TOTAL,
+            array_sum(self::GUARDED_ACCESSOR_CALL_SITES),
+            'The expected breakdown in this file must reconcile with its own total before it is compared with '
+            . 'anything. This is the exact defect the prose version shipped with - per-class numbers that were '
+            . 'wrong in two places and summed to the right answer - and it is the reason the breakdown is '
+            . 'asserted at all rather than just the total.'
+        );
+
+        $counted = $this->guardedAccessorCallSites();
+
+        $this->assertSame(
+            self::GUARDED_ACCESSOR_CALL_SITES,
+            $counted,
+            sprintf(
+                'The set of statements that can trip ShopperScopedSessionStores::assertEnrolled() has moved: '
+                . 'expected %s, found %s. That throw runs inside checkout and is justified ONLY by this set '
+                . 'being small and reviewed, so a change here is a change to the risk of the throw and must be '
+                . 'looked at by a person. If the new call site is correct, update '
+                . 'self::GUARDED_ACCESSOR_CALL_SITES - and check the new statement is not somewhere a broad '
+                . 'catch would swallow the \InvalidArgumentException, which is how this guard was silently '
+                . 'disabled once already (Plugin\Admin\ValidateImportAddress).',
+                json_encode(self::GUARDED_ACCESSOR_CALL_SITES),
+                json_encode($counted)
+            )
+        );
+        $this->assertSame(
+            self::GUARDED_ACCESSOR_CALL_SITE_TOTAL,
+            array_sum($counted),
+            'And the total, asserted separately from the breakdown so that neither can be corrected into '
+            . 'agreement with the other without the disagreement being seen.'
+        );
+    }
+
+    /**
+     * Every production statement that reaches one of ShopperScopedSessionStores' three
+     * key-taking accessors, counted per file.
+     *
+     * FAILS RATHER THAN RETURNS AN EMPTY OR SHORT ANSWER at each point where it could be
+     * looking at something other than what it thinks: no module root, a walk that finds no
+     * source, a walk that misses the guard's own file, or a pattern that matches nothing at
+     * all. Each of those makes an empty result look exactly like "nothing reaches the
+     * assertion", which is a sentence this test must never be able to say by accident.
+     *
+     * @return array<string, int> Module-relative file path => number of call sites, ordered by
+     *                            path, files with none omitted.
+     */
+    private function guardedAccessorCallSites(): array
+    {
+        $guardFile = (new ReflectionClass(ShopperScopedSessionStores::class))->getFileName();
+        $this->assertIsString(
+            $guardFile,
+            'ShopperScopedSessionStores must be a file-backed class: its call sites are statements in source '
+            . 'files, so the source tree is the only place they can be counted.'
+        );
+        $root = dirname((string)$guardFile, 2);
+
+        $this->assertTrue(
+            function_exists('token_get_all'),
+            'ext-tokenizer is required to tell this module\'s code from its (extensive) comments about that '
+            . 'code. Without it the count would include every docblock that discusses a call site, so the scan '
+            . 'stops here rather than reporting a number it cannot stand behind.'
+        );
+
+        $files = $this->productionSourceFiles($root);
+        $this->assertContains(
+            'Helper/ShopperScopedSessionStores.php',
+            $files,
+            sprintf(
+                'The walk of %s did not reach the guard\'s own file, so it is not looking at the module. A '
+                . 'count taken from the wrong tree would report zero call sites and pass.',
+                $root
+            )
+        );
+
+        $counted = [];
+        foreach ($files as $relative) {
+            $matches = preg_match_all(
+                '/(?:shopperSession|sessionStores)\s*->\s*(?:getData|setData|contactDigest)\s*\(/',
+                $this->sourceWithoutComments($root . '/' . $relative)
+            );
+            if ($matches) {
+                $counted[$relative] = $matches;
+            }
+        }
+
+        $this->assertNotSame(
+            [],
+            $counted,
+            'No call to getData(), setData() or contactDigest() on a shopperSession/sessionStores property was '
+            . 'found anywhere in the module. Either the guard is now reached some other way - through a '
+            . 'differently named property, a local variable, or an interface - or the accessors were renamed. '
+            . 'Point this scan at the new shape rather than letting it report zero: an empty count would let '
+            . 'this test assert that nothing can trip the enrolment assertion, which is the opposite of what '
+            . 'it exists to say.'
+        );
+        ksort($counted);
+
+        return $counted;
+    }
+
+    /**
+     * Every .php file in the module that is not a test, a dependency, or version-control noise,
+     * as module-relative paths.
+     *
+     * @param string $root Module root directory.
+     * @return list<string>
+     */
+    private function productionSourceFiles(string $root): array
+    {
+        $walk = new RecursiveIteratorIterator(
+            new RecursiveCallbackFilterIterator(
+                new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS),
+                static function ($file): bool {
+                    if ($file->isDir()) {
+                        // 'Test' is excluded deliberately: this very file names the accessors in
+                        // its own fixtures and messages, and counting them would make the number
+                        // depend on the test rather than on the module.
+                        return !in_array($file->getFilename(), ['vendor', 'Test', '.git'], true);
+                    }
+
+                    return strtolower($file->getExtension()) === 'php';
+                }
+            )
+        );
+
+        $files = [];
+        foreach ($walk as $file) {
+            $files[] = str_replace($root . '/', '', $file->getPathname());
+        }
+        sort($files);
+
+        $this->assertNotSame(
+            [],
+            $files,
+            sprintf('No production PHP source was found under %s, so there is nothing to count.', $root)
+        );
+
+        return $files;
+    }
+
+    /**
+     * A PHP file's source with every comment and docblock removed, so a call site discussed in
+     * prose is not counted as a call site.
+     *
+     * ext-tokenizer's presence is asserted once by the caller rather than per file, so the
+     * assertion count of the test stays a count of things about the module.
+     *
+     * @param string $path Absolute path to a PHP file.
+     * @return string
+     */
+    private function sourceWithoutComments(string $path): string
+    {
+        $code = '';
+        foreach (token_get_all((string)file_get_contents($path)) as $token) {
+            if (is_array($token) && in_array($token[0], [T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+            $code .= is_array($token) ? $token[1] : $token;
+        }
+
+        return $code;
     }
 
     /**
