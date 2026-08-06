@@ -32,14 +32,34 @@ use PHPUnit\Framework\MockObject\MockObject;
 trait ShopperSessionHarness
 {
     /**
+     * The CORE session attributes this module writes through Magento's own typed setters,
+     * mapped from the setter the module calls to the attribute the real session stores it under.
+     *
+     * Doubled because they are where a "we no longer keep the customer's details" claim is most
+     * easily made false by accident: they are written with a whole POST, they are not this
+     * module's stores, and so they are invisible to every assertion that looks at the module's
+     * own attributes. Answering these calls means the double's payload is what the REAL session
+     * payload would be, which is what the privacy assertions search - see sessionPayload().
+     *
+     * The names are Magento\Framework\DataObject's __call convention (setCustomerFormData() ->
+     * 'customer_form_data'), reproduced rather than derived so this map reads as the pair it is.
+     */
+    private const CORE_FORM_DATA_SETTERS = [
+        'setCustomerFormData' => 'customer_form_data',
+        'setAddressFormData' => 'address_form_data',
+    ];
+
+    /**
      * A Magento\Customer\Model\Session double that actually stores what it is given.
      *
      * The shared Test/stubs Session is a no-op (getData() returns null, setData() stores
-     * nothing), so nothing under test could ever be observed. getData()/setData() have to be
-     * *added* when the real Magento Session is present, because it does not declare them -
-     * SessionManager __call-forwards them to Session\Storage - while the stub does declare them
-     * and PHPUnit refuses to "add" an existing method; hence the method_exists() filter, which
-     * keeps this double working on both sides.
+     * nothing), so nothing under test could ever be observed. Which methods have to be DECLARED
+     * to PHPUnit and which have to be ADDED depends on which Session is in play: the real
+     * Magento class declares getCustomerId() but __call-forwards getData(), setData() and the
+     * two form-data setters to Session\Storage, while the stub declares the first three and
+     * forwards nothing. PHPUnit refuses to "add" a method that exists and refuses to configure
+     * one it was not told about, so the list is split by method_exists() and each half is
+     * declared the way that class needs - which keeps this double working on both sides.
      *
      * @param ArrayObject $sessionStore Backing store for the session attributes.
      * @param ArrayObject $identity Holds 'customerId', read LIVE so a test can log in mid-test.
@@ -47,11 +67,23 @@ trait ShopperSessionHarness
      */
     private function createSessionDouble(ArrayObject $sessionStore, ArrayObject $identity)
     {
-        $sessionBuilder = $this->getMockBuilder(Session::class)->disableOriginalConstructor();
+        $wanted = array_merge(
+            ['getData', 'setData', 'getCustomerId'],
+            array_keys(self::CORE_FORM_DATA_SETTERS)
+        );
+        $declared = array_values(array_filter(
+            $wanted,
+            static fn (string $method): bool => method_exists(Session::class, $method)
+        ));
         $undeclared = array_values(array_filter(
-            ['getData', 'setData'],
+            $wanted,
             static fn (string $method): bool => !method_exists(Session::class, $method)
         ));
+
+        $sessionBuilder = $this->getMockBuilder(Session::class)->disableOriginalConstructor();
+        if ($declared) {
+            $sessionBuilder->onlyMethods($declared);
+        }
         if ($undeclared) {
             $sessionBuilder->addMethods($undeclared);
         }
@@ -66,6 +98,17 @@ trait ShopperSessionHarness
                 return $sessionMock;
             }
         );
+        foreach (self::CORE_FORM_DATA_SETTERS as $setter => $attribute) {
+            if (!method_exists(Session::class, $setter)) {
+                $sessionMock->method($setter)->willReturnCallback(
+                    static function ($value = null) use ($sessionStore, $sessionMock, $attribute) {
+                        $sessionStore[$attribute] = $value;
+
+                        return $sessionMock;
+                    }
+                );
+            }
+        }
         $sessionMock->method('getCustomerId')->willReturnCallback(static fn () => $identity['customerId']);
 
         return $sessionMock;

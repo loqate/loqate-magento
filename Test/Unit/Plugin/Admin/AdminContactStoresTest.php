@@ -14,6 +14,7 @@ use Magento\Framework\App\Action\Context;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\UrlInterface;
 use Magento\Sales\Controller\Adminhtml\Order\Create\Save;
+use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 
@@ -58,6 +59,16 @@ class AdminContactStoresTest extends TestCase
 
     /** A customer's phone number, chosen so no numeric-string comparison can be involved. */
     private const PHONE = '+44 20 7946 0000';
+
+    /**
+     * The rest of what an admin order-create POST carries, and what used to be copied into the
+     * session with it: the two contact stores hold only an email address and a phone number, but
+     * the attribute this module wrote on a rejected submission held the entire form.
+     */
+    private const CUSTOMER_NAME = 'Wilhelmina-Testcase';
+
+    /** @see self::CUSTOMER_NAME */
+    private const CUSTOMER_STREET = '17 Nonexistent Wharf';
 
     /**
      * An admin who submits the same order twice is billed for one email and one phone
@@ -142,6 +153,79 @@ class AdminContactStoresTest extends TestCase
             $payload,
             'Nor must the customer\'s phone number.'
         );
+        $this->assertEveryEntryIsADigest($harness, self::VERIFIED_EMAIL_SESSION_KEY);
+        $this->assertEveryEntryIsADigest($harness, self::VERIFIED_PHONE_SESSION_KEY);
+    }
+
+    /**
+     * The same guarantee on the submission that is REJECTED - which is the only submission that
+     * stores anything, and the whole reason these two stores exist.
+     *
+     * WHY THIS IS A SEPARATE TEST AND WHY IT IS THE IMPORTANT ONE. Every other test in this file
+     * drives a submission Loqate ACCEPTS, and an accepted submission never reaches
+     * Plugin\Admin\OrderSave's error branch. That branch is not an edge case: with prevent_submit
+     * off (the shipped default) the module warns once and accepts the value on resubmission, so
+     * "rejected, then submitted again" IS the sequence the store is for, and a store entry is
+     * only ever written on the way to it. It used to answer that branch by handing the WHOLE POST
+     * to Session::setCustomerFormData() - raw - a few lines after storing the digest, so the
+     * address and the number went back into the same session the digest had kept them out of, and
+     * on this path nothing in adminhtml ever reads that attribute back and clears it. The suite
+     * was green throughout, because no test reached line 92 (LOQ-17149).
+     *
+     * ASSERTED OVER THE WHOLE POST, not just the two values the stores hold: what was copied was
+     * the customer's name and street as well, so a test that only looked for the email address
+     * would pass on a change that kept copying everything else.
+     */
+    public function testARejectedAdminOrderLeavesNoPartOfTheSubmissionReadableInTheSession(): void
+    {
+        $harness = $this->createAdminSession(false);
+
+        $result = $this->orderSave($harness)->aroundExecute(
+            $this->postValue([
+                'order' => [
+                    'billing_address' => [
+                        'telephone' => self::PHONE,
+                        'country_id' => 'GB',
+                        'firstname' => self::CUSTOMER_NAME,
+                        'street' => [self::CUSTOMER_STREET],
+                    ],
+                    'account' => ['email' => self::EMAIL],
+                ],
+            ]),
+            static fn () => 'order saved'
+        );
+
+        $this->assertNotSame(
+            'order saved',
+            $result,
+            'Fixture guard: the submission must have been REJECTED and redirected. If it proceeded, this test '
+            . 'is exercising the accepted path the other tests already cover and proves nothing about the '
+            . 'branch that stores the digests.'
+        );
+        $this->assertNotSame(
+            [],
+            iterator_to_array($harness['errorMessages']),
+            'Fixture guard: the admin must have been warned, which is what "submit again to use this value" '
+            . 'means and what the store entry is written for.'
+        );
+
+        $payload = $this->sessionPayload($harness['session']);
+
+        foreach ([self::EMAIL, self::PHONE, self::CUSTOMER_NAME, self::CUSTOMER_STREET] as $submitted) {
+            $this->assertStringNotContainsString(
+                $submitted,
+                $payload,
+                sprintf(
+                    '"%s" was submitted on an order the module rejected, and none of the POST may be left '
+                    . 'readable in the session afterwards. In adminhtml nothing reads back or clears '
+                    . '\'customer_form_data\' on the customer session, so anything written there stays for the '
+                    . 'whole of the admin\'s browser session - which is why LOQ-17149 removed that write '
+                    . 'instead of documenting it.',
+                    $submitted
+                )
+            );
+        }
+
         $this->assertEveryEntryIsADigest($harness, self::VERIFIED_EMAIL_SESSION_KEY);
         $this->assertEveryEntryIsADigest($harness, self::VERIFIED_PHONE_SESSION_KEY);
     }
@@ -328,7 +412,7 @@ class AdminContactStoresTest extends TestCase
     private function constructorArguments(array $harness): array
     {
         return [
-            $this->createMock(Context::class),
+            $harness['context'],
             $this->createMock(UrlInterface::class),
             $harness['sessionMock'],
             $harness['validator'],
@@ -340,9 +424,13 @@ class AdminContactStoresTest extends TestCase
     /**
      * One adminhtml customer session - no customer id, ever - with a counting connector.
      *
+     * @param bool $contactChecksPass Whether Loqate ACCEPTS the email addresses and phone numbers
+     *                                it is sent. False drives Plugin\Admin\OrderSave's error
+     *                                branch, which is the only branch that redirects and the one
+     *                                a store entry is written on the way to.
      * @return array<string, mixed>
      */
-    private function createAdminSession(): array
+    private function createAdminSession(bool $contactChecksPass = true): array
     {
         $sessionStore = new ArrayObject();
         // NULL for the whole session and never changed: that IS the adminhtml situation. The
@@ -351,9 +439,11 @@ class AdminContactStoresTest extends TestCase
         $identity = new ArrayObject(['customerId' => null]);
         $emailRequests = new ArrayObject();
         $phoneRequests = new ArrayObject();
+        $errorMessages = new ArrayObject();
 
         return [
             'sessionMock' => $this->createSessionDouble($sessionStore, $identity),
+            'context' => $this->createAdminContext($errorMessages),
             'helper' => $this->createConfigHelper([
                 'loqate_settings/settings/api_key' => 'TEST-API-KEY-0000',
                 // The three admin toggles the contact stores are reached through. The ADDRESS
@@ -366,12 +456,111 @@ class AdminContactStoresTest extends TestCase
                 'loqate_settings/email_settings/enable_customer_account_admin' => 1,
                 'loqate_settings/phone_settings/enable_customer_account_admin' => 1,
             ]),
-            'validator' => $this->createCountingValidator($emailRequests, $phoneRequests),
+            'validator' => $this->createCountingValidator(
+                $emailRequests,
+                $phoneRequests,
+                $contactChecksPass,
+                $contactChecksPass
+            ),
             'session' => $sessionStore,
             'identity' => $identity,
             'emailRequests' => $emailRequests,
             'phoneRequests' => $phoneRequests,
+            'errorMessages' => $errorMessages,
         ];
+    }
+
+    /**
+     * A Magento\Framework\App\Action\Context whose three collaborators survive the ERROR branch.
+     *
+     * WHY THE DEFAULT DOUBLE IS NOT ENOUGH, and why that mattered. createMock(Context::class)
+     * answers null to getMessageManager(), getResultRedirectFactory() and getRedirect(), because
+     * the stub declares no return types - which is sufficient for a submission Loqate ACCEPTS,
+     * since that path touches none of them. It is also why a rejected submission could not be
+     * driven at all: the first addErrorMessage() on the error branch was a call on null. The
+     * branch that was never reached is the branch that stores the digests, so the assertions in
+     * this file were passing over the one path they are about (LOQ-17149).
+     *
+     * Anonymous classes rather than mocks of Magento\Framework\Message\ManagerInterface and its
+     * siblings: those three types have no stub under Test/stubs, and AbstractPlugin keeps all
+     * three in untyped properties, so what is needed is an object that answers the calls - not
+     * one that satisfies a type nothing checks.
+     *
+     * @param ArrayObject $errorMessages Every error message the plugin raises, in order.
+     * @return Context&MockObject
+     */
+    private function createAdminContext(ArrayObject $errorMessages)
+    {
+        $messageManager = new class ($errorMessages) {
+            /** @var ArrayObject */
+            private $messages;
+
+            public function __construct(ArrayObject $messages)
+            {
+                $this->messages = $messages;
+            }
+
+            /**
+             * @param mixed $message A Phrase in production, a string under the __() stub.
+             * @return $this
+             */
+            public function addErrorMessage($message)
+            {
+                $this->messages[] = (string)$message;
+
+                return $this;
+            }
+        };
+
+        $redirect = new class {
+            /**
+             * @return string
+             */
+            public function getRefererUrl()
+            {
+                return 'https://example.test/admin/sales/order_create/';
+            }
+
+            /**
+             * @param string $defaultUrl
+             * @return string
+             */
+            public function error($defaultUrl)
+            {
+                return $defaultUrl;
+            }
+        };
+
+        $redirectFactory = new class {
+            /**
+             * @return object A result with the one method the plugin calls on it.
+             */
+            public function create()
+            {
+                return new class {
+                    /** @var mixed The URL the plugin redirected to; declared, not dynamic. */
+                    public $url;
+
+                    /**
+                     * @param mixed $url
+                     * @return $this
+                     */
+                    public function setUrl($url)
+                    {
+                        $this->url = $url;
+
+                        return $this;
+                    }
+                };
+            }
+        };
+
+        $context = $this->createMock(Context::class);
+        $context->method('getMessageManager')->willReturn($messageManager);
+        $context->method('getResultRedirectFactory')->willReturn($redirectFactory);
+        $context->method('getRedirect')->willReturn($redirect);
+
+        return $context;
     }
 
     /**

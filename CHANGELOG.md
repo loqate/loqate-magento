@@ -170,15 +170,27 @@ predate it and are described by their git tags and commit history.
   verification on it and, if it failed, blocked their checkout with a message about
   an address that appeared nowhere on their form. It is now cleared when the
   logged-in customer changes (LOQ-17149).
-- **Customer email addresses and phone numbers are no longer kept in the session.**
-  The "already warned about" lists held the values in plain text for the whole life
-  of the session. They now hold a salted, full-length HMAC-SHA-256 digest instead:
-  the lists only ever need to *compare*, never to read a value back. The salt is
-  generated per session, never persisted or configured, and is replaced whenever the
-  logged-in customer changes. Values written by earlier releases are discarded the
-  first time the list is written to. The one email address that must stay readable is
-  the pending checkout address described above, because it is sent to Loqate to be
-  verified; it is cleared on success and now also when the shopper changes
+- **The "already warned about" email and phone lists no longer hold the values.**
+  They held the customer's email address and phone number in plain text for the whole
+  life of the session. They now hold a salted, full-length HMAC-SHA-256 digest
+  instead: the lists only ever need to *compare*, never to read a value back. The
+  salt is generated per session, never persisted or configured, and is replaced
+  whenever the logged-in customer changes. Values written by earlier releases are
+  discarded the first time the list is written to. Two things in the session are
+  deliberately still readable, because hashing them would break what they are for:
+  the pending checkout email address described above, which is sent to Loqate to be
+  verified, and the `captured_addresses` store, which holds the addresses picked from
+  the Capture lookup so they can be compared field by field (LOQ-17149).
+- **An admin order create no longer copies the submitted order into the session.**
+  When a check failed, `Plugin\Admin\OrderSave` handed the whole POST — the account
+  email address, every address's telephone, the names and the streets — to Magento's
+  `customer_form_data` session attribute, raw, in the same request that stored the
+  digest above; and because nothing in the admin panel reads that attribute back off
+  the customer session, nothing ever cleared it. It stayed for the rest of the
+  admin's browser session. The call is removed. Nothing re-populated the order-create
+  form from it (the form is rebuilt from the backend quote session), so there is no
+  behaviour change; the storefront account-create and account-edit paths, where core
+  really does re-render the form from it and clears it on read, are untouched
   (LOQ-17149).
 
 ### Changed — for developers extending this module
@@ -257,10 +269,12 @@ predate it and are described by their git tags and commit history.
   ACCEPTED LIMITS block on `Helper\ShopperScopedSessionStores`. In short: the admin
   panel runs its own PHP session, separate from the storefront's, so this is
   admin-to-admin on one shared browser and never admin-to-shopper. What a second
-  admin can inherit is one identical admin order create, customer-email re-check or
-  address phone re-check that the first already paid for — the merchant pays nothing
-  extra, only the attribution between two admin users is imprecise — and since the
-  contact stores now hold salted digests rather than values, nothing readable is
-  inherited with it. Closing it would mean either a backend dependency in a helper
-  built on every storefront checkout request or a second bill for a verdict that is
-  identical by construction.
+  admin can inherit is a verification the first already paid for — an identical admin
+  order create, customer-email re-check, address re-check or Capture lookup — so the
+  merchant pays nothing extra and only the attribution between two admin users is
+  imprecise. Since this release the two contact lists hold salted digests rather than
+  values, so no email address or phone number is inherited with it; the
+  `captured_addresses` store still holds the addresses the first admin looked up,
+  which is unchanged by this release. Closing the swap itself would mean either a
+  backend dependency in a helper built on every storefront checkout request or a
+  second bill for a verdict that is identical by construction.

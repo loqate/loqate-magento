@@ -125,14 +125,21 @@ use Magento\Customer\Model\Session;
  *  - THE GUARD SCOPES BY CUSTOMER IDENTITY ONLY, and LOQ-17149 DECIDED to leave it there
  *    rather than inherit the LOQ-16978 reasoning. The marker tracks
  *    Magento\Customer\Model\Session::getCustomerId() and nothing else, so an ADMIN user swap
- *    inside one browser session is not covered. That is not academic for three of the seven
- *    stores: self::BATCH_VERIFY_CACHE_SESSION_KEY is written exclusively from adminhtml
- *    (Plugin\Admin\OrderSave, Plugin\Admin\ValidateImportAddress), and
- *    self::VERIFIED_EMAIL_SESSION_KEY / self::VERIFIED_PHONE_SESSION_KEY are written from
- *    adminhtml as well as from the storefront (Plugin\Admin\OrderSave via validateEmail() and
- *    validatePhone(), Plugin\Admin\ValidateCustomer, Plugin\Admin\ValidateAddress). In
- *    adminhtml the customer session holds no customer id, so the owner there is permanently
- *    self::GUEST_OWNER_ID and the flush is a NO-OP on that path.
+ *    inside one browser session is not covered. That is not academic for FIVE of the seven
+ *    stores, counted rather than estimated:
+ *      * self::CAPTURED_ADDRESSES_SESSION_KEY - Controller\Adminhtml\Capture\Retrieve, through
+ *        Helper\Controller::retrieve(), which is the same helper method the storefront
+ *        controller calls;
+ *      * self::VERIFY_CACHE_SESSION_KEY - Plugin\Admin\ValidateAddress, through
+ *        Validator::verifyAddress();
+ *      * self::BATCH_VERIFY_CACHE_SESSION_KEY - written exclusively from adminhtml
+ *        (Plugin\Admin\OrderSave, Plugin\Admin\ValidateImportAddress);
+ *      * self::VERIFIED_EMAIL_SESSION_KEY and self::VERIFIED_PHONE_SESSION_KEY - from adminhtml
+ *        as well as from the storefront (Plugin\Admin\OrderSave via validateEmail() and
+ *        validatePhone(), Plugin\Admin\ValidateCustomer, Plugin\Admin\ValidateAddress).
+ *    Only self::PENDING_EMAIL_SESSION_KEY and self::BILLING_ERRORS_SESSION_KEY are
+ *    storefront-only. In adminhtml the customer session holds no customer id, so the owner
+ *    there is permanently self::GUEST_OWNER_ID and the flush is a NO-OP on all five.
  *    WHAT THAT COSTS, QUANTIFIED, so nobody "fixes" a non-defect and nobody mistakes it for
  *    the shopper-facing defect this class exists to close:
  *      * WHO IS EXPOSED TO WHOM: admin to admin, on one shared browser, only. The admin area
@@ -144,9 +151,11 @@ use Magento\Customer\Model\Session;
  *        scope for.
  *      * WHAT REPLAYS: an identical admin order create (Plugin\Admin\OrderSave - one email
  *        and up to two phone numbers per submission, plus the batch address verdicts), an
- *        identical customer-email re-check (Plugin\Admin\ValidateCustomer) and an identical
- *        address phone re-check (Plugin\Admin\ValidateAddress). Nothing else: the customer
- *        import writes neither contact store.
+ *        identical customer-email re-check (Plugin\Admin\ValidateCustomer), an identical
+ *        address re-check (Plugin\Admin\ValidateAddress - the phone and the single-address
+ *        verdict) and an address the first admin had already picked out of the Capture lookup
+ *        (Controller\Adminhtml\Capture\Retrieve). The customer import replays batch verdicts
+ *        only: it writes neither contact store.
  *      * WHAT THE MERCHANT PAYS: nothing extra. The second admin is NOT billed for a verify
  *        the first already paid for, which is what the caches are FOR. What is imprecise is
  *        the ATTRIBUTION of that one call between two admins, and the module has never
@@ -159,14 +168,31 @@ use Magento\Customer\Model\Session;
  *        earned by submitting that address themselves. The contact stores replay a
  *        "warned once, allowed on resubmission" decision, which is a decision about a VALUE,
  *        not about a person.
- *      * WHAT IS NOT EXPOSED: the customer's email address and phone number. This is what
- *        changed the calculus, and it is why (b) - record the residual - is now defensible
- *        where inheriting the LOQ-16978 paragraph would not have been: since LOQ-17149 the
- *        contact stores hold salted HMAC digests and not the values (see contactDigest()), so
- *        what a second admin inherits is a set of unreadable digests under a salt that dies
- *        with the session. The residual is therefore a BILLING-ATTRIBUTION one on every one
- *        of the three adminhtml-written stores, which is the same class of residual LOQ-16978
- *        already accepted for the batch cache.
+ *      * WHAT THE TWO CONTACT STORES EXPOSE: nothing readable. This is what changed the
+ *        calculus for them, and it is why (b) - record the residual - is defensible there
+ *        where inheriting the LOQ-16978 paragraph would not have been: since LOQ-17149 they
+ *        hold salted HMAC digests and not the values (see contactDigest()), under a salt that
+ *        dies with the session, so their residual is a BILLING-ATTRIBUTION one - the same
+ *        class of residual LOQ-16978 already accepted for the batch cache.
+ *        THAT CLAIM IS ONLY WORTH MAKING BECAUSE IT HOLDS ON THE ERROR PATH, which is the only
+ *        path that stores anything and the whole reason these stores exist ("warned once,
+ *        submit again"). Plugin\Admin\OrderSave used to answer a failed check by handing the
+ *        entire order-create POST - the account email address, every address's telephone, the
+ *        names and the streets - to Session::setCustomerFormData(), raw, in the same request
+ *        that had just stored the digest, which put the values straight back into the session
+ *        the digest had kept them out of. LOQ-17149 REMOVED that call: nothing in adminhtml
+ *        reads 'customer_form_data' off the customer session, so it re-populated no form. The
+ *        enumeration behind that is at the old call site in Plugin\Admin\OrderSave.
+ *      * WHAT IS STILL READABLE, so this is not read as more than it says. The three ADDRESS
+ *        stores are not hashed and were never in LOQ-17149's scope. The two verdict caches
+ *        hold a boolean and a schema version per entry, under a key that is a truncated hash
+ *        of the address, so nothing is readable OUT of them - but
+ *        self::CAPTURED_ADDRESSES_SESSION_KEY holds, in full, the addresses the first admin
+ *        picked out of the Capture lookup (bounded to Helper\Controller::CAPTURED_ADDRESSES_LIMIT
+ *        entries, flushed on a CUSTOMER change and therefore never on this path). A second
+ *        admin at a shared browser can read those. That residual is LOQ-16978's, it is
+ *        unchanged by this ticket in either direction, and it is named here so the bullet above
+ *        cannot be read as "an admin session holds nothing about a customer".
  *    THE PRICE OF CLOSING IT, which is why it is not closed: Magento\Backend\Model\Auth\Session
  *    would have to be read here, and this class is constructed on every frontend checkout
  *    request through Helper\Validator and Plugin\AbstractPlugin. Either it becomes a required
@@ -216,7 +242,12 @@ use Magento\Customer\Model\Session;
  *    back with getCustomerFormData(true), which clears them. They are not verify bypasses,
  *    this module is not their only writer, and flushing an attribute whose lifetime core
  *    manages would be this module deciding core's business - so they are out of scope here
- *    and named at their accessors instead.
+ *    and named at their accessors instead. That reasoning is about the CALL SITES, not about
+ *    the attribute names: it holds for the three storefront callers, whose redirect targets
+ *    core renders from the value and clears in doing so, and it did NOT hold for the one
+ *    adminhtml caller, which LOQ-17149 therefore removed rather than excused (see
+ *    Plugin\Admin\OrderSave). A new caller has to be checked against that, not against this
+ *    paragraph.
  */
 class ShopperScopedSessionStores
 {

@@ -43,8 +43,13 @@ use Magento\Framework\UrlInterface;
  * rememberCustomerFormData() and rememberAddressFormData() write Magento's own
  * 'customer_form_data' / 'address_form_data' through core's typed setters. They are CORE
  * attributes - core writes them on its own validation failures and core reads them back with
- * getCustomerFormData(true), which clears them - so they are not enrolled in this module's
- * flush; see the closing paragraph of ShopperScopedSessionStores' class docblock.
+ * getCustomerFormData(true) / getAddressFormData(true), which clear them - so they are not
+ * enrolled in this module's flush; see the closing paragraph of ShopperScopedSessionStores'
+ * class docblock. That exclusion is only sound while every caller is on a path where core
+ * really does read the attribute back, which is why LOQ-17149 removed the one caller that was
+ * not: Plugin\Admin\OrderSave called rememberCustomerFormData() with the whole admin
+ * order-create POST, and nothing in adminhtml reads that attribute off the customer session at
+ * all - see the comment at that call site for the enumeration.
  */
 abstract class AbstractPlugin
 {
@@ -287,6 +292,15 @@ abstract class AbstractPlugin
      * would be this module overriding core's behaviour. It does hold the submitted POST, so
      * it holds PII for as long as core leaves it there - identical to what core itself does
      * on a failed registration, and out of scope here.
+     *
+     * THAT ARGUMENT IS ABOUT THE CALLERS, NOT ABOUT THE ATTRIBUTE, and LOQ-17149 had to act on
+     * the difference. "Core clears it on read" is only true where core reads it, and every
+     * remaining caller is such a path: Plugin\Frontend\CustomerAccountCreate and
+     * CustomerAccountEdit redirect to a page core renders from this value with
+     * getCustomerFormData(true). Plugin\Admin\OrderSave was the exception - nothing in adminhtml
+     * reads 'customer_form_data' off the CUSTOMER session, so there the POST was never read and
+     * never cleared - and that call was removed rather than documented. Do not add an adminhtml
+     * caller back without re-checking that enumeration; it is written out at the old call site.
      *
      * This is the only reason AbstractPlugin still holds the raw session at all.
      *
