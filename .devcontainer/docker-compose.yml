@@ -30,7 +30,12 @@ services:
       - "3306:3306"
     volumes:
       - dbdata:/var/lib/mysql
-    command: --default-authentication-plugin=mysql_native_password --ssl=0
+    # log-bin-trust-function-creators is required by Magento's setup:upgrade, which creates
+    # triggers for the indexer changelog tables and otherwise fails with "You do not have the
+    # SUPER privilege and binary logging is enabled" (SQLSTATE HY000 1419). setup-magento.sh
+    # sets it with SET GLOBAL, but that is lost whenever this container restarts - so the very
+    # next setup:upgrade fails. Set it here so it survives restarts.
+    command: --default-authentication-plugin=mysql_native_password --ssl=0 --log-bin-trust-function-creators=1
 
   opensearch:
     image: opensearchproject/opensearch:2.19.3
