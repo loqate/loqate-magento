@@ -32,7 +32,7 @@ class CustomerAccountCreate extends AbstractPlugin
                 if ($errorMessage) {
                     $this->messageManager->addErrorMessage($errorMessage);
 
-                    $this->session->setCustomerFormData($request);
+                    $this->rememberCustomerFormData($request);
                     return $this->resultRedirectFactory->create()->setUrl(
                         $this->redirect->error($this->redirect->getRefererUrl())
                     );

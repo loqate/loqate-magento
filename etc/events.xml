@@ -7,6 +7,13 @@
         is persisted. This is the correct hook for Hyvä Checkout compatibility
         because Hyvä does not use the REST ShippingInformationManagement or
         BillingAddressManagement services that the existing plugins intercept.
+
+        DO NOT move this into etc/frontend/events.xml. Hyvä GraphQL checkout runs in the
+        'graphql' area and the REST checkout in 'webapi_rest', and NEITHER inherits
+        'frontend', so a frontend-only registration would silently disable verification on
+        the exact paths this observer was added for. The registration is global on purpose;
+        admin order create - which Plugin\Admin\OrderSave already verifies in one batch
+        call - is excluded at runtime instead, in QuoteSubmitBefore::isAdminArea().
     -->
     <event name="sales_model_service_quote_submit_before">
         <observer name="loqate_quote_submit_before_validate"

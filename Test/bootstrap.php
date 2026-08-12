@@ -22,6 +22,16 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
+// A random_bytes() inside the module's Helper namespace, so that one guarantee - the contact
+// digests failing CLOSED when the platform has no usable CSPRNG - can be observed at all.
+// Required here rather than autoloaded for two reasons: Composer's PSR-4 does not autoload
+// functions, and something that shadows a core PHP function for the whole suite belongs where a
+// reader of the bootstrap will see it rather than arriving as a side effect of loading a test.
+// It delegates to the real \random_bytes() unless a test explicitly switches it, and the switch
+// is restored in a finally, so every other test in the suite runs against the real CSPRNG.
+// See Test/Support/Csprng.php for the full argument.
+require __DIR__ . '/Support/CsprngOverride.php';
+
 // Magento framework stubs the unit tests depend on (skipped automatically when
 // the real Magento classes are available). registration.php guards its own
 // ComponentRegistrar call, so the Composer "files" autoload is safe here.

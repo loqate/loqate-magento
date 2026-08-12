@@ -4,26 +4,42 @@ namespace Loqate\ApiIntegration\Plugin;
 
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Extra;
+use Loqate\ApiIntegration\Helper\ShopperScopedSessionStores;
 use Magento\Checkout\Block\Checkout\LayoutProcessorInterface;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\CountryFactory;
 
 /**
- * @property Session $session
+ * Pre-selects a country in the checkout address fieldsets from the request's IP address.
+ *
+ * @see Plugin\ChangeAddressDefaultCountry for why the IP-country cache goes through
+ *      Helper\ShopperScopedSessionStores' named accessors and why that one attribute is
+ *      deliberately NOT enrolled in the shopper flush (LOQ-17149).
+ *
+ * NOTE that unlike every other reader of the seam, this plugin runs while a PAGE is being
+ * rendered. That is safe only because getIpCountry()/setIpCountry() do not run the ownership
+ * check and therefore write nothing of their own - the warning on
+ * ShopperScopedSessionStores::enforceOwnership() about not routing a cacheable path through
+ * getData() is about the ENROLLED accessors, and this class does not use them.
  */
 class ChangeCheckoutDefaultCountry
 {
     protected $countryFactory;
     private Extra $extra;
     private Data $helper;
-    private Session $session;
+
+    /**
+     * @var ShopperScopedSessionStores Reached only for the IP-country cache, through the named
+     *      accessors. The raw Session is deliberately not kept.
+     */
+    private ShopperScopedSessionStores $sessionStores;
 
     public function __construct(CountryFactory $countryFactory, Extra $extra, Data $helper, Session $session)
     {
         $this->countryFactory = $countryFactory;
         $this->extra = $extra;
         $this->helper = $helper;
-        $this->session = $session;
+        $this->sessionStores = new ShopperScopedSessionStores($session);
     }
 
     public function afterProcess(
@@ -34,10 +50,10 @@ class ChangeCheckoutDefaultCountry
             return $jsLayout;
         }
 
-        $countryResult = $this->session->getData('loqate_ipcountry');
+        $countryResult = $this->sessionStores->getIpCountry();
         if (!$countryResult) {
             $countryResult = $this->extra->ipToCountry();
-            $this->session->setData('loqate_ipcountry', $countryResult);
+            $this->sessionStores->setIpCountry($countryResult);
         }
 
         if (isset($countryResult['Iso2']) && $countryResult['Iso2'] != null) {

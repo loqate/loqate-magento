@@ -52,7 +52,7 @@ class CustomerAccountAddress extends AbstractPlugin
         }
 
         if (isset($error)) {
-            $this->session->setAddressFormData($request);
+            $this->rememberAddressFormData($request);
             return $this->resultRedirectFactory->create()->setUrl(
                 $this->redirect->error($this->redirect->getRefererUrl())
             );
