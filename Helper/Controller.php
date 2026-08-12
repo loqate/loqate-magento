@@ -166,6 +166,14 @@ class Controller
     /**
      * Store captured address in session so verify is not performed if the address hasn't changed
      *
+     * This is the ONLY writer of "captured_addresses", which is why that bypass only ever
+     * applied to addresses picked from the Loqate lookup - addresses Loqate itself
+     * authored - and not to typed ones (see Validator::verifyAddress()).
+     *
+     * The store is unbounded: it grows for the whole session, one serialised address per
+     * retrieve, inflating the session payload. Bounding it is tracked as LOQ-16978;
+     * Validator::VERIFY_CACHE_LIMIT deliberately does not repeat the pattern.
+     *
      * @param $result
      */
     protected function storeCapturedAddress($result)

@@ -112,6 +112,57 @@ class ValidatorTest extends TestCase
     }
 
     /**
+     * The captured-address match must keep working for stores that configure more than
+     * two street lines (customer/address/street_lines), where Magento delivers a third
+     * or fourth line the Loqate lookup has no field for at all: it stores Line1/Line2
+     * only (ADDRESS_CAPTURE_MAPPING).
+     *
+     * This is the regression risk of folding the joined street into the VERIFY cache
+     * keys: buildAddressSignature() is shared between that cache and this comparison,
+     * so had 'Address' been added to the signature itself, every captured entry - which
+     * has no 'Address' key and would normalise it to '' - would stop matching, and every
+     * address picked from the lookup would be re-verified and possibly rejected. That is
+     * exactly the defect the previous ticket fixed, so it is pinned here.
+     */
+    public function testCapturedLookupAddressWithMoreThanTwoStreetLinesIsStillMatched(): void
+    {
+        $stored = [$this->storedCapturedAddress([
+            'Line1' => '123 High Street',
+            'Line2' => 'Flat 2',
+            'CountryIso2' => 'GB',
+            'PostalCode' => 'SW1A 1AA',
+            'City' => 'London',
+            'ProvinceName' => 'Greater London',
+        ])];
+
+        foreach (
+            [
+                'third line' => ['123 High Street', 'Flat 2', 'Block C'],
+                'third and fourth lines' => ['123 High Street', 'Flat 2', 'Block C', 'Floor 9'],
+            ] as $label => $street
+        ) {
+            $parsed = $this->invokePrivate('parseAddress', [[
+                'street' => $street,
+                'city' => 'London',
+                'region' => 'London',
+                'postcode' => 'SW1A 1AA',
+                'country_id' => 'GB',
+            ]]);
+
+            $this->assertNotSame(
+                '',
+                $parsed['Address'],
+                'The joined street must be populated, so this really is the ' . $label . ' case.'
+            );
+            $this->assertTrue(
+                $this->invokePrivate('checkForCapturedAddress', [$parsed, $stored]),
+                'A lookup-selected address must still be recognised as captured with a ' . $label
+                . ' Magento supplied but the lookup never stored.'
+            );
+        }
+    }
+
+    /**
      * Trivial formatting differences (case, extra whitespace) must not break the
      * match, otherwise valid lookup addresses still get re-verified.
      */
