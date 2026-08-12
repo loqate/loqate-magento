@@ -26,7 +26,7 @@ use ReflectionProperty;
  * statements across five classes: Plugin\Frontend\CheckoutShippingInformation.php:32,
  * Plugin\Frontend\CheckoutBillingAddress.php:34 (which savePaymentInformation replays
  * at place order, so that one statement runs twice in a checkout),
- * Observer\QuoteSubmitBefore.php:60 and :84,
+ * Observer\QuoteSubmitBefore.php:85 and :109,
  * Plugin\Frontend\CustomerAccountAddress.php:37 and
  * Plugin\Admin\ValidateAddress.php:42. A single checkout of a single address therefore
  * invokes it 3-5 times depending on Magento version and checkout front-end, and
@@ -35,32 +35,58 @@ use ReflectionProperty;
  * "captured_addresses", matches solely addresses picked from the Loqate Capture
  * lookup, so a typed address is re-verified - and re-billed - on every one of those
  * paths. (The two verifyMultipleAddresses() sites, Plugin\Admin\OrderSave.php:49 and
- * Plugin\Admin\ValidateImportAddress.php:38, are deliberately NOT covered by this
+ * Plugin\Admin\ValidateImportAddress.php:53, are deliberately NOT covered by this
  * cache - LOQ-16976 - and so are not covered here either.)
  *
- * The contract asserted here: identical addresses are verified once per session
- * and the verdict is replayed from a bounded, session-scoped cache keyed by the
- * canonical address signature. The two keys are deliberately ASYMMETRIC:
- *  - a SUCCESS is keyed WITHOUT the region/county, because capture.js and
- *    parseAddress() both rewrite it ("Meath" becomes "Co. Meath", a region_id is
- *    re-resolved to a name) and that is exactly the re-billing the customer
- *    reported - see testMutatedCountyNameDoesNotTriggerASecondBillableApiCall();
- *  - a REJECTION is keyed WITH it, because a shopper who corrects a wrong county
- *    must be re-verified rather than locked out of checkout by a replayed
- *    rejection - see testCorrectingOnlyTheCountyAfterARejectionIsVerifiedAgain().
- * The rejection (strict) key is also the one READ FIRST, so reverting to a county
- * Loqate explicitly rejected replays that rejection instead of the county-agnostic
- * success - see testRevertingToTheRejectedCountyReplaysTheCachedRejection() and, for
- * the residual bypass that is deliberately kept,
- * testACountyVariantLoqateNeverRejectedStillPassesFromTheCachedSuccess().
- * Both verify keys also cover the FULL joined street Loqate is actually sent, not
- * just the two lines the captured-address signature carries - see
- * testEditingAStreetLineBeyondTheSecondIsVerifiedAgain(). More generally, the strict
- * key must project EVERY field parseAddress() sends to Loqate and the lossy key
- * exactly that list minus the county; that invariant is pinned structurally by
- * testStrictCacheKeyProjectsEveryFieldSentToLoqate() and, load-bearingly, per field
+ * THE CONTRACT ASSERTED HERE, in one sentence: two submissions share a cached verdict
+ * IF AND ONLY IF they sent Loqate the same normalised address. There is ONE cache key;
+ * it projects every field parseAddress() puts in the request; successes and rejections
+ * live under it alike; and identical addresses are therefore verified once per session,
+ * the verdict being replayed from a bounded, session-scoped store.
+ *
+ * ON THE REGION AXIS - the axis every defect in this cache has been about so far - that
+ * single rule reads: two submissions share a verdict iff their RESOLVED region label is
+ * identical. parseAddress() (Helper/Validator.php:851-883) resolves 'region' from
+ * 'region_id' through RegionFactory whenever a truthy region_id is present, and only
+ * then maps 'region' onto the request's Address4 - so the region segment of the key IS
+ * the region value Loqate was actually asked about, expressed as the resolved region
+ * NAME rather than an install-local numeric id (which is why one address presented by
+ * different checkout call paths still shares one verdict - see
+ * testBothCheckoutCallPathShapesOfOneAddressAreBilledOnce()). Three consequences, each
+ * pinned below:
+ *  - a shopper whose region_id stays put while the raw region TEXT churns around it -
+ *    which is what the Capture front end produces, since it sets both 'region' and
+ *    'region_id' from the SDK's ProvinceName (mapRegionSelectValue(),
+ *    view/base/web/capture.js:7896-7940, over dispatchChange() at :7884-7894, retried
+ *    with exponential backoff at :7942-7960) - sends the identical Address4 every time,
+ *    so one address is billed once across the 3-5 checkout call paths. See
+ *    testRelabellingTheRegionAroundAFixedRegionIdIsBilledOnce();
+ *  - two DIFFERENT region records resolve to two different labels, so each is verified
+ *    in its own right and neither is ever served the other's verdict. See
+ *    testTwoSubmissionsShareAVerdictOnlyWhenTheyResolveToTheSameRegion(),
+ *    testARegionThatWasNeverVerifiedIsNeverServedAnotherRegionsSuccess() and the
+ *    tripwire testRegionRecordsWhoseLabelsReadAlikeAreStillEachVerified();
+ *  - ACCEPTED LIMIT, asserted rather than assumed: where the region is FREE TEXT (no
+ *    region_id at all), re-spelling that text is a different key and costs ONE extra
+ *    verification. See testRespellingAFreeTextRegionCostsOneExtraVerificationAndBypassesNone().
+ *    That is the safe direction - a re-bill, never an address reaching checkout on a
+ *    verdict Loqate gave to a different address. No spelling rules are applied to close
+ *    it: a rule that merges two labels merges two PLACES whenever it is wrong, and that
+ *    is a verify bypass, whereas leaving them apart is only a re-bill.
+ *
+ * The one key also covers the FULL joined street Loqate is actually sent, not just the
+ * two lines the captured-address signature carries - see
+ * testEditingAStreetLineBeyondTheSecondIsVerifiedAgain(). More generally it must project
+ * EVERY field parseAddress() sends to Loqate. That invariant is pinned structurally by
+ * testTheVerifyCacheKeyProjectsEveryFieldSentToLoqate() and, load-bearingly, per field
  * by testEditingAnyFieldSentToLoqateAfterARejectionIsVerifiedAgain() and
- * testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess().
+ * testEditingAnyFieldSentToLoqateIsVerifiedAgainAfterASuccess() - which assert the SAME
+ * guarantee on both sides, because one key serves both.
+ *
+ * A cached verdict also records the version of the key scheme it was written under and
+ * is discarded when that does not match, so a session that spans a deploy changing the
+ * key cannot be answered by a verdict looked up under the old scheme - see
+ * testACachedVerdictWrittenUnderAnEarlierKeySchemeIsDiscardedRatherThanReplayed().
  *
  * Entries are additionally namespaced per STORE VIEW and by a fingerprint of the
  * RESOLVED AVC thresholds, since the thresholds a verdict depends on are read at
@@ -164,9 +190,12 @@ class ValidatorVerifyCacheTest extends TestCase
             'base' => self::FIELD_EDIT_BASE,
             'edit' => ['city' => 'Manchester'],
         ],
+        // A GENUINELY DIFFERENT region, naming a different place rather than re-spelling
+        // the same one, so the fixture reads as an EDIT: the two submissions ask Loqate
+        // about Greater London and about Berkshire, and each must get its own verdict.
         'region' => [
             'base' => self::FIELD_EDIT_BASE,
-            'edit' => ['region' => 'Co. Meath'],
+            'edit' => ['region' => 'Berkshire'],
         ],
         'postcode' => [
             'base' => self::FIELD_EDIT_BASE,
@@ -176,6 +205,24 @@ class ValidatorVerifyCacheTest extends TestCase
             'base' => self::FIELD_EDIT_BASE,
             'edit' => ['country_id' => 'IE'],
         ],
+    ];
+
+    /**
+     * The rows of the install's region directory these tests resolve a region_id against,
+     * region_id => region name, as Magento's directory_country_region table holds them.
+     *
+     * Every name is distinct, because two rows are two places: whichever row a shopper
+     * picks is the region Loqate is asked about. The Dublin pair models a real distinction
+     * (a city postal district and the administrative county around it) and the Meath pair
+     * models an install whose region table carries an abbreviated label alongside a plain
+     * one - the two shapes a label-based collapsing rule would merge.
+     */
+    private const REGION_DIRECTORY = [
+        55 => 'Kildare',
+        100 => 'Dublin 1',
+        101 => 'County Dublin',
+        200 => 'Meath',
+        201 => 'Co. Meath',
     ];
 
     /** @var Validator The Validator under test (the "primary" shopper). */
@@ -419,6 +466,10 @@ class ValidatorVerifyCacheTest extends TestCase
      * The verdict must be cached where the rest of the module expects session
      * state to live: an assoc array under "loqate_verified_addresses", holding
      * serialised verdicts (mirroring the captured_addresses precedent).
+     *
+     * Asserted on the verdict FLAG rather than on the whole payload, because the payload
+     * also carries the key-scheme stamp - see
+     * testACachedVerdictWrittenUnderAnEarlierKeySchemeIsDiscardedRatherThanReplayed().
      */
     public function testSuccessfulVerdictIsStoredSerialisedUnderTheSessionKey(): void
     {
@@ -438,10 +489,14 @@ class ValidatorVerifyCacheTest extends TestCase
             (string)array_key_first($store),
             'The cache must be keyed, by the address signature namespaced to the store view.'
         );
-        $this->assertSame(
-            ['error' => false],
-            json_decode((string)reset($store), true),
+        $payload = json_decode((string)reset($store), true);
+        $this->assertIsArray(
+            $payload,
             'The verdict must be stored serialised, so it can be replayed verbatim.'
+        );
+        $this->assertFalse(
+            $payload['error'] ?? null,
+            'The stored payload must carry the verdict that was earned off the wire.'
         );
     }
 
@@ -524,10 +579,19 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * A verdict may not outlive the session that earned it. After a logout or a
-     * session regeneration the session data is gone, so the address has to be
-     * verified against the API again - proving the cache is session state and not
-     * hidden anywhere with a longer lifetime.
+     * A verdict may not outlive the session that earned it. In a BRAND-NEW browser session
+     * - a different visitor, a cleared cookie, a session garbage-collected between visits -
+     * there is no backing data to read, so the address has to be verified against the API
+     * again. That proves the cache is session state and is not hidden anywhere with a
+     * longer lifetime (a static, the registry, a cache backend, the customer entity).
+     *
+     * IT DOES NOT MODEL A LOGOUT OR A SESSION-ID REGENERATION, and must not be read as
+     * doing so - that is the belief LOQ-16978 exists to correct. Magento calls
+     * session_regenerate_id() on login and on logout, which changes the session ID while
+     * PRESERVING every value in $_SESSION, so the cache emphatically DOES survive both.
+     * What clears it there is Helper\ShopperScopedAddressStores, not PHP; the logout and login
+     * cases are covered by ShopperScopedAddressStoresTest::testACachedVerdictDoesNotSurviveALogin()
+     * and its siblings.
      */
     public function testCachedVerdictDoesNotSurviveASessionReset(): void
     {
@@ -536,12 +600,12 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->validator->verifyAddress(self::ADDRESS);
         $this->assertCount(1, $this->verdictStore(), 'The verdict must be written to the session.');
 
-        $this->endSession($this->shopper);
+        $this->startBrandNewSession($this->shopper);
 
         $this->assertSame(
             [],
             $this->verdictStore(),
-            'Clearing the session must clear the verdict cache: it may not be held anywhere else.'
+            'A brand-new session must start with an empty verdict cache: it may not be held anywhere else.'
         );
 
         $result = $this->validator->verifyAddress(self::ADDRESS);
@@ -549,7 +613,7 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'After a session reset the address must be verified against the API again.'
+            'In a brand-new session the address must be verified against the API again.'
         );
         $this->assertSame(['error' => false], $result);
         $this->assertCount(
@@ -614,84 +678,111 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The regression the customer reported: capture.js mutates the county
-     * ("Meath" -> "Co. Meath") between the shipping and billing saves. The
-     * county is not part of the canonical signature, so this is still the same
-     * address and must not be re-billed.
+     * The regression the customer reported, modelled the way it actually arrives: the raw
+     * region TEXT is rewritten between the shipping and the billing save while the
+     * region_id stays exactly where it is.
      *
-     * This is the mirror image of
-     * testCorrectingOnlyTheCountyAfterARejectionIsVerifiedAgain() and the reason the
-     * two cache keys are deliberately ASYMMETRIC: a SUCCESS is keyed without the
-     * county (lossy) so a rewritten county cannot re-bill it - the whole point of
-     * LOQ-16969 - while a REJECTION is keyed WITH the county (strict) so correcting a
-     * wrong county is re-verified instead of replaying a rejection forever. Making
-     * both keys the same, in either direction, breaks one of these two tests: do not
-     * "simplify" the asymmetry away.
+     * That is the shape the churn really has. The Capture front end sets both 'region' and
+     * 'region_id' from the SDK's ProvinceName (mapRegionSelectValue(),
+     * view/base/web/capture.js:7896-7940, over dispatchChange() at :7884-7894, retried with
+     * exponential backoff at :7942-7960), and parseAddress() then re-resolves 'region' from
+     * that region_id, so every one of these submissions asks Loqate about the SAME region -
+     * whatever text happened to be sitting in the field. One address, one billable
+     * verification, however many times the label is rewritten.
      */
-    public function testMutatedCountyNameDoesNotTriggerASecondBillableApiCall(): void
+    public function testRelabellingTheRegionAroundAFixedRegionIdIsBilledOnce(): void
     {
         $this->stubApiResponses([self::acceptedResponse()]);
+        $this->regionNames = self::REGION_DIRECTORY;
 
-        $address = [
-            'street' => ['12 Main Street'],
-            'city' => 'Navan',
-            'region' => 'Meath',
-            'postcode' => 'C15 XXXX',
-            'country_id' => 'IE',
-        ];
-
-        $this->validator->verifyAddress($address);
-        $this->validator->verifyAddress(array_merge($address, ['region' => 'Co. Meath']));
+        $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200, 'region' => 'Meath']));
+        $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200, 'region' => 'Co. Meath']));
+        $this->validator->verifyAddress(
+            self::addressInRegion('IE', ['region_id' => 200, 'region' => 'County Meath'])
+        );
 
         $this->assertSame(
             1,
             $this->apiCallCount(),
-            'A county/province rewritten by capture.js must not make the same address billable twice.'
+            'All three submissions name the same region record, so all three ask Loqate the identical '
+            . 'question: the address must be billed exactly once however often the region label text is '
+            . 'rewritten around that record.'
+        );
+        $this->assertCount(
+            1,
+            $this->verdictStore(),
+            'And they must share the one cache entry, rather than writing further entries that are never '
+            . 'read.'
         );
     }
 
     /**
-     * The checkout dead-end that the strict rejection key exists to prevent, and the
-     * most expensive failure mode of a cached rejection: a lost order.
+     * THE ACCEPTED LIMIT, pinned as behaviour so nobody has to trust a comment for it: on a
+     * country whose region is FREE TEXT - no region_id at all - re-spelling that text costs
+     * ONE extra billable verification.
      *
-     * A shopper submits an address with the WRONG county, Loqate rejects it, and the
-     * rejection is cached. Every later checkout call path replays that rejection for
-     * free (good - a rejection blocks checkout, so re-billing it is waste). But the
-     * moment the shopper fixes ONLY the county - the single field a rejection is most
-     * likely to be about, and the field the SUCCESS key deliberately ignores - the
-     * address must be sent to Loqate again. Were the rejection keyed on the lossy
-     * signature, the corrected address would hit the same key, be served the stale
-     * rejection with no API call, and the shopper could never get out of checkout for
-     * the rest of the session however often they corrected the county.
-     *
-     * The sequence continues in testRevertingToTheRejectedCountyReplaysTheCachedRejection()
-     * (revert to the rejected county) and
-     * testACountyVariantLoqateNeverRejectedStillPassesFromTheCachedSuccess() (the
-     * residual bypass that is deliberately kept), which together pin the ORDER the two
-     * keys are read in.
+     * This is the deliberate direction of the trade. The two submissions genuinely ask
+     * Loqate about different region text, so the second is verified and gets its OWN
+     * verdict; the price is one re-bill on a rare shape. The opposite direction - teaching
+     * the cache that two spellings name one place - buys that request back only while the
+     * guess is right, and whenever it is wrong it serves an address a verdict Loqate gave
+     * to a DIFFERENT place, which is a verify bypass on a typed address. A re-bill is
+     * recoverable; a bypass is not, so it is not attempted.
      */
-    public function testCorrectingOnlyTheCountyAfterARejectionIsVerifiedAgain(): void
+    public function testRespellingAFreeTextRegionCostsOneExtraVerificationAndBypassesNone(): void
     {
-        // Rejected first; accepted once the county is right.
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $accepted = $this->validator->verifyAddress(self::addressInRegion('IE', ['region' => 'Meath']));
+        $respelt = $this->validator->verifyAddress(self::addressInRegion('IE', ['region' => 'Co. Meath']));
+
+        $this->assertSame(['error' => false], $accepted, 'The first submission must be accepted off the wire.');
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'With no region record behind it, the region text IS the region Loqate is asked about, so '
+            . 're-spelling it asks a different question and costs one further verification. Accepted: a '
+            . 're-bill is the safe direction, because the alternative is serving an address a verdict '
+            . 'earned by a different place.'
+        );
+        $this->assertTrue(
+            $respelt['error'],
+            'And the re-spelt submission must carry ITS OWN verdict: whatever it costs, it must never be '
+            . 'answered with the verdict the other spelling earned.'
+        );
+    }
+
+    /**
+     * The checkout dead-end a cached rejection can cause, on the free-text region shape,
+     * and the most expensive failure mode this cache has: a lost order.
+     *
+     * A shopper submits an address whose region is wrong, Loqate rejects it, and the
+     * rejection is cached. Every later checkout call path replays that rejection for free
+     * (good - a rejection blocks checkout, so re-billing it is waste). But the moment the
+     * shopper edits the region, the address must be sent to Loqate again: it is a different
+     * address, so the recorded "no" no longer applies to it. An implementation that
+     * replayed the rejection anyway would leave the shopper unable to get out of checkout
+     * for the rest of the session however often they corrected the field.
+     *
+     * The sequence continues in
+     * testResubmittingTheExactAddressLoqateRejectedReplaysThatRejection().
+     */
+    public function testCorrectingAWrongFreeTextRegionAfterARejectionIsVerifiedAgain(): void
+    {
+        // Rejected first; accepted once the region is right.
         $this->stubApiResponses([self::rejectedResponse(), self::acceptedResponse()]);
 
-        $wrongCounty = [
-            'street' => ['12 Main Street'],
-            'city' => 'Navan',
-            'region' => 'Meath',
-            'postcode' => 'C15 XXXX',
-            'country_id' => 'IE',
-        ];
+        $wrongRegion = self::addressInRegion('IE', ['region' => 'Meath']);
 
         // (1) First submission: rejected off the wire.
-        $rejected = $this->validator->verifyAddress($wrongCounty);
+        $rejected = $this->validator->verifyAddress($wrongRegion);
 
         $this->assertSame(1, $this->apiCallCount(), 'The first submission must reach the API.');
         $this->assertTrue($rejected['error'], 'The address must be rejected.');
 
-        // (2) The identical address, county included, replayed by a later checkout
+        // (2) The identical address, region included, replayed by a later checkout
         // call path: served from the cache, still one billable request.
-        $replayed = $this->validator->verifyAddress($wrongCounty);
+        $replayed = $this->validator->verifyAddress($wrongRegion);
 
         $this->assertSame(
             1,
@@ -701,170 +792,612 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->assertTrue($replayed['error'], 'The cached rejection must still reject the unchanged address.');
         $this->assertSame('The provided address is invalid.', (string)$replayed['message']);
 
-        // (3) ONLY the county corrected: this must be verified again and is free to
+        // (3) ONLY the region edited: this must be verified again and is free to
         // succeed, or the shopper is locked out of checkout for the whole session.
-        $corrected = $this->validator->verifyAddress(array_merge($wrongCounty, ['region' => 'Co. Meath']));
+        $corrected = $this->validator->verifyAddress(self::addressInRegion('IE', ['region' => 'Co. Meath']));
 
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'Correcting the county of a rejected address must trigger a fresh verification: '
-            . 'a rejection cached without the county is a permanent checkout dead-end.'
+            'Editing the region of a rejected address must trigger a fresh verification: a rejection that '
+            . 'outlives the address it was given for is a permanent checkout dead-end.'
         );
         $this->assertSame(
             ['error' => false],
             $corrected,
             'The corrected address must get the live verdict, not the cached rejection.'
         );
+
+        // (4) A region naming a different place again: Loqate has never judged this
+        // address in Kildare, so it must be asked.
+        $differentRegion = $this->validator->verifyAddress(self::addressInRegion('IE', ['region' => 'Kildare']));
+
+        $this->assertSame(
+            3,
+            $this->apiCallCount(),
+            'A region Loqate was never asked about must be verified in its own right, never answered by a '
+            . 'verdict earned for another region: that would put an address Loqate has never judged through '
+            . 'checkout.'
+        );
+        $this->assertSame(
+            ['error' => false],
+            $differentRegion,
+            'The differently-regioned address must get its own live verdict.'
+        );
     }
 
     /**
-     * The same dead-end guard for the other address shape checkout uses: the county
-     * arrives as a region_id that parseAddress() resolves through RegionFactory
-     * (Quote\Address and the admin grid both take this path), so the strict rejection
-     * key has to see the resolved name, not the raw id.
+     * I4 - CORRECTING A GENUINELY WRONG REGION CLEARS A CACHED REJECTION, on the shape
+     * checkout and the admin grid actually deliver: the region arrives as a region_id that
+     * parseAddress() resolves through RegionFactory.
+     *
+     * Three claims in one sequence, and the middle one is what stops the other two being
+     * satisfied by a cache that simply never hits:
+     *  - the rejected address is billed once;
+     *  - re-submitting it unchanged replays that rejection for free;
+     *  - picking a different region record is a different address, so it is verified again
+     *    and is free to be accepted. Otherwise the shopper cannot escape checkout by
+     *    correcting the one field the rejection was about.
      */
-    public function testCorrectingOnlyTheRegionIdAfterARejectionIsVerifiedAgain(): void
+    public function testCorrectingAGenuinelyWrongRegionClearsACachedRejection(): void
     {
         $this->stubApiResponses([self::rejectedResponse(), self::acceptedResponse()]);
-        $this->regionNames = [100 => 'Meath', 101 => 'Louth'];
+        $this->regionNames = self::REGION_DIRECTORY;
 
-        $address = [
-            'street' => ['12 Main Street'],
-            'city' => 'Navan',
-            'postcode' => 'C15 XXXX',
-            'country_id' => 'IE',
-        ];
-
-        $rejected = $this->validator->verifyAddress(array_merge($address, ['region_id' => 100]));
+        $rejected = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200]));
         $this->assertSame(1, $this->apiCallCount(), 'The first submission must reach the API.');
-        $this->assertTrue($rejected['error']);
+        $this->assertTrue($rejected['error'], 'The address must be rejected off the wire.');
 
-        $replayed = $this->validator->verifyAddress(array_merge($address, ['region_id' => 100]));
+        $replayed = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200]));
         $this->assertSame(
             1,
             $this->apiCallCount(),
-            'An unchanged rejected address must be replayed from the cache.'
+            'An unchanged rejected address must be replayed from the cache rather than re-billed.'
         );
-        $this->assertTrue($replayed['error']);
+        $this->assertTrue($replayed['error'], 'The replayed verdict must still be the rejection.');
 
-        $corrected = $this->validator->verifyAddress(array_merge($address, ['region_id' => 101]));
+        $corrected = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 55]));
 
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'Picking a different region_id after a rejection must trigger a fresh verification.'
+            'Picking a different region record after a rejection must trigger a fresh billable '
+            . 'verification: the recorded "no" was given for another address, and a shopper who corrects '
+            . 'the region must not be held in checkout by it.'
         );
-        $this->assertSame(['error' => false], $corrected);
+        $this->assertSame(
+            ['error' => false],
+            $corrected,
+            'And the corrected address must get its own live verdict, not the cached rejection.'
+        );
     }
 
     /**
-     * The read ORDER of the two keys, which nothing else in this file pins.
+     * The guarantee for the address a shopper is most likely to submit next: the one Loqate
+     * has just said no to.
      *
-     * verifyAddress() reads the strict (rejection) key BEFORE the lossy (success) one.
-     * Both are plain cache reads, so the order costs nothing, and exactly one case
-     * changes: a shopper who is rejected, corrects the county, is accepted, and then
-     * REVERTS to the county Loqate explicitly rejected. Strict-read-first hands back
-     * that recorded rejection; lossy-read-first would hand back the county-agnostic
-     * success and let an address Loqate said no to through checkout.
-     *
-     * Flipping the two reads in verifyAddress() leaves every other test in this file
-     * green, so this test is what makes the order load-bearing. Neither variant issues
-     * a further billable request - the difference is purely which cached verdict wins.
+     * A shopper is rejected, edits the region, is accepted, and then puts the original
+     * region back. That third submission is byte-for-byte the address Loqate REJECTED, so it
+     * must be answered with that rejection - and answered from the cache, because re-billing
+     * an address Loqate has already judged is the waste this whole cache exists to remove.
+     * Neither half is optional: handing it the OTHER submission's "valid" would put an
+     * address Loqate said no to through checkout, and re-billing it would be paying twice
+     * for one answer.
      */
-    public function testRevertingToTheRejectedCountyReplaysTheCachedRejection(): void
+    public function testResubmittingTheExactAddressLoqateRejectedReplaysThatRejection(): void
     {
         $this->stubApiResponses([self::rejectedResponse(), self::acceptedResponse()]);
 
-        $wrongCounty = [
-            'street' => ['12 Main Street'],
-            'city' => 'Navan',
-            'region' => 'Meath',
-            'postcode' => 'C15 XXXX',
-            'country_id' => 'IE',
-        ];
-        $rightCounty = array_merge($wrongCounty, ['region' => 'Co. Meath']);
+        $rejectedRegion = self::addressInRegion('IE', ['region' => 'Meath']);
+        $acceptedRegion = self::addressInRegion('IE', ['region' => 'Co. Meath']);
 
-        // (1) Rejected with the wrong county, (2) accepted once it is corrected.
-        $this->assertTrue($this->validator->verifyAddress($wrongCounty)['error']);
-        $this->assertSame(['error' => false], $this->validator->verifyAddress($rightCounty));
+        // (1) Rejected with the first region, (2) accepted with the second.
+        $this->assertTrue($this->validator->verifyAddress($rejectedRegion)['error']);
+        $this->assertSame(['error' => false], $this->validator->verifyAddress($acceptedRegion));
         $this->assertSame(2, $this->apiCallCount(), 'Both submissions must have reached the API.');
 
-        // (3) Back to the county Loqate explicitly rejected.
-        $reverted = $this->validator->verifyAddress($wrongCounty);
+        // (3) Back to the exact address Loqate rejected.
+        $reverted = $this->validator->verifyAddress($rejectedRegion);
 
         $this->assertTrue(
             $reverted['error'],
-            'Reverting to a county Loqate explicitly REJECTED must replay that rejection: the strict key '
-            . 'is read before the county-agnostic success key, so the recorded "no" wins.'
+            'Re-submitting the exact address Loqate REJECTED must be answered with that rejection: any '
+            . 'other answer lets an address Loqate said no to through checkout.'
         );
         $this->assertSame('The provided address is invalid.', (string)$reverted['message']);
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'The rejection comes from the strict cache entry, so reverting must not cost a billable request.'
+            'And it must be answered from the cache: an address Loqate has already judged must never be '
+            . 'billed a second time.'
         );
     }
 
     /**
-     * The deliberately-accepted residual bypass, and the reason the SUCCESS key stays
-     * lossy (LOQ-16969): once ANY county variant of an address is accepted, every county
-     * variant Loqate has NOT explicitly rejected also passes from the cache for the rest
-     * of the session.
+     * The exact width of a cached success: it is replayed for the address that earned it and
+     * for nothing else.
      *
-     * This is a trade-off, not an oversight. Keying successes strictly would re-bill
-     * exactly what this ticket fixes (capture.js rewrites "Meath" to "Co. Meath",
-     * parseAddress() re-resolves a region_id to a name), and the pre-existing
-     * captured_addresses guard has always behaved this way. It is pinned here so that
-     * anyone tightening it does so knowingly, and so the scope of the bypass stays
-     * exactly this: variants Loqate never rejected, since a rejected one is caught by
-     * the strict read - see testRevertingToTheRejectedCountyReplaysTheCachedRejection().
+     * Asserted as one sequence over the region axis, because that is where the width is
+     * decided. A submission naming the SAME region record as the accepted one - whatever
+     * text happens to be in the region field - asks Loqate the identical question and is
+     * served the success for free. A submission naming a DIFFERENT region record asks a
+     * different question, so it is verified in its own right; serving it the cached "valid"
+     * would put an address Loqate has never judged through checkout, which is a verify
+     * bypass on a typed address (strictly wider than the captured-address bypass, which only
+     * ever covers addresses the Loqate lookup itself authored).
      */
-    public function testACountyVariantLoqateNeverRejectedStillPassesFromTheCachedSuccess(): void
+    public function testACachedSuccessIsReplayedForTheVerifiedRegionAndForNoOther(): void
     {
         $this->stubApiResponses([self::rejectedResponse(), self::acceptedResponse()]);
+        $this->regionNames = self::REGION_DIRECTORY;
 
-        $wrongCounty = [
-            'street' => ['12 Main Street'],
-            'city' => 'Navan',
-            'region' => 'Meath',
-            'postcode' => 'C15 XXXX',
-            'country_id' => 'IE',
-        ];
-
-        $this->assertTrue($this->validator->verifyAddress($wrongCounty)['error']);
+        $this->assertTrue($this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 55]))['error']);
         $this->assertSame(
             ['error' => false],
-            $this->validator->verifyAddress(array_merge($wrongCounty, ['region' => 'Co. Meath']))
+            $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200]))
         );
         $this->assertSame(2, $this->apiCallCount(), 'Both submissions must have reached the API.');
 
-        // A THIRD county spelling, which Loqate has never been asked about: it is served
-        // the cached success, because the success key excludes the county.
-        $neverJudged = $this->validator->verifyAddress(array_merge($wrongCounty, ['region' => 'County Meath']));
+        // The accepted region record again, with the region label text rewritten around it
+        // the way the Capture front end rewrites it: the same question, already answered.
+        $sameRegionRelabelled = $this->validator->verifyAddress(
+            self::addressInRegion('IE', ['region_id' => 200, 'region' => 'County Meath'])
+        );
 
         $this->assertSame(
             ['error' => false],
-            $neverJudged,
-            'A county variant Loqate never rejected is deliberately served the cached success: the success '
-            . 'key excludes the county so a rewritten county cannot re-bill the same address.'
+            $sameRegionRelabelled,
+            'A submission naming the region record that was accepted must be served that success: it is '
+            . 'the address Loqate already approved, and re-billing it is the waste this cache removes.'
         );
         $this->assertSame(
             2,
             $this->apiCallCount(),
-            'The accepted trade-off is that this costs no further billable request either.'
+            'Re-submitting the accepted region must cost no further billable request.'
+        );
+
+        // A region record Loqate has never been asked about.
+        $differentRegion = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 101]));
+
+        $this->assertSame(
+            3,
+            $this->apiCallCount(),
+            'A region Loqate was never asked about must be verified in its own right: serving it the '
+            . 'verdict another region earned puts an address Loqate has never judged through checkout.'
+        );
+        $this->assertSame(
+            ['error' => false],
+            $differentRegion,
+            'The differently-regioned address must get its own live verdict.'
         );
     }
 
     /**
-     * Same address, but Magento resolves a different region record ("Dublin" vs
-     * "Dublin 1"). Region is resolved via RegionFactory into Address4, which the
-     * signature deliberately excludes, so this must not re-bill either.
+     * I1 - THE WHOLE CONTRACT ON THE REGION AXIS, AS A TABLE: two submissions of one
+     * address that differ only in how the region is given share a billable verification IF
+     * AND ONLY IF they ask Loqate about the same region.
+     *
+     * Every row's justification is an EXTERNAL fact - which region RECORD of the install's
+     * directory each submission resolves to, or, where no record is named, what region text
+     * reaches the request - and never a statement about how the module is written. The
+     * external fact is not merely asserted in prose either: before the two submissions are
+     * made against one shopper, each address is sent on a throwaway shopper of its own and
+     * the region that actually reached Loqate is compared, so a row whose premise stops
+     * holding fails on its own precondition instead of quietly testing something else.
+     *
+     * @param array $firstRegion Magento region keys of the first submission ('region',
+     *                           'region_id'), or [] to name no region at all.
+     * @param array $secondRegion Magento region keys of the second submission.
+     * @param int $expectedCalls 1 when both ask about the same region, 2 when they do not.
+     * @param string $resolvesTo The external fact: which region each submission names.
      */
-    public function testDifferentRegionIdDoesNotTriggerASecondBillableApiCall(): void
-    {
+    #[DataProvider('regionAxisProvider')]
+    public function testTwoSubmissionsShareAVerdictOnlyWhenTheyResolveToTheSameRegion(
+        array $firstRegion,
+        array $secondRegion,
+        int $expectedCalls,
+        string $resolvesTo
+    ): void {
+        $this->regionNames = self::REGION_DIRECTORY;
+        $first = self::addressInRegion('IE', $firstRegion);
+        $second = self::addressInRegion('IE', $secondRegion);
+
+        // The row's premise, established on the wire rather than claimed: do these two
+        // submissions ask Loqate about the same region or about different ones? Compared
+        // the way any address field is compared - trivial reformatting of a value is not a
+        // different value, see testBuildAddressSignatureNormalisesCaseAndWhitespace().
+        $sentFirst = self::asComparableRegion($this->regionSentToLoqate($first));
+        $sentSecond = self::asComparableRegion($this->regionSentToLoqate($second));
+        if ($expectedCalls === 1) {
+            $this->assertSame(
+                $sentFirst,
+                $sentSecond,
+                sprintf('Precondition of this row: %s, so both submissions send Loqate one region.', $resolvesTo)
+            );
+        } else {
+            $this->assertNotSame(
+                $sentFirst,
+                $sentSecond,
+                sprintf('Precondition of this row: %s, so the two submissions send Loqate '
+                    . 'different regions.', $resolvesTo)
+            );
+        }
+
         $this->stubApiResponses([self::acceptedResponse()]);
-        $this->regionNames = [100 => 'Dublin', 101 => 'Dublin 1'];
+
+        $this->validator->verifyAddress($first);
+        $this->validator->verifyAddress($second);
+
+        $this->assertSame(
+            $expectedCalls,
+            $this->apiCallCount(),
+            sprintf(
+                'Two submissions must share one billable verification if and only if they ask Loqate about '
+                . 'the same address. Here %s, so the second submission must %s.',
+                $resolvesTo,
+                $expectedCalls === 1
+                    ? 'be answered from the first verdict without a further billable request - paying twice '
+                        . 'for one answer is the over-billing this cache exists to remove'
+                    : 'be verified in its own right - answering it with the first verdict would put an '
+                        . 'address Loqate has never judged through checkout'
+            )
+        );
+        $this->assertCount(
+            $expectedCalls,
+            $this->verdictStore(),
+            'One cache entry per address Loqate was actually asked about, so submissions that share a '
+            . 'verdict must share the entry rather than writing a second one that is never read.'
+        );
+    }
+
+    /**
+     * One row per way the region can arrive, justified by which region each submission
+     * names and by nothing else.
+     *
+     * @return array<string, array{0: array, 1: array, 2: int, 3: string}>
+     */
+    public static function regionAxisProvider(): array
+    {
+        return [
+            // Same region record, region label text churning around it. This is the
+            // reported regression: the Capture front end sets both region fields from
+            // ProvinceName, so a real churn carries the region_id with it.
+            'one region record, label text rewritten' => [
+                ['region_id' => 200, 'region' => 'Meath'],
+                ['region_id' => 200, 'region' => 'Co. Meath'],
+                1,
+                'both submissions name directory region 200, which is Meath',
+            ],
+            'one region record, a third label spelling' => [
+                ['region_id' => 200, 'region' => 'County Meath'],
+                ['region_id' => 200, 'region' => 'Meath'],
+                1,
+                'both submissions name directory region 200, which is Meath',
+            ],
+            'one region record, no label text at all on one side' => [
+                ['region_id' => 200],
+                ['region_id' => 200, 'region' => 'Co. Meath'],
+                1,
+                'both submissions name directory region 200, which is Meath',
+            ],
+            // The cross-call-path case: the dropdown and the typed field can name one
+            // place, which is why the region is keyed by the name it resolves to.
+            'a region record and the same place typed as free text' => [
+                ['region_id' => 200],
+                ['region' => 'Meath'],
+                1,
+                'directory region 200 IS Meath, so a shopper who picked it and one who typed it name one '
+                    . 'place',
+            ],
+            // An empty region_id names no record, so the typed text stands - the shape the
+            // customer-account and admin address POSTs actually deliver.
+            'an empty region_id beside the same label text' => [
+                ['region_id' => '', 'region' => 'Meath'],
+                ['region' => 'Meath'],
+                1,
+                'neither submission names a directory region, and both give the region as Meath',
+            ],
+            'no region record, identical label text' => [
+                ['region' => 'Meath'],
+                ['region' => 'Meath'],
+                1,
+                'neither submission names a directory region, and both give the region as Meath',
+            ],
+            'no region record, label text reformatted only' => [
+                ['region' => 'Meath'],
+                ['region' => '  meath '],
+                1,
+                'neither submission names a directory region, and both give the region as Meath, one of '
+                    . 'them re-cased and padded by the form',
+            ],
+
+            // Different regions. Each of these is a different question for Loqate.
+            'two different region records' => [
+                ['region_id' => 200],
+                ['region_id' => 55],
+                2,
+                'directory region 200 is Meath and 55 is Kildare, two different places',
+            ],
+            'no region record, different label text' => [
+                ['region' => 'Meath'],
+                ['region' => 'Co. Meath'],
+                2,
+                'neither submission names a directory region, so the region text is what Loqate is asked '
+                    . 'about, and the two texts differ',
+            ],
+            'a region record against no region at all' => [
+                [],
+                ['region_id' => 200],
+                2,
+                'the first submission names no region and the second names directory region 200, Meath',
+            ],
+            'the same label text with and without a region record behind it' => [
+                ['region_id' => 55, 'region' => 'Meath'],
+                ['region' => 'Meath'],
+                2,
+                'the first submission names directory region 55, Kildare, and the second names no region '
+                    . 'record so its typed Meath stands',
+            ],
+        ];
+    }
+
+    /**
+     * I2 - A REGION THAT WAS NEVER VERIFIED IS NEVER SERVED ANOTHER REGION'S SUCCESS.
+     *
+     * After one region of an address is accepted, an address in a different region must
+     * reach Loqate and come back with ITS OWN verdict - including a rejection.
+     *
+     * Asserted on the verdict as well as on the call count, because the call count alone
+     * would still pass an implementation that re-billed the address and then handed back
+     * the stale cached "valid" anyway. That failure is the expensive one: the address
+     * reaches checkout carrying a verdict Loqate never gave it, on a TYPED address, which
+     * is strictly wider than the captured-address bypass - that one only ever covers
+     * addresses picked from the Loqate lookup, i.e. addresses Loqate itself authored.
+     */
+    public function testARegionThatWasNeverVerifiedIsNeverServedAnotherRegionsSuccess(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+        $this->regionNames = self::REGION_DIRECTORY;
+
+        $accepted = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 200]));
+        $otherRegion = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => 55]));
+
+        $this->assertSame(['error' => false], $accepted, 'The first region must be accepted off the wire.');
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'An address in a region Loqate was never asked about must be sent to Loqate: it is a different '
+            . 'address, and no verdict has ever been given for it.'
+        );
+        $this->assertTrue(
+            $otherRegion['error'],
+            'And it must carry ITS OWN verdict. Being handed the other region\'s "valid" is the failure '
+            . 'this cache must never produce: the address reaches checkout with a verdict Loqate never '
+            . 'gave it.'
+        );
+        $this->assertSame(
+            'The provided address is invalid.',
+            (string)$otherRegion['message'],
+            'And it must reject with the standard shopper-facing message.'
+        );
+    }
+
+    /**
+     * I3 - THE TRIPWIRE. Two different region records must each be verified in their own
+     * right however alike their labels read.
+     *
+     * The pairs below are exactly the pairs a label-based collapsing rule merges - a rule
+     * that strips a leading "County ", or prefixes "Co. ", or rewrites a bare "Dublin" to
+     * "Dublin 1", folds each of these two pairs onto one verdict. If such a rule is ever
+     * (re)introduced anywhere between the address and the cache key, this test is what goes
+     * red.
+     *
+     * Why they must stay apart is not a matter of taste: these are separate rows of the
+     * install's region directory, so a shopper who picks one has picked a different record
+     * from a shopper who picks the other, and each submission puts different region text on
+     * the wire - which the test asserts from the recorded payloads rather than claiming.
+     * Loqate is being asked two questions and must answer both. Merging them buys back one
+     * billable request while the guess is right and serves an address a verdict earned by a
+     * different place whenever it is wrong; keeping them apart costs at most one request.
+     *
+     * @param int $firstRegionId Directory region the first submission names.
+     * @param int $secondRegionId Directory region the second submission names.
+     * @param string $records The external fact: what those two directory rows are.
+     */
+    #[DataProvider('similarlyLabelledRegionPairProvider')]
+    public function testRegionRecordsWhoseLabelsReadAlikeAreStillEachVerified(
+        int $firstRegionId,
+        int $secondRegionId,
+        string $records
+    ): void {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+        $this->regionNames = self::REGION_DIRECTORY;
+
+        $accepted = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => $firstRegionId]));
+        $second = $this->validator->verifyAddress(self::addressInRegion('IE', ['region_id' => $secondRegionId]));
+
+        $this->assertSame(['error' => false], $accepted, 'The first submission must be accepted off the wire.');
+        $this->assertNotSame(
+            $this->apiRequests[0]['Addresses'][0]['Address4'] ?? null,
+            $this->apiRequests[1]['Addresses'][0]['Address4'] ?? null,
+            sprintf(
+                'Precondition, taken from the payloads themselves: %s, so the two submissions really do '
+                . 'ask Loqate about different regions.',
+                $records
+            )
+        );
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            sprintf(
+                '%s. Two different places are two different addresses, so each must be verified and '
+                . 'billed in its own right. Serving the second one the first one\'s verdict is a verify '
+                . 'bypass on a typed address; verifying it costs at most one request.',
+                $records
+            )
+        );
+        $this->assertTrue(
+            $second['error'],
+            'And the second submission must carry its own verdict, not the acceptance the other region '
+            . 'earned.'
+        );
+    }
+
+    /**
+     * The pairs a label-based collapsing rule merges, and which must therefore stay apart.
+     *
+     * @return array<string, array{0: int, 1: int, 2: string}>
+     */
+    public static function similarlyLabelledRegionPairProvider(): array
+    {
+        return [
+            'a city postal district and the county around it' => [
+                100,
+                101,
+                'directory region 100 is Dublin 1, a city postal district, and 101 is County Dublin, the '
+                    . 'administrative county around it',
+            ],
+            'two directory rows whose labels differ by an abbreviation' => [
+                200,
+                201,
+                'directory regions 200 and 201 are two separate rows of the install\'s region table, '
+                    . 'labelled Meath and Co. Meath',
+            ],
+        ];
+    }
+
+    /**
+     * A verdict must not outlive the key scheme it was looked up under. A session can span a
+     * deploy that changes how the key is built, and a payload written before it names an
+     * address that cannot be recovered from the key any more - so it is discarded and the
+     * address is verified again rather than answered by it.
+     *
+     * The cost is one re-verification per stale entry, once, which is the safe direction; the
+     * alternative is replaying a verdict that may belong to a different address entirely.
+     */
+    public function testACachedVerdictWrittenUnderAnEarlierKeySchemeIsDiscardedRatherThanReplayed(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+        $schemaVersion = $this->verifyKeySchemaVersion();
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $store = $this->verdictStore();
+        $this->assertCount(1, $this->verdictStore(), 'The verdict must be cached normally first.');
+
+        $key = (string)array_key_first($store);
+        $payload = json_decode((string)$store[$key], true);
+        $this->assertIsArray($payload, 'The cached verdict must be readable as a payload.');
+        $this->assertContains(
+            $schemaVersion,
+            array_values($payload),
+            'A cached verdict must record the version of the key scheme it was written under, or a verdict '
+            . 'from before a key change cannot be told apart from one written by this deploy.'
+        );
+
+        // The same verdict as written by a deploy whose key scheme was one version older.
+        $store[$key] = json_encode(array_map(
+            static fn ($value) => $value === $schemaVersion ? $schemaVersion - 1 : $value,
+            $payload
+        ));
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $result = $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'A verdict stamped with another key scheme must be discarded and the address verified again: '
+            . 'the key it is filed under no longer names the same address.'
+        );
+        $this->assertTrue(
+            $result['error'],
+            'And the live verdict must be returned, so the stale entry can be seen not to have answered '
+            . 'the lookup.'
+        );
+    }
+
+    /**
+     * A verdict with NO stamp at all is discarded too, not treated as current.
+     *
+     * The wrong-stamp case above is caught by any comparison; an ABSENT stamp is caught only
+     * because the default supplied for a missing key cannot equal the current version.
+     * Relaxing that default would silently admit every unstamped entry - exactly the set the
+     * deploy before the stamp wrote.
+     */
+    public function testACachedVerdictWithNoKeySchemeStampIsDiscardedRatherThanReplayed(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $store = $this->verdictStore();
+        $key = (string)array_key_first($store);
+        // Exactly what the deploy before the stamp wrote.
+        $store[$key] = json_encode(['error' => false]);
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $result = $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'An UNSTAMPED verdict must be re-verified: nothing establishes that the key it is filed under '
+            . 'still names this address under the current key scheme.'
+        );
+        $this->assertTrue($result['error'], 'And the live verdict must be the one returned.');
+    }
+
+    /**
+     * A BATCH-shaped entry must not be readable as a single-address verdict.
+     *
+     * The two caches live in separate session attributes, and this is the second, independent
+     * guard behind that separation: the payload shapes differ ("error" here, "valid" there), so
+     * a batch verdict degrades to a miss rather than answering an AVC lookup. It has to, because
+     * the two verdicts answer different questions - the AVC thresholds versus the address
+     * quality index - so replaying one for the other reports a verdict the merchant's
+     * configuration never produced.
+     *
+     * The plant carries the CURRENT key-scheme stamp on purpose. Stamp-less, the stamp check
+     * would reject it first and this test would pass whether or not the shape guard existed -
+     * the mistake that left the batch cache's equivalent test defending nothing once both
+     * caches gained a stamp. Stamped, the shape is the only thing left that can reject it.
+     */
+    public function testABatchShapedVerdictPlantedInTheSingleAddressStoreIsNotReadAsAVerdict(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+
+        $this->validator->verifyAddress(self::ADDRESS);
+        $store = $this->verdictStore();
+        $key = (string)array_key_first($store);
+        $store[$key] = json_encode([
+            'valid' => true,
+            'schema' => $this->verifyKeySchemaVersion(),
+        ]);
+        $this->sessionStore[self::VERIFY_CACHE_SESSION_KEY] = $store;
+
+        $result = $this->validator->verifyAddress(self::ADDRESS);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount(),
+            'A verdict in the BATCH cache\'s shape must not satisfy a single-address lookup: it was judged '
+            . 'against the address quality index, not the AVC thresholds, so reading it here would let an '
+            . 'AQI verdict silently satisfy an AVC check the merchant configured.'
+        );
+        $this->assertTrue(
+            $result['error'],
+            'And the LIVE verdict must be returned, so the planted entry can be seen not to have answered '
+            . 'the lookup rather than merely to have agreed with it.'
+        );
+    }
+
+    /**
+     * Two different region records on an otherwise identical address are two different
+     * addresses: each must be verified, and each gets its own verdict.
+     */
+    public function testADifferentRegionIdIsVerifiedInItsOwnRight(): void
+    {
+        $this->stubApiResponses([self::acceptedResponse(), self::rejectedResponse()]);
+        $this->regionNames = self::REGION_DIRECTORY;
 
         $address = [
             'street' => ['4 O\'Connell Street'],
@@ -873,14 +1406,17 @@ class ValidatorVerifyCacheTest extends TestCase
             'country_id' => 'IE',
         ];
 
-        $this->validator->verifyAddress(array_merge($address, ['region_id' => 100]));
-        $this->validator->verifyAddress(array_merge($address, ['region_id' => 101]));
+        $accepted = $this->validator->verifyAddress(array_merge($address, ['region_id' => 100]));
+        $other = $this->validator->verifyAddress(array_merge($address, ['region_id' => 101]));
 
+        $this->assertSame(['error' => false], $accepted, 'The first region must be accepted off the wire.');
         $this->assertSame(
-            1,
+            2,
             $this->apiCallCount(),
-            'A different region_id on an otherwise identical address must not make it billable twice.'
+            'Picking a different region on an otherwise identical address asks Loqate about a different '
+            . 'place, so it must be verified rather than answered from the first verdict.'
         );
+        $this->assertTrue($other['error'], 'And the second region must get its own verdict.');
     }
 
     /**
@@ -1012,66 +1548,76 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The STRUCTURAL half of the invariant the whole scheme rests on: the strict
-     * (rejection) key must project EVERY field parseAddress() sends to Loqate - every
-     * value of Validator::ADDRESS_MAPPING - and the lossy (success) key must be exactly
-     * that list minus the county.
+     * I5 - THE STRUCTURAL COVERAGE GATE: the ONE cache key must project EVERY field
+     * parseAddress() sends to Loqate, that is every value of Validator::ADDRESS_MAPPING.
+     *
+     * A verdict may only ever be replayed for the address Loqate actually judged, so a
+     * field that reaches the request but not the key breaks the contract in both
+     * directions: editing it would replay a wrong "invalid" the shopper cannot clear (the
+     * checkout dead-end) or a wrong "valid" that puts an unverified address through
+     * checkout. There is one key, so there is one list and one rule for successes and
+     * rejections alike.
      *
      * READ THIS BEFORE TRUSTING IT. This test cannot catch a field being ADDED to
-     * ADDRESS_MAPPING, and it is not claimed to: strictSignatureFields() and
-     * verifySignatureFields() DERIVE their lists from ADDRESS_MAPPING, so a new mapping
-     * extends both keys by construction and the sets stay equal. Adding
-     * 'company' => 'Company' to ADDRESS_MAPPING leaves this test green (verified with
-     * that exact mutant). What it does pin is the derivation itself: hand-writing either
-     * list again, dropping a field from one of them, or naming a COUNTY_FIELD that is not
-     * in ADDRESS_MAPPING at all, all fail here. The BEHAVIOURAL defence - that a mapped
-     * field genuinely reaches the key and genuinely costs a second billable request when
-     * it changes - is
-     * testEditingAnyFieldSentToLoqateAfterARejectionIsVerifiedAgain() and
-     * testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess(),
-     * which iterate ADDRESS_MAPPING and fail on an unpinned new field.
+     * ADDRESS_MAPPING, and it is not claimed to: the list is DERIVED from ADDRESS_MAPPING,
+     * so a new mapping extends the key by construction and the two sets stay equal. Adding
+     * 'company' => 'Company' leaves this test green; what fails then is the per-field pair
+     * below, which has no fixture for it. What this test does pin is the derivation itself:
+     * hand-writing the list again, dropping a field from it, or naming a COUNTY_FIELD that
+     * is not in ADDRESS_MAPPING at all, all fail here - as does a key builder that stops
+     * distinguishing two addresses by their region, or one that keys an address carrying
+     * nothing identifiable at all.
      */
-    public function testStrictCacheKeyProjectsEveryFieldSentToLoqate(): void
+    public function testTheVerifyCacheKeyProjectsEveryFieldSentToLoqate(): void
     {
         $sentToLoqate = array_values(Validator::ADDRESS_MAPPING);
-        $county = (string)$this->privateConstant('COUNTY_FIELD');
-        $strict = $this->invokePrivate('strictSignatureFields', []);
-        $lossy = $this->invokePrivate('verifySignatureFields', []);
+        $region = (string)$this->privateConstant('COUNTY_FIELD');
+        $projected = $this->invokePrivate('verifyCacheSignatureFields', []);
 
         $this->assertContains(
-            $county,
+            $region,
             $sentToLoqate,
-            'COUNTY_FIELD must be one of the fields parseAddress() actually sends, or the strict key '
-            . 'appends a segment Loqate never sees and the lossy key drops nothing real.'
+            'COUNTY_FIELD must name one of the fields parseAddress() actually sends, or the key carries a '
+            . 'segment Loqate never sees.'
         );
         $this->assertEqualsCanonicalizing(
             $sentToLoqate,
-            $strict,
-            'The STRICT (rejection) key must project every field sent to Loqate: a rejection may only be '
-            . 'replayed for the exact address Loqate judged. A field that reaches the request but not this '
-            . 'list would make editing it replay a stale verdict - a wrong "invalid" the shopper cannot '
-            . 'clear (the checkout dead-end) or a wrong "valid" that lets an unverified address through.'
-        );
-        $this->assertEqualsCanonicalizing(
-            array_values(array_diff($sentToLoqate, [$county])),
-            $lossy,
-            'The LOSSY (success) key must be exactly the strict key minus the county: it may ignore the '
-            . 'churning county (that is the LOQ-16969 fix) and nothing else.'
+            $projected,
+            'The verify cache key must project every field sent to Loqate: a verdict may only be replayed '
+            . 'for the exact address Loqate judged. A field that reaches the request but not this list '
+            . 'would make editing it replay a stale verdict - a wrong "invalid" the shopper cannot clear '
+            . '(the checkout dead-end) or a wrong "valid" that lets an unverified address through.'
         );
         $this->assertSame(
-            [$county],
-            array_values(array_diff($strict, $lossy)),
-            'The county must be the ONLY field the two key families differ by.'
-        );
-        $this->assertSame(
-            [],
-            array_values(array_diff($lossy, $strict)),
-            'The lossy key must not project anything the strict key does not.'
-        );
-        $this->assertSame(
-            count($strict),
-            count(array_unique($strict)),
+            count($projected),
+            count(array_unique($projected)),
             'No field may appear twice in the key: a duplicated segment is dead weight in the session payload.'
+        );
+
+        // ...and the one key builder really is built over that list: two addresses that
+        // differ only in the region get different keys, and an address with nothing
+        // identifiable in it gets none at all.
+        $parsed = [
+            'Address' => '1 High St, Flat 2',
+            'Address1' => '1 High St',
+            'Address2' => 'Flat 2',
+            'Address3' => 'London',
+            'Address4' => 'Greater London',
+            'PostalCode' => 'SW1A 1AA',
+            'Country' => 'GB',
+        ];
+
+        $this->assertNotSame(
+            $this->invokePrivate('buildVerifyCacheSignature', [$parsed]),
+            $this->invokePrivate('buildVerifyCacheSignature', [array_merge($parsed, ['Address4' => 'Berkshire'])]),
+            'Two addresses in different regions must not share a key: one of them would be answered with a '
+            . 'verdict Loqate gave the other.'
+        );
+        $this->assertSame(
+            '',
+            $this->invokePrivate('buildVerifyCacheSignature', [['Address' => '', 'Address4' => 'Greater London']]),
+            'An address with nothing identifiable in it must have no key at all, so it is neither cached '
+            . 'nor served another address\'s verdict.'
         );
     }
 
@@ -1082,11 +1628,16 @@ class ValidatorVerifyCacheTest extends TestCase
      *
      * Driven from Validator::ADDRESS_MAPPING itself and through the public
      * verifyAddress(), so it pins the two things that actually matter and that the
-     * structural test above cannot see: that the field reaches the strict cache KEY, and
+     * structural test above cannot see: that the field reaches the cache KEY, and
      * that a change to it costs a second BILLABLE call rather than replaying the
      * rejection. A field added to ADDRESS_MAPPING with no fixture here fails outright
      * (that is the point: adding 'company' => 'Company' must not be able to leave the
      * suite green), and a field left out of the key fails on the call count.
+     *
+     * Its twin, testEditingAnyFieldSentToLoqateIsVerifiedAgainAfterASuccess(), asserts the
+     * SAME guarantee after an acceptance. There is one key, so no field is treated
+     * differently on the two sides and neither test is redundant: they pin the two verdicts
+     * a stale replay could serve.
      *
      * @param string $magentoField Magento address key, e.g. 'postcode'.
      * @param string $loqateField Loqate request field it is mapped onto, e.g. 'PostalCode'.
@@ -1115,7 +1666,7 @@ class ValidatorVerifyCacheTest extends TestCase
             $this->apiCallCount(),
             sprintf(
                 'Editing "%s" (sent to Loqate as %s) after a rejection must trigger a fresh verification: '
-                . 'the STRICT key must project every field Loqate judged, or the shopper is served the stale '
+                . 'the cache key must project every field Loqate judged, or the shopper is served the stale '
                 . 'rejection and can never get out of checkout however often they correct that field.',
                 $magentoField,
                 $loqateField
@@ -1129,24 +1680,27 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The mirror image on the success path: for every field EXCEPT the county, editing it
+     * The mirror image on the success path: for EVERY field sent to Loqate, editing it
      * after an acceptance must be verified again, or an unverified address is smuggled
      * past checkout on another address's "valid".
      *
-     * The county is the one deliberate exception (the LOQ-16969 trade-off) and is asserted
-     * as such here rather than skipped, so the exception stays exactly one field wide -
-     * anything else falling out of the lossy key fails.
+     * NO FIELD IS EXEMPT, the region included: an address in a different region is a
+     * different address and gets its own verdict. What is NOT an edit is the region LABEL
+     * churning while the region record stays put, which asks Loqate the identical question
+     * and is pinned where it belongs, in
+     * testRelabellingTheRegionAroundAFixedRegionIdIsBilledOnce(). This test's region
+     * fixture ("Greater London" -> "Berkshire") is deliberately a different place rather
+     * than a re-spelling; see self::FIELD_EDIT_FIXTURES.
      *
      * @param string $magentoField Magento address key, e.g. 'postcode'.
      * @param string $loqateField Loqate request field it is mapped onto, e.g. 'PostalCode'.
      */
     #[DataProvider('fieldSentToLoqateProvider')]
-    public function testEditingAnyFieldSentToLoqateExceptTheCountyIsVerifiedAgainAfterASuccess(
+    public function testEditingAnyFieldSentToLoqateIsVerifiedAgainAfterASuccess(
         string $magentoField,
         string $loqateField
     ): void {
         [$base, $edited] = $this->mappedFieldFixture($magentoField, $loqateField);
-        $isCounty = $loqateField === (string)$this->privateConstant('COUNTY_FIELD');
 
         $this->assertEditChangesTheLoqateRequest($base, $edited, $loqateField);
 
@@ -1157,28 +1711,13 @@ class ValidatorVerifyCacheTest extends TestCase
 
         $this->validator->verifyAddress($edited);
 
-        if ($isCounty) {
-            $this->assertSame(
-                1,
-                $this->apiCallCount(),
-                sprintf(
-                    'The county (%s) is the ONE field the success key deliberately ignores, because '
-                    . 'capture.js and parseAddress() both rewrite it - re-billing that churn is the defect '
-                    . 'LOQ-16969 fixes. Tightening this is tracked as LOQ-16979.',
-                    $loqateField
-                )
-            );
-
-            return;
-        }
-
         $this->assertSame(
             2,
             $this->apiCallCount(),
             sprintf(
-                'Editing "%s" (sent to Loqate as %s) must be verified again: the LOSSY key must project '
-                . 'every field sent to Loqate except the county, or a genuinely different address is served '
-                . 'this address\'s "valid" and reaches checkout unverified.',
+                'Editing "%s" (sent to Loqate as %s) must be verified again: the cache key must project '
+                . 'every field sent to Loqate - the region included - or a genuinely different address is '
+                . 'served this address\'s "valid" and reaches checkout unverified.',
                 $magentoField,
                 $loqateField
             )
@@ -1303,9 +1842,8 @@ class ValidatorVerifyCacheTest extends TestCase
             $store,
             'Once the retry succeeds, its verdict must be cached like any other success.'
         );
-        $this->assertSame(
-            ['error' => false],
-            json_decode((string)reset($store), true),
+        $this->assertFalse(
+            json_decode((string)reset($store), true)['error'] ?? null,
             'The cached entry must be the successful verdict from the retry.'
         );
 
@@ -1462,7 +2000,7 @@ class ValidatorVerifyCacheTest extends TestCase
      *  - the plain POST shape: street is a real ARRAY and the county is a 'region'
      *    NAME (self::ADDRESS, used by most tests here);
      *  - the quote paths (CheckoutShippingInformation.php:32,
-     *    CheckoutBillingAddress.php:34, QuoteSubmitBefore.php:60/:84) pass
+     *    CheckoutBillingAddress.php:34, QuoteSubmitBefore.php:85/:109) pass
      *    Quote\Address::getData(), and AbstractAddress::setData() has already run the
      *    multiline street attribute through trim(implode("\n", $value)), so street is
      *    a NEWLINE-SEPARATED STRING and the county is a 'region_id' that
@@ -1645,14 +2183,19 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The region is excluded from the dedup KEY, not from the REQUEST: Loqate needs
-     * the county to verify the address, and an "optimisation" that dropped it from the
-     * payload along with the key would silently degrade every verification.
+     * The region is sent to Loqate exactly as Magento holds it. Loqate needs it in order to
+     * verify the address at all, so an "optimisation" that pushed a rewritten form - or
+     * nothing at all - into the PAYLOAD rather than only into the cache key would silently
+     * degrade every verification.
+     *
+     * The region is excluded only from the CAPTURED-address signature, whose field list is
+     * fixed by the store it is compared against; the verify cache key carries it, and
+     * nothing drops it from the request.
      */
-    public function testRegionIsStillSentToLoqateAlthoughItIsExcludedFromTheDedupKey(): void
+    public function testTheRegionIsSentToLoqateExactlyAsMagentoSuppliesIt(): void
     {
         $this->stubApiResponses([self::acceptedResponse()]);
-        $this->regionNames = [100 => 'Dublin'];
+        $this->regionNames = self::REGION_DIRECTORY;
 
         $this->validator->verifyAddress(self::ADDRESS);
 
@@ -1660,7 +2203,8 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->assertSame(
             'Greater London',
             $sent['Address4'] ?? null,
-            'The region/county must still be sent to Loqate as Address4, even though the dedup key ignores it.'
+            'The region must be sent to Loqate as Address4 exactly as Magento supplied it: how the cache '
+            . 'renders it is a KEY concern and must never reach the payload.'
         );
         $this->assertSame('1 High St, Flat 2', $sent['Address'] ?? null, 'The full street must be sent.');
         $this->assertSame('1 High St', $sent['Address1'] ?? null);
@@ -1669,7 +2213,7 @@ class ValidatorVerifyCacheTest extends TestCase
         $this->assertSame('SW1A 1AA', $sent['PostalCode'] ?? null);
         $this->assertSame('GB', $sent['Country'] ?? null);
 
-        // A county that arrived as a region_id must be resolved and sent too.
+        // A region that arrived as a region_id must be resolved and sent too.
         $this->validator->verifyAddress([
             'street' => ['4 O\'Connell Street'],
             'city' => 'Dublin',
@@ -1680,7 +2224,7 @@ class ValidatorVerifyCacheTest extends TestCase
 
         $this->assertSame(2, $this->apiCallCount(), 'A different address must be verified in its own right.');
         $this->assertSame(
-            'Dublin',
+            'Dublin 1',
             $this->lastApiRequest()['Addresses'][0]['Address4'] ?? null,
             'A region resolved from region_id must be sent as Address4.'
         );
@@ -1940,10 +2484,14 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The signature is the dedup key, so its projection is load-bearing: the
-     * region/county (Address4) must be excluded because capture.js rewrites it,
-     * while the city (Address3) must be included because two different towns can
-     * share a street name and postcode format.
+     * buildAddressSignature() is the CAPTURED-ADDRESS projection, and its field list is
+     * fixed by the store it is compared against, not by anything about the verify cache:
+     * Helper\Controller::storeCapturedAddress() writes ADDRESS_CAPTURE_MAPPING's keys, so
+     * the region/county (Address4) must stay OUT of it while the city (Address3) must
+     * stay IN - two different towns can share a street name and postcode format.
+     *
+     * The verify cache key does carry the region, but it is built on TOP of this projection
+     * rather than inside it - see testTheVerifyCacheKeyProjectsEveryFieldSentToLoqate().
      */
     public function testBuildAddressSignatureExcludesRegionAndIncludesCity(): void
     {
@@ -2069,6 +2617,12 @@ class ValidatorVerifyCacheTest extends TestCase
      * into a scalar field. Neither may throw out of verifyAddress() - a TypeError in a
      * checkout plugin is a 500 on the place-order call - and neither may reach the
      * signature as anything other than a plain string.
+     *
+     * THE REGION AND THE COUNTRY GET THEIR OWN CASE, because they are the pair the cache
+     * key treats most carefully and neither is type-checked upstream: an array 'region' is
+     * dropped by parseAddress() before any key is built, while an object 'region' survives
+     * that filter and reaches the key. Both must degrade to "no readable region" - the same
+     * key, one verification - rather than throwing or being answered by another address.
      */
     public function testNestedArrayAndObjectFieldsDegradeInsteadOfThrowing(): void
     {
@@ -2102,6 +2656,52 @@ class ValidatorVerifyCacheTest extends TestCase
                 'Country' => 'GB',
             ]),
             'Objects and arrays must normalise to the empty part, never throw.'
+        );
+
+        // The region and the country together, driven through the public entry point: an
+        // OBJECT region (which parseAddress() lets through, since it only filters arrays)
+        // alongside an OBJECT country code.
+        $objectRegionAndCountry = array_merge(
+            self::ADDRESS,
+            ['region' => new \stdClass(), 'country_id' => new \stdClass()]
+        );
+
+        $third = $this->validator->verifyAddress($objectRegionAndCountry);
+
+        $this->assertSame(
+            ['error' => false],
+            $third,
+            'An object region and an object country code must not throw out of verifyAddress(): both are '
+            . 'read while the cache key is built, and a TypeError here is a 500 on place-order.'
+        );
+        $this->assertSame(
+            3,
+            $this->apiCallCount(),
+            'The address is still identifiable by street, city and postcode, so it is verified in its '
+            . 'own right rather than being silently answered by another address.'
+        );
+        $this->assertCount(
+            3,
+            $this->verdictStore(),
+            'Its verdict is still cacheable: an unreadable region renders as the empty segment, which is '
+            . 'a usable key part, not an empty signature.'
+        );
+
+        // An ARRAY region takes the other path - parseAddress() drops it before any
+        // signature is built - and must land on the same key as the object one, since
+        // both mean "no readable region". One further submission, no further request.
+        $arrayRegion = array_merge(self::ADDRESS, ['region' => ['x'], 'country_id' => new \stdClass()]);
+
+        $this->assertSame(
+            ['error' => false],
+            $this->validator->verifyAddress($arrayRegion),
+            'An array region must degrade the same way, not throw.'
+        );
+        $this->assertSame(
+            3,
+            $this->apiCallCount(),
+            'Neither submission supplies a readable region, so as far as anything readable goes they '
+            . 'describe one address and the second must be served from the cache rather than billed.'
         );
     }
 
@@ -2152,9 +2752,8 @@ class ValidatorVerifyCacheTest extends TestCase
     /**
      * The namespace is a NAMESPACE: two store views that accept the same address must
      * store the identical signature under two different prefixes, rather than the store
-     * view leaking into the signature projection itself (which would, for instance,
-     * make the county-agnostic success key store-view-dependent in ways no other test
-     * would notice).
+     * view leaking into the signature projection itself (which would make one address
+     * project to several signatures in ways no other test would notice).
      */
     public function testTwoStoreViewsCacheTheSameSignatureUnderDifferentNamespaces(): void
     {
@@ -2452,8 +3051,8 @@ class ValidatorVerifyCacheTest extends TestCase
      * it outlives the session, it is rotated into backups and shipped to aggregators, and
      * under UK/EU data protection law a log full of shoppers' home addresses is a
      * reportable problem. So the only things permitted on these lines are the outcome
-     * (hit/miss), the key family, and a truncated hash - enough to reconcile the drop in
-     * billable requests, and nothing that identifies anybody.
+     * (hit/miss) and a truncated hash - enough to reconcile the drop in billable requests,
+     * and nothing that identifies anybody.
      *
      * Asserted as a WHITELIST (every debug record must match one exact shape) rather than
      * as a blacklist of forbidden strings, because a blacklist only catches the leaks
@@ -2472,8 +3071,8 @@ class ValidatorVerifyCacheTest extends TestCase
             'country_id' => 'IE',
         ];
 
-        // A full realistic sequence: miss, lossy hit, miss, strict hit, and the unkeyed
-        // case (an address with nothing identifiable in it).
+        // A full realistic sequence: an accepted address missed then hit, a rejected one
+        // missed then hit, and the unkeyed case (nothing identifiable in the address).
         $this->validator->verifyAddress(self::ADDRESS);
         $this->validator->verifyAddress(self::ADDRESS);
         $this->validator->verifyAddress($rejectedAddress);
@@ -2482,8 +3081,8 @@ class ValidatorVerifyCacheTest extends TestCase
 
         $records = $this->cacheLogRecords($this->shopper);
         $this->assertSame(
-            [['miss', 'none'], ['hit', 'lossy'], ['miss', 'none'], ['hit', 'strict'], ['miss', 'none']],
-            array_map(static fn (array $r): array => [$r['outcome'], $r['family']], $records),
+            ['miss', 'hit', 'miss', 'hit', 'miss'],
+            array_column($records, 'outcome'),
             'Every cache lookup outcome must be logged exactly once, in order.'
         );
 
@@ -2542,11 +3141,12 @@ class ValidatorVerifyCacheTest extends TestCase
      * What makes the instrumentation meaningful rather than decorative:
      *  - a MISS is logged before the billable request it accounts for, so misses and
      *    invoice lines can be counted one-to-one;
-     *  - a HIT logs the family the verdict actually came from, which is only knowable
-     *    because the two cache reads are separate and the strict one runs first;
-     *  - a hit issues no request at all.
+     *  - a hit issues no request at all;
+     *  - a replayed verdict is logged the same way whether it was an acceptance or a
+     *    rejection, because both are one address whose verification was not paid for twice,
+     *    which is what the reconciliation counts.
      */
-    public function testCacheOutcomeLogsAreOrderedAndReportTheKeyFamilyTheVerdictCameFrom(): void
+    public function testCacheOutcomeLogsAreOrderedSoMissesCanBeCountedAgainstBillableRequests(): void
     {
         $this->stubApiResponses([self::acceptedResponse()]);
 
@@ -2560,29 +3160,17 @@ class ValidatorVerifyCacheTest extends TestCase
             . 'the Loqate invoice), and a hit must issue no request at all.'
         );
 
-        $records = $this->cacheLogRecords($this->shopper);
-        $this->assertSame(
-            [['miss', 'none'], ['hit', 'lossy']],
-            array_map(static fn (array $r): array => [$r['outcome'], $r['family']], $records),
-            'A miss has no key family yet; a success is cached under the LOSSY (county-blind) key, so the '
-            . 'hit must be reported as lossy.'
-        );
-
-        // A rejection is cached under the STRICT key, so its replay must say so - that is
-        // the distinction the split cache reads exist to make visible.
+        // The same timeline for an address Loqate rejected: one saved request either way.
         $rejecting = $this->createShopper();
         $this->stubShopperResponses($rejecting, [self::rejectedResponse()]);
         $rejecting['validator']->verifyAddress(self::ADDRESS);
         $rejecting['validator']->verifyAddress(self::ADDRESS);
 
         $this->assertSame(
-            [['miss', 'none'], ['hit', 'strict']],
-            array_map(
-                static fn (array $r): array => [$r['outcome'], $r['family']],
-                $this->cacheLogRecords($rejecting)
-            ),
-            'A replayed rejection must be reported as a STRICT hit: the family is what tells an operator '
-            . 'whether a hit came from the rejection key or the county-blind success key.'
+            ['log:miss', 'api', 'log:hit'],
+            $this->eventTimeline($rejecting),
+            'A replayed rejection is a saved billable request exactly as a replayed acceptance is, and must '
+            . 'be reported the same way: the log is there to be counted against the invoice.'
         );
     }
 
@@ -2747,6 +3335,83 @@ class ValidatorVerifyCacheTest extends TestCase
         return (array)$this->apiRequests[$this->apiCallCount() - 1];
     }
 
+    /**
+     * One fixed address in $countryId, carrying exactly the region keys given and nothing
+     * else variable, so a pair of these differs in the region alone and any second billable
+     * request can only be the region's doing.
+     *
+     * An empty $regionFields omits both region fields, which is how Magento presents an
+     * address whose region input was never filled in.
+     *
+     * @param string $countryId Magento country code, in whatever case the test needs.
+     * @param array $regionFields Magento region keys to carry: 'region' (free text) and/or
+     *                            'region_id' (a row of the install's region directory).
+     * @return array Magento-shaped address.
+     */
+    private static function addressInRegion(string $countryId, array $regionFields): array
+    {
+        return array_merge(
+            [
+                'street' => ['12 Main Street'],
+                'city' => 'Navan',
+                'postcode' => 'C15 XXXX',
+                'country_id' => $countryId,
+            ],
+            $regionFields
+        );
+    }
+
+    /**
+     * The region label that actually reaches Loqate for an address, taken from a throwaway
+     * shopper of its own so the answer cannot be affected by - or affect - the cache under
+     * test.
+     *
+     * This is what makes the region-axis rows justifiable by an external fact: what Loqate
+     * was asked is observable, rather than something a test has to claim.
+     *
+     * @param array $address Magento-shaped address.
+     * @return string|null Value sent as Address4, or null when the field was never populated.
+     */
+    private function regionSentToLoqate(array $address): ?string
+    {
+        $shopper = $this->createShopper();
+        $this->stubShopperResponses($shopper, [self::acceptedResponse()]);
+        $shopper['validator']->verifyAddress($address);
+
+        $sent = $shopper['requests'][0]['Addresses'][0]['Address4'] ?? null;
+
+        return $sent === null ? null : (string)$sent;
+    }
+
+    /**
+     * One region value as any address field is compared: trimmed, whitespace-collapsed and
+     * case-folded, because a form re-formatting a value has not changed which place it names
+     * (the rule itself is pinned by testBuildAddressSignatureNormalisesCaseAndWhitespace()).
+     *
+     * @param string|null $region Region as it reached Loqate, or null when none did.
+     * @return string|null
+     */
+    private static function asComparableRegion(?string $region): ?string
+    {
+        return $region === null ? null : mb_strtoupper(preg_replace('/\s+/', ' ', trim($region)));
+    }
+
+    /**
+     * The version of the verify cache's key scheme, failing with an explanation when the
+     * production code does not stamp its cached verdicts with one.
+     */
+    private function verifyKeySchemaVersion(): int
+    {
+        $version = $this->privateConstant('VERIFY_KEY_SCHEMA_VERSION');
+        $this->assertIsInt(
+            $version,
+            'Validator::VERIFY_KEY_SCHEMA_VERSION must be an integer, so a verdict written before the key '
+            . 'scheme changed can be told apart from one written after it.'
+        );
+
+        return $version;
+    }
+
     /** A unique, fully-formed address per index. */
     private function distinctAddress(int $index): array
     {
@@ -2774,12 +3439,18 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * Model the end of a browser session (logout, or Magento regenerating the
-     * session id): the session's backing data is dropped, which is precisely how
-     * this harness represents session state, so nothing the previous session
+     * Model a BRAND-NEW browser session: a different visitor, a cleared cookie, or a
+     * session PHP has garbage-collected between visits. The backing data is empty, which is
+     * precisely how this harness represents session state, so nothing an earlier session
      * cached can be read back.
+     *
+     * NOT a logout and NOT a session-id regeneration. Magento regenerates the session id on
+     * both login and logout and the DATA survives that (see Helper\ShopperScopedAddressStores);
+     * emptying the store here would be the wrong model of either. The identity-change cases
+     * are ShopperScopedAddressStoresTest's subject - testACachedVerdictDoesNotSurviveALogin()
+     * covers the logout/login hand-off, where the guard does the clearing that PHP does not.
      */
-    private function endSession(array $shopper): void
+    private function startBrandNewSession(array $shopper): void
     {
         $shopper['session']->exchangeArray([]);
     }
@@ -2881,8 +3552,8 @@ class ValidatorVerifyCacheTest extends TestCase
         $reflection = new ReflectionClass(Validator::class);
         if (!$reflection->hasConstant($name)) {
             $this->fail(sprintf(
-                'Validator::%s is not defined: the asymmetric cache keys must name the field they differ '
-                . 'by in exactly one place, so both key builders and these tests agree on it.',
+                'Validator::%s is not defined, so the production code and these tests can no longer agree '
+                . 'on what the verify cache key is made of.',
                 $name
             ));
         }
@@ -2923,20 +3594,20 @@ class ValidatorVerifyCacheTest extends TestCase
     }
 
     /**
-     * The ONE line shape the verify cache instrumentation may write: an outcome, a key
-     * family and a 12-hex hash (or "unkeyed"). Anything else - an address, a signature, a
-     * store id - fails to match, which is what makes this a whitelist rather than a
-     * guess at what a leak would look like.
+     * The ONE line shape the verify cache instrumentation may write: an outcome and a
+     * 12-hex hash (or "unkeyed"). Anything else - an address, a signature, a store id -
+     * fails to match, which is what makes this a whitelist rather than a guess at what a
+     * leak would look like.
      */
     private const CACHE_LOG_PATTERN =
-        '/^Loqate verify cache (hit|miss) \[family=(strict|lossy|none), key=([0-9a-f]{12}|unkeyed)\]$/';
+        '/^Loqate verify cache (hit|miss) \[key=([0-9a-f]{12}|unkeyed)\]$/';
 
     /**
      * The cache-outcome debug records of a shopper, parsed, asserting on the way that each
      * one matches the whitelisted shape and carries no log context.
      *
      * @param array $shopper Shopper harness from createShopper().
-     * @return array<int, array{outcome: string, family: string, token: string}>
+     * @return array<int, array{outcome: string, token: string}>
      */
     private function cacheLogRecords(array $shopper): array
     {
@@ -2947,8 +3618,8 @@ class ValidatorVerifyCacheTest extends TestCase
                 $record['message'],
                 sprintf(
                     'Debug record #%d ("%s") is not one of the permitted cache-outcome lines. These records '
-                    . 'may contain the outcome, the key family and a truncated hash only - never the '
-                    . 'address and never the signature.',
+                    . 'may contain the outcome and a truncated hash only - never the address and never the '
+                    . 'signature.',
                     $index,
                     $record['message']
                 )
@@ -2964,7 +3635,7 @@ class ValidatorVerifyCacheTest extends TestCase
             );
 
             preg_match(self::CACHE_LOG_PATTERN, $record['message'], $matches);
-            $parsed[] = ['outcome' => $matches[1], 'family' => $matches[2], 'token' => $matches[3]];
+            $parsed[] = ['outcome' => $matches[1], 'token' => $matches[2]];
         }
 
         return $parsed;

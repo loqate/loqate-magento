@@ -39,17 +39,54 @@ class Validator
      * Fixed by the captured-address store this signature is compared against:
      * Helper\Controller::storeCapturedAddress() writes exactly
      * ADDRESS_CAPTURE_MAPPING's keys, which carry no 'Address' at all, so no field may
-     * be added here (see buildAddressSignature()). The verify cache keys extend this
-     * list instead - see strictSignatureFields() for the invariant that governs them.
+     * be added here (see buildAddressSignature()). The verify cache key extends this
+     * list instead - see verifyCacheSignatureFields() for the invariant that governs it.
      */
     private const CAPTURED_SIGNATURE_FIELDS = ['Address1', 'Address2', 'Address3', 'PostalCode', 'Country'];
 
     /**
-     * The county/province field: present in the strict (rejection) key, absent from
-     * the lossy (success) one. That asymmetry is the whole design, so the field is
-     * named once here rather than spelled out at each key builder.
+     * The region field, named once here rather than spelled out at each builder.
+     *
+     * It is the one field the shared base (verifySignatureFields()) leaves out, and the key
+     * appends it last, in a segment of its own - see verifyCacheSignatureFields().
      */
     private const COUNTY_FIELD = 'Address4';
+
+    /**
+     * Every value address_quality_index is allowed to hold, worst ('E') to best ('A').
+     *
+     * checkQualityIndex() compares the response AQI against the threshold with <=, which is
+     * a STRING comparison, so an unrecognised threshold does not fail closed - anything
+     * sorting above 'E' passes every address. This list is what makes that comparison
+     * meaningful; see checkQualityIndex() for the failure it prevents.
+     */
+    private const VALID_QUALITY_INDEXES = ['A', 'B', 'C', 'D', 'E'];
+
+    /**
+     * Version of the verify caches' KEY SCHEME. Stamped into every verdict written by
+     * storeVerifyResult() AND storeBatchVerifyResult(), and required to match on every read
+     * (getCachedVerifyResult(), getCachedBatchVerifyResult()); an entry stamped with anything
+     * else is discarded.
+     *
+     * A session outlives a deploy, so without this a payload written under an older key
+     * shape would be answered as though its key named the address the CURRENT shape derives
+     * from that key. Bump it whenever buildVerifyCacheSignature() or either cache's key
+     * builder changes what a key means: stale entries are then re-verified once, which is the
+     * safe direction.
+     *
+     * ONE version covers BOTH caches because both key builders sit on the same signature -
+     * buildVerifyCacheSignature() - so any change to what a key means changes it for both at
+     * once. A second constant would be two things to bump and one of them would be forgotten.
+     *
+     * An earlier revision carried this on the single-address cache only, reasoning that the
+     * batch payload's distinct shape (['valid' => ...] against ['error' => ...]) already
+     * guards the two caches from being read for each other. True, and unrelated: that guard
+     * is about CROSS-CACHE conflation, while this stamp is about CROSS-DEPLOY staleness. The
+     * batch cache needed it more, not less - storeBatchVerifyResult() stores only PASSES, so
+     * every stale batch replay is a false ACCEPT, where the single-address cache stores
+     * rejections too and can at worst replay a stale refusal.
+     */
+    private const VERIFY_KEY_SCHEMA_VERSION = 1;
 
     /**
      * Session data key holding the verify verdict cache (LOQ-16969).
@@ -59,18 +96,103 @@ class Validator
      * process- or install-wide and would serve one shopper's verdict to another.
      * Entries are additionally namespaced per store view and per resolved AVC threshold,
      * see buildVerifyCacheKey().
+     *
+     * "Per-shopper" is enforced, not merely assumed: a PHP session survives a login
+     * (session_regenerate_id() changes the ID and keeps the data), so this attribute is
+     * reached through ShopperScopedAddressStores, which flushes it whenever the logged-in
+     * customer changes (LOQ-16978).
+     *
+     * An ALIAS of ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY, kept so every existing
+     * reference to Validator::VERIFY_CACHE_SESSION_KEY still resolves. The literal lives on
+     * the guard because the guard is what enforces this attribute's lifetime, and holding
+     * it here made the dependency circular - the guard's flush list pointed at this class
+     * while this class constructs the guard.
      */
-    const VERIFY_CACHE_SESSION_KEY = 'loqate_verified_addresses';
+    const VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::VERIFY_CACHE_SESSION_KEY;
 
     /**
      * Maximum number of verdicts kept per session, oldest evicted first.
      *
-     * Bounded so the cache cannot inflate the session payload the way the pre-existing
-     * "captured_addresses" store does: that one grows without limit for the whole
-     * session (Helper/Controller.php:171-186), which is tracked as LOQ-16978 and is
-     * deliberately not replicated here.
+     * Bounded so the cache cannot inflate the session payload, and small because this is
+     * the INTERACTIVE path: one shopper checking out replays a handful of addresses across
+     * the call paths listed on verifyAddress(), so 50 distinct addresses is already far
+     * beyond a realistic session. Helper\Controller::CAPTURED_ADDRESSES_LIMIT now bounds
+     * the older captured-address store at the same figure and for the same reasons
+     * (LOQ-16978); self::BATCH_VERIFY_CACHE_LIMIT is the one that is deliberately larger,
+     * because only that path has to hold a 100-row import chunk.
      */
     const VERIFY_CACHE_LIMIT = 50;
+
+    /**
+     * Session data key holding the BATCH verdict cache (LOQ-16976).
+     *
+     * A PHYSICALLY SEPARATE session attribute from self::VERIFY_CACHE_SESSION_KEY - not a
+     * prefix inside that array - because the two caches hold verdicts of different KINDS
+     * that must never answer each other's lookups. verifyAddress() judges an address
+     * against the AVC thresholds (checkAVCStatus()); verifyMultipleAddresses() judges it
+     * against the address quality index (checkQualityIndex()). The thresholds differ, so
+     * the namespacing fingerprints differ (resolveComparerAvcString() versus
+     * resolveQualityIndexThreshold()), and the stored shapes differ ('error' versus
+     * 'valid'). Sharing one array would leave conflation one missing-prefix bug away, and
+     * a key collision there would let an AVC verdict satisfy an AQI check - silently
+     * bypassing a threshold the merchant configured. Two attributes make that
+     * structurally impossible rather than merely unlikely, and cost one extra session key.
+     *
+     * Same lifetime rules as the single-address cache: a verdict is customer data, so it
+     * lives in the per-shopper customer session and nowhere process- or install-wide, and
+     * it is reached through ShopperScopedAddressStores so that it is flushed when the logged-in
+     * customer changes (LOQ-16978) - subject to the ACCEPTED LIMITS on that class, which
+     * name THIS attribute specifically: it is written only from adminhtml, where the
+     * customer session carries no customer id, so the guard's flush is a no-op for it and
+     * an admin-user swap inside one browser session is not covered.
+     *
+     * An ALIAS of ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY, for the same
+     * dependency-direction reason as self::VERIFY_CACHE_SESSION_KEY above.
+     */
+    const BATCH_VERIFY_CACHE_SESSION_KEY = ShopperScopedAddressStores::BATCH_VERIFY_CACHE_SESSION_KEY;
+
+    /**
+     * Maximum number of batch verdicts kept per session, oldest evicted first.
+     *
+     * Deliberately larger than self::VERIFY_CACHE_LIMIT because this path is BATCHED:
+     * customer import verifies in chunks of 100 rows
+     * (Plugin\Admin\ValidateImportAddress.php:50), so any limit below 100 could not hold
+     * even one chunk - the eviction would discard a chunk's earliest rows before the
+     * chunk finished, and re-running a file that FITS WITHIN THIS LIMIT would re-bill them.
+     * 200 holds two full chunks while still bounding the session payload, which is the whole
+     * point of having a limit at all (see self::VERIFY_CACHE_LIMIT and
+     * Helper\Controller::CAPTURED_ADDRESSES_LIMIT, both 50 because no import writes to
+     * them).
+     *
+     * READ THAT PARAGRAPH AS A FLOOR ON THE CONSTANT, NOT AS A SAVING ON THE IMPORT PATH.
+     * It is why >= 100 is asserted, and it holds only for a file whose whole working set
+     * fits inside the limit; for a file LARGER than the limit it claims nothing, because
+     * FIFO eviction leaves close to zero hits however the constant is chosen. The paragraph
+     * below is the one to quote when crediting this cache with a saving.
+     *
+     * DO NOT MEASURE THIS AGAINST THE IMPORT PATH - state the consequence plainly so the
+     * saving is not credited to the wrong place. Eviction is FIFO, so re-running a file
+     * LARGER than this limit yields close to ZERO cache hits: chunk 1's entries are already
+     * evicted by the time run 1 finishes, and re-fetching them during run 2 evicts exactly
+     * what chunk 2 would have needed. Two further facts compound it: only PASSING verdicts
+     * are cached at all (storeBatchVerifyResult()), and address_quality_index defaults to
+     * 'A' (etc/config.xml:20), the strictest value, so on a default install most rows fail
+     * and are therefore never cacheable in the first place. The practical dedupe on the
+     * import path is consequently near nil, and raising this constant would not change that
+     * - it is inherent to FIFO over a working set larger than the cache.
+     *
+     * THIS IS TRACKED, NOT ACCEPTED. LOQ-16976 was raised for admin order create AND customer
+     * import; this cache delivers the first. The import half is LOQ-17148, which is where the
+     * two fixable causes belong - caching failed verdicts on that path, where a failure costs
+     * a re-verify rather than a bypass, and exposing address_quality_index in
+     * etc/adminhtml/system.xml so the default cannot silently fail every row.
+     *
+     * Where this cache actually pays for itself is ADMIN ORDER CREATE: two addresses per
+     * submission, re-submitted after a validation bounce or an unrelated form error, is
+     * two billed addresses instead of two per attempt - well inside any limit. That is the
+     * win LOQ-16976 buys; a large re-run import is not.
+     */
+    const BATCH_VERIFY_CACHE_LIMIT = 200;
 
     /** @var Verify $apiConnector */
     private $apiConnector;
@@ -78,8 +200,13 @@ class Validator
     /** @var Logger $logger */
     private $logger;
 
-    /** @var Session $session */
-    private $session;
+    /**
+     * @var ShopperScopedAddressStores The captured-address store and the two verdict caches,
+     *      behind the shopper-ownership guard. The raw customer session is deliberately
+     *      NOT kept as well: keeping it would leave a way to reach those stores without
+     *      the guard - see ShopperScopedAddressStores.
+     */
+    private ShopperScopedAddressStores $shopperSession;
 
     /** @var RegionFactory */
     private $regionFactory;
@@ -94,7 +221,9 @@ class Validator
      * Validator construct
      *
      * @param Logger $logger
-     * @param Session $session
+     * @param Session $session Wrapped in a ShopperScopedAddressStores and not kept raw, so the
+     *                         captured-address store and both verdict caches can only be
+     *                         reached through the shopper-ownership guard.
      * @param RegionFactory $regionFactory
      * @param ModuleListInterface $moduleList
      * @param Data $helper
@@ -109,7 +238,7 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        $this->session = $session;
+        $this->shopperSession = new ShopperScopedAddressStores($session);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
@@ -179,25 +308,32 @@ class Validator
     /**
      * Verify single address using Loqate API
      *
-     * The Cleansing API behind $this->apiConnector is billable per request, and this
-     * method is wired in from SIX call statements across five classes, every one of
-     * them registered GLOBALLY - etc/di.xml and etc/events.xml carry no area scoping:
+     * The Cleansing API behind $this->apiConnector is billable PER ADDRESS (see the billing
+     * note on verifyMultipleAddresses()); this method sends exactly one address per request,
+     * so here one call is one billed address. It is wired in from SIX call statements across
+     * five classes, every one of them registered GLOBALLY - etc/di.xml and etc/events.xml
+     * carry no area scoping:
      *  - Plugin\Frontend\CheckoutShippingInformation.php:32 - shipping-information POST;
      *  - Plugin\Frontend\CheckoutBillingAddress.php:34 - billing save, which
      *    savePaymentInformation replays at place order, so this one statement can run
      *    twice in a checkout;
-     *  - Observer\QuoteSubmitBefore.php:60 and :84 - shipping and billing on
+     *  - Observer\QuoteSubmitBefore.php:85 and :109 - shipping and billing on
      *    sales_model_service_quote_submit_before, a global event, so it also fires on
-     *    admin order create and multishipping, not just in checkout;
+     *    multishipping, not just in checkout; admin order create is the one path that
+     *    event reaches but these two statements no longer do - the observer returns
+     *    before them there, see QuoteSubmitBefore::isAdminArea() and the note in
+     *    etc/events.xml:14-16;
      *  - Plugin\Frontend\CustomerAccountAddress.php:37 - customer address-book save;
      *  - Plugin\Admin\ValidateAddress.php:42 - admin customer-address validation,
      *    including an admin re-testing the same address repeatedly.
      * So one checkout of one address reaches this method 3-5 times depending on
      * Magento version and checkout front-end, and account saves and admin re-tests
      * replay the same address on top of that. Verdicts are therefore de-duplicated on
-     * the canonical address signature and replayed from a session-scoped cache, so one
-     * address costs one request (LOQ-16969). verifyMultipleAddresses() has no such
-     * guard yet - LOQ-16976.
+     * the normalised address signature and replayed from a session-scoped cache, so one
+     * address costs one request (LOQ-16969). verifyMultipleAddresses() now has its own
+     * equivalent guard (LOQ-16976), built by the same signature builder but held in its own
+     * session attribute and namespaced by its own threshold, because its verdicts come from
+     * the AQI rather than the AVC - see self::BATCH_VERIFY_CACHE_SESSION_KEY.
      *
      * CONCURRENCY - stated limit: this de-duplicates SEQUENTIAL calls only. Reading the
      * cache, issuing the billable call and writing the verdict are not atomic and
@@ -222,67 +358,51 @@ class Validator
         }
 
         $requestArray = $this->parseAddress($address);
-        if ($checkForCaptured && ($storedAddresses = $this->session->getData('captured_addresses'))) {
+        $capturedKey = Controller::CAPTURED_ADDRESSES_SESSION_KEY;
+        if ($checkForCaptured && ($storedAddresses = $this->shopperSession->getData($capturedKey))) {
             if ($this->checkForCapturedAddress($requestArray, $storedAddresses)) {
                 return ['error' => false];
             }
         }
 
-        // Asymmetric keys: successes on the lossy signature (county excluded) so one
-        // address is billed once across all checkout call paths; rejections on the
-        // strict signature (county included) so a shopper who corrects a wrong county
-        // is re-verified instead of locked out of checkout by a replayed rejection.
-        // Cost: a rejection may be re-billed once per call path, which is fine
-        // because a rejection blocks checkout, so later paths are rarely reached.
+        // ONE key, one read, and both verdicts written under it. Its region segment is
+        // Address4 - the region value ACTUALLY SENT to Loqate - which is what makes one key
+        // enough for successes and rejections alike; see buildVerifyCacheSignature().
         //
-        // Both verify keys are derived from the captured-address signature rather than
-        // being it: of the street, buildAddressSignature() covers lines 1 and 2 only
-        // (Address1/Address2), while the request sent to Loqate carries the FULL joined
-        // street in 'Address',
-        // so with customer/address/street_lines >= 3 an edit to line 3 or 4 would leave
-        // the signature untouched and replay a verdict for an address Loqate never saw.
+        // The key is DERIVED from the captured-address signature rather than being it: of
+        // the street, buildAddressSignature() covers lines 1 and 2 only (Address1/Address2),
+        // while the request sent to Loqate carries the FULL joined street in 'Address', so
+        // with customer/address/street_lines >= 3 an edit to line 3 or 4 would leave the
+        // signature untouched and replay a verdict for an address Loqate never saw.
         // buildVerifySignature() folds 'Address' in, and must not be pushed down into
         // buildAddressSignature(), which is also compared against the captured-address
         // store whose entries (Helper\Controller::storeCapturedAddress() via
         // ADDRESS_CAPTURE_MAPPING) have no 'Address' key at all.
         //
-        // THE INVARIANT THE WHOLE SCHEME RESTS ON: the STRICT key must project EVERY
-        // field parseAddress() sends to Loqate - that is, every value in
-        // ADDRESS_MAPPING - and the LOSSY key must be exactly the strict key minus the
-        // county (self::COUNTY_FIELD). Only then is the asymmetry safe: a rejection is
-        // recorded against the complete address Loqate actually judged, so correcting
-        // ANY field re-verifies rather than replaying a rejection (no checkout
-        // dead-end), while the lossy key ignores nothing but the churning county.
-        // A field added to ADDRESS_MAPPING but left out of the keys would be sent to
-        // Loqate yet invisible to the cache, silently re-opening BOTH the double
-        // billing and the dead-end. The field lists are therefore DERIVED from
-        // ADDRESS_MAPPING rather than written out by hand - see
-        // strictSignatureFields() / verifySignatureFields().
-        $signature = $this->buildAddressSignature($requestArray);
-        $verifySignature = $this->buildVerifySignature($signature, $requestArray);
-        $strictSignature = $this->buildStrictAddressSignature($verifySignature, $requestArray);
+        // THE INVARIANT THE WHOLE SCHEME RESTS ON: the key must project EVERY field
+        // parseAddress() sends to Loqate - that is, every value in ADDRESS_MAPPING. Only
+        // then is one key safe for both verdicts: a rejection is recorded against the
+        // complete address Loqate actually judged, so correcting ANY field re-verifies
+        // rather than replaying a rejection (no checkout dead-end), and a success is
+        // replayed only for an address Loqate actually accepted. A field added to
+        // ADDRESS_MAPPING but left out of the key would be sent to Loqate yet invisible to
+        // the cache, silently re-opening BOTH the double billing and the dead-end, so the
+        // field list is DERIVED from ADDRESS_MAPPING rather than written out by hand - see
+        // verifyCacheSignatureFields().
+        $signature = $this->buildVerifyCacheSignature($requestArray);
 
-        // Strict (rejection) key first: the two key families are disjoint, so both
-        // reads are cheap cache lookups and only one case changes - a shopper who
-        // reverts to a county Loqate explicitly rejected now gets that rejection back
-        // instead of being passed by the county-agnostic success entry.
-        // ?? short-circuits, so the lossy key is only read when the strict one misses,
-        // which is also what makes the reported key family below accurate.
-        $strictResult = $this->getCachedVerifyResult($strictSignature);
-        $cachedResult = $strictResult ?? $this->getCachedVerifyResult($verifySignature);
+        $cachedResult = $this->getCachedVerifyResult($signature);
         if ($cachedResult !== null) {
-            $this->logVerifyCacheOutcome(
-                'hit',
-                $strictResult !== null ? 'strict' : 'lossy',
-                $strictResult !== null ? $strictSignature : $verifySignature
-            );
+            $this->logVerifyCacheOutcome('hit', $signature);
 
             return $cachedResult;
         }
 
         // Every miss is followed by exactly one billable request (the call below), so
-        // counting these lines counts the Loqate invoice.
-        $this->logVerifyCacheOutcome('miss', 'none', $verifySignature);
+        // counting these lines counts the Loqate invoice. The miss and every hit that later
+        // replays it are reported under the same key, so they share a token - see
+        // logVerifyCacheOutcome().
+        $this->logVerifyCacheOutcome('miss', $signature);
 
         $response = $this->apiConnector->verifyAddress(['Addresses' => [$requestArray], 'source' => $this->version]);
 
@@ -298,10 +418,6 @@ class Validator
             ];
         }
 
-        // if (!isset($response[0][0]['AQI']) || !$this->checkQualityIndex($response[0][0]['AQI'])) {
-        //     return ['error' => true, 'message' => __('The provided address is invalid.')];
-        // }
-
         $avcCode = $response[0][0]['AVC'] ?? null;
         if (!is_string($avcCode) || $avcCode === '') {
             // No AVC at all means a response shape we cannot read (the connector
@@ -314,37 +430,23 @@ class Validator
         }
 
         if (!$this->checkAVCStatus($avcCode)) {
-            // A real AVC that fails the thresholds is a definitive verdict, so it
-            // is cached - under the strict key only, see above.
-            $this->storeVerifyResult($strictSignature, true);
+            // A real AVC that fails the thresholds is a definitive verdict, so it is cached.
+            $this->storeVerifyResult($signature, true);
 
             return ['error' => true, 'message' => __('The provided address is invalid.')];
         }
 
-        // Accepted trade-off (LOQ-16969), stated at its true width: because the success
-        // key excludes the county, once ANY county variant of this address is accepted,
-        // every county variant Loqate has NOT explicitly rejected also passes from the
-        // cache for the rest of the session (a rejected one is caught by the strict read
-        // above, which runs first).
+        // The same key a rejection is stored under, which is safe precisely because that key
+        // is a faithful projection of the address Loqate just judged.
         //
-        // This is accepted because keying successes strictly would re-bill precisely the
-        // county churn this ticket fixes: capture.js populates the region <select> from
-        // the SDK's ProvinceName and fires a bubbling change event
-        // (view/base/web/capture.js:7932, retried with backoff at :7942-7960), and
-        // parseAddress() additionally re-resolves 'region' from region_id, so the county
-        // value is NOT stable across the call paths listed in this method's docblock.
-        //
-        // It is NOT the status quo, and must not be justified as parity with the
-        // pre-existing captured_addresses guard: that guard is written only by
-        // Helper\Controller::retrieve() -> storeCapturedAddress()
-        // (Helper/Controller.php:171-186), so it only ever applied to addresses picked
-        // from the Loqate lookup - addresses Loqate itself authored. Caching successes
-        // county-blind extends that county-blindness to TYPED addresses, which is a
-        // widening of the bypass. Tightening it (for instance by keying successes
-        // strictly and canonicalising the county instead) is tracked as LOQ-16979,
-        // "tighten county-blind verify verdict cache so unverified county variants
-        // cannot pass".
-        $this->storeVerifyResult($verifySignature, false);
+        // WHY THE SEPARATE SUCCESS KEY IS GONE, where its rationale used to live: it existed
+        // because the success key was LOSSY about the region, so a stricter key was needed
+        // beside it to stop a shopper being stranded on a replayed "no". Nothing is lossy
+        // now, so there is nothing for a second key to absorb - and both invariants that
+        // motivated the split still hold: a shopper who corrects a genuinely wrong region
+        // gets a different key and a fresh verification, and a success can only ever be
+        // replayed for an address Loqate actually accepted.
+        $this->storeVerifyResult($signature, false);
 
         return ['error' => false];
     }
@@ -353,14 +455,135 @@ class Validator
      * Verify multiple addresses using Loqate API
      *
      * Used by admin order create (Plugin\Admin\OrderSave.php:49) and customer import
-     * (Plugin\Admin\ValidateImportAddress.php:38). This path is NOT covered by the
-     * verify verdict cache that verifyAddress() uses and still bills every address on
-     * every submission: its verdicts come from the AQI (checkQualityIndex()), not the
-     * AVC, so it needs its own key and its own verdict shape - tracked as LOQ-16976.
+     * (Plugin\Admin\ValidateImportAddress.php:53).
+     *
+     * BILLING (LOQ-16976): the Cleansing API is billable PER ADDRESS, not per request, so
+     * the verdict cache is consulted PER ADDRESS, before the address is added to the
+     * payload - only misses are sent, so a five-row batch with three rows already verified
+     * in this session bills two. Verdicts live in their own session attribute
+     * (self::BATCH_VERIFY_CACHE_SESSION_KEY) with their own AQI-based namespacing, and are
+     * therefore invisible to verifyAddress()' cache and vice versa: read that constant
+     * before considering merging the two. Only PASSING verdicts are cached, see
+     * storeBatchVerifyResult(). The pre-existing captured-address guard is applied first
+     * and is likewise free.
+     *
+     * RETURN SHAPE - load-bearing in two ways, do not "simplify" either:
+     *  - one entry per input address, under the INPUT's OWN KEY. OrderSave.php:51-57
+     *    reports that key to the admin, and before LOQ-16977 the keys of a mixed batch
+     *    were wrong: the original code recovered them with
+     *    array_search(false, $addressesToCheck) over an array whose values were all
+     *    truthy, so it always got false, coerced to key 0 - every response row overwrote
+     *    $result[0], and the captured addresses' own verdicts were never merged into
+     *    $result at all. The mapping is now an explicit parallel array, see $sentItems.
+     *  - in the INPUT's OWN ORDER, because ValidateImportAddress.php:94 array_merge()s the
+     *    per-chunk arrays and then derives the import row number from the merged
+     *    $index + 1. array_merge() renumbers integer keys BY INSERTION ORDER, not by key
+     *    value, so a result that came back as [3 => .., 0 => .., 1 => .., 2 => ..] - which
+     *    is precisely what filling cache hits during the first pass and API verdicts
+     *    afterwards would otherwise produce - would silently mis-attribute EVERY reported
+     *    row number. $result is therefore pre-seeded with one slot per address in input
+     *    order before any verdict is filled in. A ksort() at the end would NOT be an
+     *    equivalent fix: it would reorder string keys (OrderSave's) and any input that is
+     *    not already in ascending key order.
+     *
+     * WHY THE ROW COUNT IS CHECKED BEFORE ANY ROW IS ATTRIBUTED, and why a mismatch fails the
+     * whole batch. Verdicts are attributed POSITIONALLY - the Nth answer belongs to the Nth
+     * address sent - and the connector makes that attribution unverifiable from the response
+     * itself: Verify::verifyAddress() (vendor/lqt/api-connector/src/Client/Verify.php:50-52)
+     * ends in array_column($response, 'Matches'), and array_column() SILENTLY DROPS every
+     * record that has no 'Matches' key and REINDEXES the survivors into a clean 0..N-1 list.
+     * So a three-address batch whose MIDDLE record came back as a PER-RECORD error envelope
+     * reaches us as a TWO-element list in which position 1 holds address 3's verdict (verified
+     * on PHP 8.3). Without the count guard below, address 2 would be handed address 3's verdict
+     * and - far worse - storeBatchVerifyResult() would persist address 3's PASS against ADDRESS
+     * 2's signature for the rest of the session: the "wrong valid replayed" failure the strict
+     * key exists to prevent, arriving through the one door the single-address path does not have
+     * (verifyAddress() sends one address, so a dropped record leaves it nothing to
+     * mis-attribute).
+     *
+     * NOTE THE EXACT SCOPE, so this guard is not credited with more than it does: array_column()
+     * drops only records MISSING the key. A record that HAS 'Matches' whose value is [] or null
+     * SURVIVES as an empty element and the count is PRESERVED (verified on PHP 8.3), so it sails
+     * past this guard and lands in the attribution loop with no readable AQI. That disjoint fault
+     * is answered there, by checkQualityIndex() failing closed - see both.
+     *
+     * The same array_column() also flattens a class of WHOLE-response faults to the same empty
+     * list: any HTTP 200 body that is not a list of records carrying 'Matches' - {"Items": ...},
+     * {"error":"Unauthorized"}, {} - since each collapses to []. None of those sets
+     * $response['error'], so before the guard they produced zero verdicts, zero log lines and an
+     * import that proceeded entirely unverified with no diagnostic at all.
+     *
+     * WHAT IS NOT IN THAT CLASS, named explicitly so this justification is not widened back out
+     * to faults that were never silent: an unparseable body and a TOP-LEVEL
+     * {"Number":..,"Description":..} envelope. The first json_decode()s to null, so
+     * is_array() fails (vendor/lqt/api-connector/src/Client/Verify.php:50) and the connector
+     * returns ['error' => true, 'message' => 'Unexpected error occurred.'] (same file, :57). The
+     * second makes HttpClient::searchForError() report an error, so post() THROWS
+     * (vendor/lqt/api-connector/src/Client/Http/HttpClient.php:53-55 over :72-74) and
+     * Verify::verifyAddress() catches it into that same shape (Verify.php:53-55). Both were
+     * therefore already answered by the isset($response['error']) branch below, before this
+     * guard existed (all traced on PHP 8.3). Such an envelope does arrive as [] in two
+     * corners, both of them just further instances of the class above rather than new ones,
+     * and both because searchForError()'s return is tested for TRUTHINESS rather than for
+     * false (HttpClient.php:53 over :72-74):
+     *  - a FALSY 'Description' - '' and '0', but equally JSON null, 0 and false;
+     *  - an ABSENT 'Description' next to a present 'Number', which HttpClient.php:73 reads
+     *    UNGUARDED. This one is decided by the error handler in force, not by the body: PHP 8
+     *    raises "Undefined array key" and evaluates the read to null, so with no throwing
+     *    handler the return is falsy and the whole envelope reaches array_column() as [] -
+     *    the count guard's branch. Under Magento's own handler
+     *    (Magento\Framework\App\ErrorHandler, registered in Bootstrap::run() and throwing
+     *    for any level error_reporting() reports) the same warning becomes an \Exception,
+     *    which Verify::verifyAddress()'s catch (Throwable) converts into
+     *    ['error' => true, ...] - the OTHER branch. So one identical body is classified two
+     *    different ways depending on the entry point (a web request, which registers that
+     *    handler, versus a context that never calls Bootstrap::run()). NOT on
+     *    developer-versus-production mode: app/bootstrap.php sets error_reporting(E_ALL) and
+     *    Bootstrap::run() registers the handler, both irrespective of MAGE_MODE. Either
+     *    branch is safe - one returns false, the other returns false - which is why this is
+     *    documented rather than defended against here.
+     *
+     * TRADE-OFF, accepted deliberately: a genuinely TRUNCATED response (Loqate answering
+     * fewer rows than it was sent) now fails the whole batch instead of reporting the rows it
+     * does hold. For the import that means one critical error and no import, where before it
+     * meant later chunks silently renumbered by ValidateImportAddress's array_merge(). That is
+     * the right direction: a mis-numbered row sends the merchant to edit a VALID row while the
+     * genuinely bad one imports unnoticed, whereas a blocked import is loud, retryable and
+     * loses nothing.
+     *
+     * ACCEPTED LIMITS, stated:
+     *  - CONCURRENCY: exactly the limit documented on verifyAddress(). Read, billable call
+     *    and write are not atomic, so two genuinely concurrent submissions of the same
+     *    batch can both miss and both be billed. Sequential replay - the re-submitted
+     *    admin order, the re-run import - is what this de-duplicates.
+     *  - a row present in the response but carrying no readable AQI is answered INVALID and
+     *    is never cached. That is a fail-closed verdict, decided by checkQualityIndex()'s
+     *    shape guard, and reached for a record whose 'Matches' list is present but empty -
+     *    the row-count guard below cannot catch that shape, because array_column()
+     *    PRESERVES such a record, see the attribution loop for the demonstration. It is a
+     *    deliberate rejection, not a gap: it costs one re-attempt on a response we could
+     *    not read, where the previous behaviour reported "no match found" as VALID.
+     *  - the same address twice in ONE batch is billed twice: both copies miss the cache in
+     *    the pre-flight pass, since nothing is written until the response comes back.
+     *    Tracked as LOQ-17015. Whoever implements it MUST preserve the
+     *    ONE-RESPONSE-ROW-PER-SENT-ITEM assumption the row-count guard below and the
+     *    positional attribution loop after it both depend on: collapsing duplicates into a
+     *    single payload slot changes the row/address arithmetic, so that dedupe and this
+     *    guard have to be changed TOGETHER. Sending N slots and fanning one row out to
+     *    several caller keys, or sending N-k slots and re-deriving the expected row count
+     *    from the de-duplicated payload rather than from the caller's address count, are both
+     *    safe; silently comparing count($response) against the pre-dedupe count is not.
      *
      * @param $addresses
      * @param bool $checkForCaptured
-     * @return array|false
+     * @return array|false THREE shapes, and every caller has to handle all three - see
+     *                     Plugin\Admin\ValidateImportAddress::afterValidateData():19-32:
+     *                     array<int|string, bool>, one verdict per input key in input order,
+     *                     the normal case; ['noKeyFound' => true] when no API key is
+     *                     configured, which is load-bearing and must NOT be merged into
+     *                     row-indexed data (a string key there is reported as row #1); or
+     *                     false when the API call failed or answered a row count that cannot
+     *                     be attributed to the addresses sent.
      */
     public function verifyMultipleAddresses($addresses, $checkForCaptured = true)
     {
@@ -368,54 +591,178 @@ class Validator
             return ['noKeyFound' => true];
         }
 
-        if ($checkForCaptured) {
-            $storedAddresses = $this->session->getData('captured_addresses');
-        }
+        $storedAddresses = $checkForCaptured
+            ? $this->shopperSession->getData(Controller::CAPTURED_ADDRESSES_SESSION_KEY)
+            : null;
 
+        $result = [];
         $requestArray = [];
+
+        // PARALLEL TO $requestArray BY POSITION: $sentItems[$n] describes the address sent
+        // at position $n of the payload - the caller's key to report its verdict under,
+        // and the signature to cache that verdict against. This is the whole of the
+        // LOQ-16977 fix: the key an address came in under is RECORDED when the address is
+        // added to the payload, instead of being guessed at afterwards.
+        $sentItems = [];
+
         foreach ($addresses as $index => $address) {
+            // Reserve this address's slot NOW, so the returned array follows the input key
+            // order however out of order the verdicts are filled in below. See the return
+            // shape note above: this ordering is what keeps import row numbers correct.
+            $result[$index] = null;
+
             $parsedAddress = $this->parseAddress($address);
-            if (isset($storedAddresses)
-                && $storedAddresses
-                && ($checkedAddress = $this->checkForCapturedAddress($parsedAddress, $storedAddresses))) {
-                //store all the address keys in a new array, so we can preserve the original keys/identifiers
-                //because we are not sending the original array for validation and we need them to display results
-                $addressesToCheck[$index] = $checkedAddress;
+
+            // Pre-existing guard, kept ahead of the verdict cache because it is free and
+            // Loqate authored these addresses itself.
+            if ($storedAddresses && $this->checkForCapturedAddress($parsedAddress, $storedAddresses)) {
+                $result[$index] = true;
                 continue;
             }
+
+            // The SAME builder verifyAddress() uses, and now the only one there is: the
+            // region is in the key on the read exactly as on the write, so a region variant
+            // Loqate was never asked about simply misses and is billed. (That is why the
+            // warning this comment replaces - "no county rewrite may be pushed down into the
+            // shared builders" - is deletable: there is no second builder left to widen.)
+            // What stays separate is the STORE and the namespacing, because these verdicts
+            // come from the AQI: see self::BATCH_VERIFY_CACHE_SESSION_KEY and
+            // buildBatchVerifyCacheKey(). Pinned by
+            // ValidatorBatchVerifyCacheTest::testAnUnverifiedCountyVariantIsNeverServedACachedBatchPass()
+            // and ::testChangingOnlyTheCountyCostsASecondBillableAddress().
+            $signature = $this->buildVerifyCacheSignature($parsedAddress);
+            $cachedVerdict = $this->getCachedBatchVerifyResult($signature);
+            if ($cachedVerdict !== null) {
+                $this->logBatchVerifyCacheOutcome('hit', $signature);
+                $result[$index] = $cachedVerdict;
+                continue;
+            }
+
+            // Every miss becomes exactly one billed address in the request below, so
+            // counting these lines counts the Loqate invoice for this path.
+            $this->logBatchVerifyCacheOutcome('miss', $signature);
+
+            $sentItems[] = ['key' => $index, 'signature' => $signature];
             $requestArray[] = $parsedAddress;
         }
 
-
-        if (!$requestArray && isset($addressesToCheck)) {
-            return $addressesToCheck;
+        if ($requestArray === []) {
+            // Nothing left to ask, because every address was captured or cached (or the
+            // batch was empty). Returning here is what makes an all-hit batch cost NO
+            // request, rather than sending an empty 'Addresses' payload to a billable
+            // endpoint and discarding the answer.
+            return $result;
         }
 
         $response = $this->apiConnector->verifyAddress(['Addresses' => $requestArray, 'source' => $this->version]);
         if (isset($response['error'])) {
+            // A transport failure is not a verdict: nothing is cached, so the next attempt
+            // retries the API instead of replaying the failure for the rest of the session.
+            // Callers MUST handle this non-array return - see
+            // Plugin\Admin\ValidateImportAddress::afterValidateData().
             $this->logger->info($response['message']);
             return false;
         }
 
-        $result = [];
-        if (isset($addressesToCheck)) {
-            foreach ($response as $address) {
-                // BROKEN, pre-existing, left alone deliberately: $addressesToCheck holds
-                // the CAPTURED addresses (all truthy), so array_search(false, ...) can
-                // only ever return false, and every response row is written to
-                // $result[false] === $result[0]. Verdicts for a mixed batch are therefore
-                // mis-attributed. Fixing it changes admin/import behaviour and needs its
-                // own regression cover - tracked as LOQ-16977.
-                $originalPos = array_search(false, $addressesToCheck);
-                $result[$originalPos] = $this->checkQualityIndex($address[0]['AQI']);
-            }
-        } else {
-            foreach ($response as $address) {
-                $result[] = $this->checkQualityIndex($address[0]['AQI']);
-            }
+        // THE PRECONDITION OF POSITIONAL ATTRIBUTION, checked before a single verdict is read
+        // or cached: exactly one answer per address sent. Everything below reads the Nth answer
+        // as the Nth address's verdict, and the connector's array_column($response, 'Matches')
+        // makes that unverifiable per row - it drops records with no 'Matches' key and
+        // reindexes the rest, so a gap arrives as a SHORTER CLEAN LIST that is indistinguishable
+        // from a truncated one and shifts every position after it. See the docblock above for
+        // the full mechanism and the accepted trade-off. Bailing out is therefore the only safe
+        // reading of a count mismatch, and it also gives the whole-response faults the connector
+        // collapses to [] - any 200 body that is not a list of records carrying 'Matches', such as
+        // {"Items": ...}, {"error":"Unauthorized"} or {} - a return value and a log line, where
+        // before they were completely silent. An unparseable body and a top-level error envelope
+        // are NOT among those: the connector reports both as ['error' => true, ...], so the branch
+        // directly above already returns for them and always did. See the docblock.
+        //
+        // Returning false, not a partial array: the callers already treat false as "no verdict
+        // for this batch" and fail closed on it - Plugin\Admin\ValidateImportAddress.php:55-75
+        // reports one critical error and stops, Plugin\Admin\OrderSave.php:59-64 blocks the
+        // order with a message.
+        if (!is_array($response) || count($response) !== count($sentItems)) {
+            $this->logger->info(sprintf(
+                'Loqate batch verify answered %d rows for %d addresses; verdicts not attributed.',
+                is_array($response) ? count($response) : 0,
+                count($sentItems)
+            ));
+
+            return false;
         }
 
-        return $result;
+        // Attribution is positional and, thanks to the guard above, total: $sentItems and
+        // $response are now known to be the same length, so an own counter walks them in
+        // lockstep and every address sent gets exactly one verdict.
+        //
+        // WHAT THE COUNTER DOES AND DOES NOT BUY, stated exactly, because it is easy to read
+        // more into it. foreach pairs the two lists by ITERATION ORDER, so this loop does
+        // depend on $response iterating in the order the payload was built - just as strong an
+        // assumption as reading $response[$position] would be, not a weaker one. That order is
+        // guaranteed upstream, not here: the connector's array_column($response, 'Matches')
+        // emits one element per source record in source order, and Loqate answers records in
+        // the order they were sent. What the counter buys is only that $sentItems is indexed by
+        // POSITION and never by $response's KEYS, so nothing breaks if those keys are ever
+        // something other than the clean 0..N-1 list array_column() happens to produce (a
+        // string key, a gap): the loop still reads the Nth iterated answer as the Nth address.
+        // The count guard above is what keeps the one realistic reordering out of this loop
+        // altogether - a dropped record shortens the list, so the counts differ and we return.
+        $position = 0;
+        foreach ($response as $addressResponse) {
+            $sentItem = $sentItems[$position];
+            $position++;
+
+            // '??' rather than a bare read: post data and connector output are both outside
+            // our control, and a missing AQI must not raise a warning mid-import.
+            $qualityIndex = $addressResponse[0]['AQI'] ?? null;
+
+            // FAILS CLOSED on an AQI we could not read, and the two guards on this path catch
+            // DISJOINT faults - neither one subsumes the other:
+            //  - the ROW-COUNT guard above catches records MISSING the 'Matches' key (the
+            //    connector's array_column($response, 'Matches') DROPS those, so the list is
+            //    shorter and the counts differ) plus the whole-response shapes that collapse
+            //    to [];
+            //  - checkQualityIndex()'s shape guard catches a record that IS PRESENT carrying
+            //    an empty or otherwise unreadable 'Matches' - semantically "Loqate found no
+            //    match for this address".
+            //
+            // The second case is FULLY REACHABLE past the count guard, and this is the
+            // correction of an earlier claim in these comments that it was not. Verified on
+            // PHP 8.3: array_column() only drops records missing the key; a record that HAS
+            // 'Matches' whose value is [] SURVIVES as an empty element and the COUNT IS
+            // PRESERVED. Three records whose middle one is ['Matches' => []] therefore yield a
+            // three-element list that passes the count guard, position 1 arrives here as [],
+            // $addressResponse[0]['AQI'] ?? null is null, and null <= 'A' is true - so before
+            // this change that row was answered VALID. "No match found" being reported as
+            // "valid" is the maximally wrong answer, so this is a genuinely reachable hole
+            // being closed, not defence in depth.
+            //
+            // checkQualityIndex() now mirrors verifyAddress()'s AVC guard; see
+            // checkQualityIndex()'s own docblock for why the test is on the value's shape
+            // rather than on truthiness, and for why an unrecognised THRESHOLD rejects rather
+            // than - as it once did - passing every address.
+            $isValid = $this->checkQualityIndex($qualityIndex);
+            $result[$sentItem['key']] = $isValid;
+
+            // NEVER CACHE A VERDICT WE COULD NOT READ still holds, and it no longer needs a
+            // separate readability test here: an unreadable AQI is now a FALSE verdict, and
+            // storeBatchVerifyResult() caches nothing but passes. One test, one place - the
+            // previous arrangement had the readability rule stated twice (once for the verdict,
+            // once for the cache) and could drift.
+            $this->storeBatchVerifyResult($sentItem['signature'], $isValid);
+        }
+
+        // With the count guard in place this filter is a NO-OP by construction, and that is
+        // worth stating rather than deleting: every reserved slot is now necessarily filled -
+        // captured, cache hit, or sent and therefore answered, since a mismatched row count
+        // returned above - so no null can survive to here. It is kept as the enforcement of the
+        // documented return shape ("no null verdicts, ever"), so that a future edit which adds
+        // a fourth way of leaving a slot unfilled degrades to a missing key, which callers
+        // already read as "nothing to report", instead of shipping a null that
+        // ValidateImportAddress would report as an invalid row. array_filter() preserves both
+        // keys and order, so the return-shape guarantees above survive it either way.
+        return array_filter($result, static fn ($verdict) => $verdict !== null);
     }
 
     /**
@@ -488,16 +835,108 @@ class Validator
     }
 
     /**
-     * Check if response quality index matches the quality customer has set
+     * Check if response quality index matches the quality customer has set.
      *
-     * @param $qualityIndex
-     * @return bool
+     * FAILS CLOSED on an AQI it cannot read. The guard is on the value's SHAPE - "is this a
+     * non-empty string" - and deliberately not on truthiness or emptiness, because the
+     * comparison below is a STRING comparison in which 'A' is the strongest grade
+     * (etc/config.xml:20 defaults the threshold to 'A' and 'A' <= 'A' is true). Anything
+     * looser would over-reject:
+     *  - empty()/falsy would reject '0', and would reject nothing this guard does not
+     *    already catch;
+     *  - a whitelist of known grade letters would reject a grade letter Loqate adds later,
+     *    turning a forward-compatible comparison into a hard-coded one.
+     * A legitimately valid 'A' therefore still passes, and only a genuinely unreadable
+     * value - no string, or the empty string - is rejected.
+     *
+     * WHY THIS IS NOT COSMETIC. Under PHP 8's comparison rules null <= 'A', '' <= 'A',
+     * false <= 'A' and 0 <= 'A' are ALL true (verified on 8.3), so before this guard an
+     * unreadable AQI was answered VALID. The single call site - the positional attribution
+     * loop in verifyMultipleAddresses() - reads
+     * $addressResponse[0]['AQI'] ?? null, which is null for a response record whose
+     * 'Matches' list is present but EMPTY - i.e. Loqate saying "no match for this address",
+     * the case where "valid" is the maximally wrong answer. See the comment at that call
+     * site for why the row-count guard does not catch that shape.
+     *
+     * This mirrors verifyAddress()'s AVC guard, so both verify paths now draw the
+     * "readable verdict" line in exactly the same place.
+     *
+     * BOTH SIDES ARE NOW GUARDED EXPLICITLY, and the threshold side had to be.
+     *
+     * An earlier revision guarded only the AQI side and reasoned about the threshold side
+     * being unset: 'A' <= null and 'A' <= '' are both false on 8.3, so a blank threshold
+     * rejects every address. True, and the safe direction - but it is the wrong case. The
+     * dangerous value is not a blank threshold, it is an UNREADABLE one. Under the same
+     * string comparison, 'A' <= 'zzz' and 'E' <= 'zzz' are both TRUE (verified on 8.3), so a
+     * threshold of any text sorting above 'E' passes EVERY address, including the worst AQI
+     * Loqate can return. That is a total bypass of the merchant's configured quality bar,
+     * arrived at silently, and no amount of guarding the response side detects it.
+     *
+     * So the threshold is required to be one of self::VALID_QUALITY_INDEXES and anything
+     * else fails closed and is logged. Rejecting is the only safe answer: the whole point of
+     * the setting is to bar addresses, and a threshold nobody can read cannot be said to
+     * admit any of them.
+     *
+     * Not reachable from the admin UI today - etc/config.xml:20 supplies the default and
+     * etc/adminhtml/system.xml exposes no field for it - but "unreachable" here rests on the
+     * absence of a form field, and the value is a plain core_config_data row that a data
+     * patch, a CLI config:set, or an admin field added later can put anything into. The
+     * guard costs one in_array() per verdict.
+     *
+     * resolveQualityIndexThreshold() still returns the value RAW and uncast, so the batch
+     * cache key keeps fingerprinting exactly what was compared; see its docblock.
+     *
+     * @param $qualityIndex The AQI from the response row, of any type - it is unvalidated
+     *                      connector output, so this method must not assume a string.
+     * @return bool True only when the AQI is readable, the threshold is readable, AND the
+     *              AQI meets it.
      */
     private function checkQualityIndex($qualityIndex): bool
     {
-        $configIndex = $this->helper->getConfigValue('loqate_settings/address_settings/address_quality_index');
+        if (!is_string($qualityIndex) || $qualityIndex === '') {
+            return false;
+        }
+
+        $configIndex = $this->resolveQualityIndexThreshold();
+
+        if (!is_string($configIndex) || !in_array($configIndex, self::VALID_QUALITY_INDEXES, true)) {
+            $this->logger->info(sprintf(
+                'Loqate: address_quality_index is not a recognised quality index (%s of type %s); '
+                . 'rejecting the address. Set it to one of %s.',
+                var_export($configIndex, true),
+                gettype($configIndex),
+                implode(', ', self::VALID_QUALITY_INDEXES)
+            ));
+
+            return false;
+        }
 
         return $qualityIndex <= $configIndex;
+    }
+
+    /**
+     * Resolve the address quality index threshold a batch verdict is judged against.
+     *
+     * Extracted from checkQualityIndex() for exactly the reason resolveComparerAvcString()
+     * was extracted from checkAVCStatus(): the batch verdict cache key has to be
+     * namespaced by the threshold that was actually APPLIED, and both the comparison and
+     * the key MUST keep reading it through this one method, or the key can describe a
+     * threshold the verdict was not judged against - a merchant tightening the AQI would
+     * then keep being served verdicts earned under the looser one for the rest of every
+     * live session.
+     *
+     * Returns the configured value RAW and uncast on purpose: checkQualityIndex() compares
+     * it with <=, and under PHP 8's comparison rules 0 <= null (true, null coerced to 0)
+     * and 0 <= '' (false, compared as strings) disagree - so casting here would change
+     * verdicts rather than tidy them. buildBatchVerifyCacheKey() therefore fingerprints
+     * the value's TYPE as well as its text. Deliberately not memoised, for the reason
+     * given on resolveComparerAvcString().
+     *
+     * @return mixed The configured threshold, exactly as checkQualityIndex() compares it.
+     */
+    private function resolveQualityIndexThreshold()
+    {
+        return $this->helper->getConfigValue('loqate_settings/address_settings/address_quality_index');
     }
 
     /**
@@ -603,8 +1042,22 @@ class Validator
 
     /**
      * Check for captured addresses, so they should not be verified if already captured
+     *
+     * DEFENSIVE ABOUT THE STORE'S SHAPE, AT BOTH LEVELS (LOQ-16978). The store is read
+     * from the bare Controller::CAPTURED_ADDRESSES_SESSION_KEY session attribute, which
+     * this module does not own exclusively: another module, an older release or a
+     * truncated session payload can leave a non-array THERE, or a non-string element
+     * INSIDE it. Both are checked here rather than at the two call sites (verifyAddress()
+     * and verifyMultipleAddresses()) so the single relation that grants the verify bypass
+     * carries the single guard, and neither caller can be the one that forgot it.
+     *
+     * Neither shape may cost more than a missed bypass. This runs mid-checkout, so a
+     * malformed store must fall through to a normal verify - never a fatal, and never a
+     * warning either: under developer mode Magento's ErrorHandler promotes E_WARNING to
+     * an exception, so "degrades to a skipped loop" is not a safe resting place here.
+     *
      * @param $address
-     * @param $storedAddresses
+     * @param $storedAddresses Normally a list of serialised addresses, but see above.
      * @return bool
      */
     private function checkForCapturedAddress($address, $storedAddresses): bool
@@ -614,7 +1067,26 @@ class Validator
             return false;
         }
 
+        if (!is_array($storedAddresses)) {
+            // A truthy non-array whole attribute - both call sites only test the value for
+            // truthiness before handing it over. foreach over a scalar is an E_WARNING and
+            // an exception in developer mode, so it is rejected before the loop, not by it.
+            return false;
+        }
+
         foreach ($storedAddresses as $stored) {
+            if (!is_string($stored)) {
+                // Not something Controller::storeCapturedAddress() wrote. Skipped rather
+                // than unserialised: the production serializer
+                // (Magento\Framework\Serialize\Serializer\Json) hands its argument straight
+                // to json_decode(), whose first parameter is declared `string $json`, so an
+                // array or object element raises a TypeError - which is an \Error, not the
+                // \InvalidArgumentException caught below. This is the mirror of the guard in
+                // Helper\Controller::isSameCapturedAddress() (LOQ-16978); the two read the
+                // same store and must survive the same values.
+                continue;
+            }
+
             try {
                 $storedData = $this->serializer->unserialize($stored);
             } catch (\InvalidArgumentException $e) {
@@ -634,34 +1106,47 @@ class Validator
     }
 
     /**
-     * Build a normalised, comparable signature for an address: the canonical
-     * projection of the fields Loqate Verify keys on. Used to match an address
-     * against the captured-address store, and as the base both verify cache keys are
-     * derived from.
+     * The captured-address equality relation, exposed so the STORE and the MATCHER agree.
      *
-     * Its field list (self::CAPTURED_SIGNATURE_FIELDS) is fixed by the captured-address
-     * store it is compared against (Helper\Controller::storeCapturedAddress() writes
-     * exactly ADDRESS_CAPTURE_MAPPING's keys), so no field may be added here: the verify
-     * keys extend it in buildVerifySignature()/buildStrictAddressSignature() instead.
+     * WHY THIS IS PUBLIC AND STATIC (LOQ-16978 review). Two addresses are "the same
+     * captured address" if and only if they project onto the same signature - that is the
+     * relation checkForCapturedAddress() grants the verify bypass on. The store's writer,
+     * Helper\Controller::storeCapturedAddress(), has to de-duplicate on the SAME relation,
+     * or the two drift apart: it used to compare the exact serialised bytes of the six
+     * ADDRESS_CAPTURE_MAPPING fields, so two captures differing only in letter case, in
+     * whitespace, in ProvinceName (which this signature excludes entirely) or in ''-versus-
+     * missing Line2 were ONE address for bypass purposes but TWO slots in a bounded store -
+     * which is exactly the "cycling one address through the lookup fills every slot"
+     * failure the de-duplication exists to prevent.
      *
-     * Region/province (self::COUNTY_FIELD) is deliberately excluded, because the county
-     * is routinely rewritten between saves - capture.js populates the region <select>
-     * from the SDK's ProvinceName and fires a bubbling change event
-     * (view/base/web/capture.js:7932), and parseAddress() re-resolves 'region' from
-     * region_id - and that must not make an identical address look new and get re-billed,
-     * the LOQ-16969 symptom. Street, city (Address3), postcode and country already
-     * identify it; rejections, which do need the county, use
-     * buildStrictAddressSignature(). '' means "nothing identifiable" and keeps an address
-     * out of both comparisons.
+     * Static because the projection is pure - it reads only self::CAPTURED_SIGNATURE_FIELDS
+     * and normalises - so Controller can call it without constructing a Validator (which
+     * would need five more collaborators and would build a billable API connector).
      *
-     * @param $address
-     * @return string
+     * NO PARAMETER TYPE DECLARATION, deliberately (LOQ-16978 review). The intended input is
+     * an array in the Loqate field shape (ADDRESS_CAPTURE_MAPPING's keys, or
+     * parseAddress()'s output - they overlap on the fields this projects), but the internal
+     * callers reach here through buildAddressSignature() with whatever
+     * checkForCapturedAddress()/buildVerifyCacheSignature() were handed, which is typed
+     * `mixed`, and Helper\Controller guards its own call with is_array() only on the
+     * deserialised path. Declaring `array` would convert today's graceful degradation into
+     * a TypeError raised mid-checkout, which is the opposite of what every other reader in
+     * this class does. Anything that is not an array degrades to '': `$address[$key] ?? null`
+     * yields null for a scalar or null $address (a string index with a non-numeric key
+     * likewise), null normalises to '', and an all-'' projection returns the ''
+     * "nothing identifiable" sentinel - so an unusable input is simply kept out of every
+     * comparison instead of matching something.
+     *
+     * @param mixed $address Normally an array in the Loqate field shape; any other value
+     *                       degrades to the '' sentinel as described above.
+     * @return string '' when the address carries nothing identifiable, which keeps it out
+     *                of every comparison rather than matching other empty addresses.
      */
-    private function buildAddressSignature($address): string
+    public static function capturedAddressSignature($address): string
     {
         $parts = [];
         foreach (self::CAPTURED_SIGNATURE_FIELDS as $key) {
-            $parts[] = $this->normaliseSignatureValue($address[$key] ?? null);
+            $parts[] = self::normaliseSignatureValue($address[$key] ?? null);
         }
 
         if (trim(implode('', $parts)) === '') {
@@ -672,9 +1157,103 @@ class Validator
     }
 
     /**
-     * Key successful verdicts are stored under (the LOSSY key): the captured-address
-     * signature plus every remaining field parseAddress() sends to Loqate except the
-     * county - today that is just the full joined street, 'Address'.
+     * Build a normalised, comparable signature for an address: the projection of the fields
+     * Loqate Verify keys on. Used to match an address against the captured-address store,
+     * and as the base the verify cache key is derived from.
+     *
+     * Its field list (self::CAPTURED_SIGNATURE_FIELDS) is fixed by the captured-address
+     * store it is compared against (Helper\Controller::storeCapturedAddress() writes
+     * exactly ADDRESS_CAPTURE_MAPPING's keys), so no field may be added here: the verify
+     * cache key extends it in buildVerifySignature()/buildVerifyCacheSignature() instead.
+     *
+     * Region/province (self::COUNTY_FIELD) is excluded, and here that is FIXED BY THE
+     * STORE, not by any judgement about the region: Helper\Controller::storeCapturedAddress()
+     * writes ADDRESS_CAPTURE_MAPPING's keys and this projection is compared field for field
+     * against them. It is also harmless, because the region label is routinely rewritten
+     * between saves - capture.js selects the matching option in the region <select> from the
+     * SDK's ProvinceName and fires a bubbling change event (mapRegionSelectValue(),
+     * view/base/web/capture.js:7896-7940), and parseAddress() re-resolves 'region' from
+     * region_id - and an address the Loqate lookup itself authored must not look new and
+     * get re-verified over that, the LOQ-16969 symptom. Street, city (Address3), postcode
+     * and country already identify it. '' means "nothing identifiable" and keeps an address
+     * out of every comparison.
+     *
+     * THE VERIFY CACHE KEY DOES NOT INHERIT THAT EXCLUSION: it appends the region on top of
+     * this projection, at the fidelity the request itself carries - see
+     * buildVerifyCacheSignature().
+     *
+     * The body lives on self::capturedAddressSignature(), which
+     * Helper\Controller::storeCapturedAddress() also calls so that the store de-duplicates
+     * on the very relation this comparison grants the bypass on. This remains the name the
+     * rest of this class - and the tests - use.
+     *
+     * @param $address
+     * @return string
+     */
+    private function buildAddressSignature($address): string
+    {
+        return self::capturedAddressSignature($address);
+    }
+
+    /**
+     * THE verify cache key's signature - the one every read and every write on both paths
+     * goes through: the shared base plus the region, and nothing else, ever.
+     *
+     * THE REGION SEGMENT IS Address4, THE REGION VALUE ACTUALLY SENT TO LOQATE. That single
+     * choice is the whole design, and everything else follows from it:
+     *  - parseAddress() derives Address4 from region_id when a region_id is present, and
+     *    from the raw 'region' string when it is not. Keying on Address4 therefore already
+     *    IS the rule "region_id when present, normalised raw region when absent" - expressed
+     *    as the resolved region NAME rather than as the install-local numeric id;
+     *  - keying on the resolved NAME rather than on the region_id is deliberate and
+     *    load-bearing. The name is EXACTLY what was billed, so two submissions share a
+     *    verdict if and only if they asked Loqate the same question - no coarsening in
+     *    either direction. A numeric region_id would be FINER than what was sent, and would
+     *    split the quote-path shape ('region_id' => 100) from the POST-path shape
+     *    ('region' => 'Greater London') of ONE address, re-billing a single checkout twice.
+     *    Pinned by
+     *    ValidatorVerifyCacheTest::testBothCheckoutCallPathShapesOfOneAddressAreBilledOnce();
+     *  - because region_id -> name is deterministic, both required outcomes fall out with
+     *    ZERO country-specific rules. Two different region records resolve to two different
+     *    names, so 'County Dublin' and 'Dublin 1' are two keys and the second is verified in
+     *    its own right; and the raw label variants that arrive around ONE region_id
+     *    ('Meath', 'Co. Meath', 'County Meath' alongside region_id 55) are all overwritten
+     *    by parseAddress() with that record's name, so they share one key - they were never
+     *    distinct requests in the first place.
+     * The install-local numeric region_id therefore never enters the key at all; the
+     * resolved name does. These caches are session-scoped in any case, so an install-local
+     * value would have been harmless - the choice is about fidelity to the billed request,
+     * not about safety.
+     *
+     * ACCEPTED LIMIT: with no region_id - a free-text-region country - the region TEXT is
+     * the region, so re-spelling it is a different key and costs one extra verification.
+     * That is the safe direction, a re-bill and never a bypass, and it replaces the old
+     * collapse of label spellings, which was a bypass.
+     *
+     * @param $address Parsed address, as returned by parseAddress().
+     * @return string Empty when the address carries nothing identifiable, which keeps it out
+     *                of the cache entirely (neither read nor written).
+     */
+    private function buildVerifyCacheSignature($address): string
+    {
+        $base = $this->buildVerifySignature($this->buildAddressSignature($address), $address);
+
+        // Read off verifyCacheSignatureFields() rather than written here as
+        // [self::COUNTY_FIELD], so the list that encodes the "every field sent to Loqate is
+        // in the key" invariant is the list this builder actually uses. A field list nothing
+        // calls enforces nothing. The slice is that one field, by that method's construction.
+        $append = array_slice($this->verifyCacheSignatureFields(), count($this->verifySignatureFields()));
+
+        return $this->appendSignatureFields($base, $address, $append);
+    }
+
+    /**
+     * The SHARED BASE the region is appended to: the captured-address signature plus every
+     * remaining field parseAddress() sends to Loqate except the region - today that is just
+     * the full joined street, 'Address'.
+     *
+     * Not a cache key on its own: buildVerifyCacheSignature() appends the region, and that
+     * is the only signature anything is read or written under.
      *
      * buildAddressSignature() only covers Address1/Address2, but parseAddress() sends
      * implode(', ', $streetLines) as 'Address', and Magento supports up to four street
@@ -695,66 +1274,45 @@ class Validator
      */
     private function buildVerifySignature(string $signature, $address): string
     {
-        // Everything the lossy key covers beyond what $signature already carries.
+        // Everything the shared base covers beyond what $signature already carries.
         $append = array_slice($this->verifySignatureFields(), count(self::CAPTURED_SIGNATURE_FIELDS));
 
         return $this->appendSignatureFields($signature, $address, $append);
     }
 
     /**
-     * Strict variant of the verify signature (the STRICT key): the lossy verify
-     * signature plus the normalised county/province.
-     *
-     * Rejections are keyed with this so that correcting only a wrong county
-     * re-verifies the address instead of replaying a rejection that blocks
-     * checkout. Built from the already-normalised signature, so the '' sentinel and
-     * the normalisation rules stay identical to buildAddressSignature(). Appending one
-     * more part also keeps the two key families disjoint by pipe count, which is why
-     * reading the strict key first cannot shadow an unrelated success - and that stays
-     * true however many fields ADDRESS_MAPPING grows, because both families gain the
-     * same segments and the strict one always gains exactly one more.
-     *
-     * @param string $signature Signature returned by buildVerifySignature().
-     * @param $address Parsed address the signature was built from.
-     * @return string Empty when $signature is empty, so it is neither read nor written.
-     */
-    private function buildStrictAddressSignature(string $signature, $address): string
-    {
-        // Everything the strict key covers beyond the lossy one: the county, and by the
-        // construction of strictSignatureFields() nothing else, ever.
-        $append = array_slice($this->strictSignatureFields(), count($this->verifySignatureFields()));
-
-        return $this->appendSignatureFields($signature, $address, $append);
-    }
-
-    /**
-     * Ordered field list of the STRICT (rejection) cache key.
+     * Ordered field list of THE verify cache key.
      *
      * The load-bearing invariant of LOQ-16969, expressed as code rather than as a
      * comment: as a SET this must equal array_values(self::ADDRESS_MAPPING) - every
-     * field parseAddress() actually sends to Loqate - because a rejection may only be
+     * field parseAddress() actually sends to Loqate - because a verdict may only be
      * replayed for the exact address Loqate judged. If a field reached the request but
      * not this list, editing it would replay a stale verdict: a wrong "invalid" the
      * shopper cannot clear (the checkout dead-end) or a wrong "valid" that lets an
      * unverified address through.
      *
      * It is therefore DERIVED, not hand-written: the captured base is fixed by the
-     * captured-address store, the county is appended last (it is what the lossy key
-     * drops), and anything else in ADDRESS_MAPPING is folded in automatically. So adding
-     * a mapping such as 'company' => 'Company' extends both keys by construction instead
-     * of quietly re-opening the defect.
+     * captured-address store, the region is appended last (it is the one field the shared
+     * base leaves out), and anything else in ADDRESS_MAPPING is folded in automatically. So
+     * adding a mapping such as 'company' => 'Company' extends the key by construction
+     * instead of quietly re-opening the defect.
      *
      * @return string[] Loqate field names, in the order they appear in the key.
      */
-    private function strictSignatureFields(): array
+    private function verifyCacheSignatureFields(): array
     {
         return array_merge($this->verifySignatureFields(), [self::COUNTY_FIELD]);
     }
 
     /**
-     * Ordered field list of the LOSSY (success) cache key: the strict list minus the
-     * county. See strictSignatureFields() for why the extras are derived from
-     * ADDRESS_MAPPING, and verifyAddress() for why the county is dropped here.
+     * Ordered field list of the SHARED BASE the region is appended to: the key's list minus
+     * the region. See verifyCacheSignatureFields() for why the extras are derived from
+     * ADDRESS_MAPPING.
+     *
+     * The region is held back from this list because it is appended LAST, in a segment of
+     * its own - which is what lets the middle of the list be derived by array_diff() over
+     * ADDRESS_MAPPING without the region's position depending on that mapping's declaration
+     * order. No key omits it.
      *
      * @return string[] Loqate field names, in the order they appear in the key.
      */
@@ -772,8 +1330,8 @@ class Validator
     /**
      * Append the normalised values of $fields to an existing signature.
      *
-     * Shared by both verify key builders so the '' sentinel and the normalisation rules
-     * can only ever be defined once.
+     * Shared by the key builder and the base it is built on, so the '' sentinel and the
+     * normalisation rules can only ever be defined once.
      *
      * @param string $signature Signature to extend.
      * @param $address Parsed address the signature was built from.
@@ -788,7 +1346,7 @@ class Validator
 
         $parts = [$signature];
         foreach ($fields as $field) {
-            $parts[] = $this->normaliseSignatureValue($address[$field] ?? null);
+            $parts[] = self::normaliseSignatureValue($address[$field] ?? null);
         }
 
         return implode('|', $parts);
@@ -800,10 +1358,14 @@ class Validator
      * the signature. Non-scalars (Magento's street array, objects) and missing
      * values normalise to '' rather than throwing.
      *
+     * Static so that self::capturedAddressSignature() - the projection Helper\Controller
+     * shares - can be static too. Every call site inside this class uses self:: rather
+     * than $this->: both resolve, but $this-> on a static method reads as an oversight.
+     *
      * @param $value
      * @return string
      */
-    private function normaliseSignatureValue($value): string
+    private static function normaliseSignatureValue($value): string
     {
         if (!is_scalar($value)) {
             return '';
@@ -826,9 +1388,9 @@ class Validator
     /**
      * Read a previously stored verify verdict for the given address signature.
      *
-     * Only the verdict flag is cached; the message is rebuilt here so no Phrase ever
-     * passes through the serializer (its translation would be frozen at the store
-     * view that cached it, and a serializer without object support would return an
+     * Only the verdict flag and the key-scheme stamp are cached; the message is rebuilt here
+     * so no Phrase ever passes through the serializer (its translation would be frozen at the
+     * store view that cached it, and a serializer without object support would return an
      * unusable value). Defensive like checkForCapturedAddress(): an unexpected shape
      * degrades to "not cached" - one extra API call - and never throws in checkout.
      *
@@ -842,7 +1404,7 @@ class Validator
             return null;
         }
 
-        $store = $this->session->getData(self::VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store) || !isset($store[$key]) || !is_string($store[$key])) {
             return null;
         }
@@ -857,6 +1419,14 @@ class Validator
             return null;
         }
 
+        // A verdict may only answer a lookup made under the key scheme it was written for. A
+        // session outlives a deploy, so an entry carrying another stamp sits under a key that
+        // no longer names the same address: discard it and verify once more. Compared
+        // strictly, so a serializer that hands back "1" cannot pass for 1.
+        if (($verdict['schema'] ?? null) !== self::VERIFY_KEY_SCHEMA_VERSION) {
+            return null;
+        }
+
         if (!$verdict['error']) {
             return ['error' => false];
         }
@@ -867,8 +1437,8 @@ class Validator
     /**
      * Store a definitive verify verdict against the given address signature.
      *
-     * Only the boolean verdict is stored, never a message (see
-     * getCachedVerifyResult()). Kept in the customer session only (see
+     * Only the boolean verdict and self::VERIFY_KEY_SCHEMA_VERSION are stored, never a
+     * message (see getCachedVerifyResult()). Kept in the customer session only (see
      * self::VERIFY_CACHE_SESSION_KEY) and bounded to self::VERIFY_CACHE_LIMIT
      * entries with FIFO eviction, so in practice the address currently being
      * checked out - the one replayed on every checkout call path - survives while
@@ -885,7 +1455,7 @@ class Validator
             return;
         }
 
-        $store = $this->session->getData(self::VERIFY_CACHE_SESSION_KEY);
+        $store = $this->shopperSession->getData(self::VERIFY_CACHE_SESSION_KEY);
         if (!is_array($store)) {
             $store = [];
         }
@@ -914,8 +1484,13 @@ class Validator
             array_shift($store);
         }
 
-        $store[$key] = $this->serializer->serialize(['error' => $error]);
-        $this->session->setData(self::VERIFY_CACHE_SESSION_KEY, $store);
+        // Stamped with the key scheme, so a session that spans a deploy changing the key
+        // shape cannot be answered by an entry built under a different one.
+        $store[$key] = $this->serializer->serialize([
+            'error' => $error,
+            'schema' => self::VERIFY_KEY_SCHEMA_VERSION,
+        ]);
+        $this->shopperSession->setData(self::VERIFY_CACHE_SESSION_KEY, $store);
     }
 
     /**
@@ -960,14 +1535,13 @@ class Validator
     /**
      * Debug-log the outcome of one verify cache lookup, so the drop in billable
      * Cleansing requests can be reconciled without waiting for the Loqate invoice:
-     * misses map one-to-one onto billable calls, and the key family shows whether a hit
-     * came from the strict (rejection) or the lossy (success) entry.
+     * misses map one-to-one onto billable calls.
      *
-     * A miss is reported under the LOSSY key's hash on purpose: that key is the
-     * county-blind one, so every event belonging to one address - including the county
-     * variants the shopper churns through - shares a hash and can be counted together.
-     * A strict hit is reported under the strict key's hash, which is why the family
-     * matters when reading the log.
+     * One key means one token per address: the miss, and every hit that later replays the
+     * verdict it paid for, are reported under the same hash and can be counted together.
+     * Two addresses Loqate is asked about separately - including one address in two
+     * different regions - get two tokens, which is what an operator counting misses should
+     * expect to see.
      *
      * HOW TO TURN THIS ON: Logger/Handler.php pins $loggerType = Logger::INFO, so DEBUG
      * records are dropped and nothing is written by default. Lower that handler to
@@ -981,18 +1555,214 @@ class Validator
      * each other and with a request count, which is all the reconciliation needs.
      *
      * @param string $outcome 'hit' or 'miss'.
-     * @param string $keyFamily 'strict', 'lossy', or 'none' for a miss.
      * @param string $signature Signature the lookup was made with; never logged as-is.
      * @return void
      */
-    private function logVerifyCacheOutcome(string $outcome, string $keyFamily, string $signature): void
+    private function logVerifyCacheOutcome(string $outcome, string $signature): void
     {
         $key = $this->buildVerifyCacheKey($signature);
 
         $this->logger->debug(sprintf(
-            'Loqate verify cache %s [family=%s, key=%s]',
+            'Loqate verify cache %s [key=%s]',
             $outcome,
-            $keyFamily,
+            $key === '' ? 'unkeyed' : substr(hash('sha256', $key), 0, 12)
+        ));
+    }
+
+    /**
+     * Read a previously stored batch verdict for the given address signature.
+     *
+     * Only ever returns true or null, because only passing verdicts are stored: null means
+     * "not cached, bill it". Defensive in the same way as getCachedVerifyResult() - any
+     * unexpected shape degrades to "not cached", costing one extra address on the invoice,
+     * and never throws in the middle of an import.
+     *
+     * The stored member is 'valid', where the single-address cache stores 'error'. That is
+     * a second, independent guard on top of the separate session attribute: even if the two
+     * stores were ever conflated, an entry written by storeVerifyResult() would fail the
+     * shape check here and degrade to a miss rather than being read as a verdict.
+     *
+     * @param string $signature
+     * @return bool|null true for a cached pass, null when nothing usable is cached.
+     */
+    private function getCachedBatchVerifyResult(string $signature): ?bool
+    {
+        $key = $this->buildBatchVerifyCacheKey($signature);
+        if ($key === '') {
+            return null;
+        }
+
+        $store = $this->shopperSession->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
+        if (!is_array($store) || !isset($store[$key]) || !is_string($store[$key])) {
+            return null;
+        }
+
+        try {
+            $verdict = $this->serializer->unserialize($store[$key]);
+        } catch (\InvalidArgumentException $e) {
+            return null;
+        }
+
+        if (!is_array($verdict) || ($verdict['valid'] ?? null) !== true) {
+            return null;
+        }
+
+        // Written under an older key scheme, so the key no longer names the address it was
+        // derived from. Discarding re-verifies once; replaying would be a false ACCEPT,
+        // because this store holds only passes. Same check as getCachedVerifyResult().
+        if (($verdict['schema'] ?? null) !== self::VERIFY_KEY_SCHEMA_VERSION) {
+            return null;
+        }
+
+        return true;
+    }
+
+    /**
+     * Store a batch verdict against the given address signature - if, and only if, it
+     * PASSED.
+     *
+     * NEVER CACHING A FAILURE is load-bearing, not tidiness. Two things rest on it: an admin
+     * or an import can never be stranded on a replayed rejection, because there is none to
+     * replay; and the stored shape stays 'valid'-only, which is the second guard against
+     * this store and the single-address one being read for each other (see
+     * getCachedBatchVerifyResult()). The guard therefore lives HERE rather than at the call
+     * site, so a future caller cannot reintroduce cached failures by forgetting it.
+     *
+     * WHAT THIS GUARD RELIES ON, and where that half lives: "$valid === true" only means
+     * checkQualityIndex() said so, and this method cannot audit that - by the time it is
+     * called the response value is gone. It is safe because checkQualityIndex() itself now
+     * FAILS CLOSED on an AQI it cannot read (its opening shape guard): an unreadable value
+     * can no longer arrive here as a genuine-looking pass to be replayed all session. Do
+     * not relax that guard without adding a readability test at this method's call site -
+     * the positional attribution loop in verifyMultipleAddresses() - or unreadable
+     * responses start being cached as passes again.
+     *
+     * Bounding and eviction mirror storeVerifyResult() exactly - unset-then-append so a
+     * refreshed entry does not cost an unrelated address its verdict, FIFO array_shift()
+     * under a $store !== [] guard so the loop terminates even if the limit is ever set to 0
+     * or below, and only the boolean verdict is serialised so no Phrase ever reaches the
+     * serializer.
+     *
+     * @param string $signature
+     * @param bool $valid Whether the address passed the quality index check.
+     * @return void
+     */
+    private function storeBatchVerifyResult(string $signature, bool $valid): void
+    {
+        if (!$valid) {
+            return;
+        }
+
+        $key = $this->buildBatchVerifyCacheKey($signature);
+        if ($key === '') {
+            return;
+        }
+
+        $store = $this->shopperSession->getData(self::BATCH_VERIFY_CACHE_SESSION_KEY);
+        if (!is_array($store)) {
+            $store = [];
+        }
+
+        // Drop any existing entry first, then re-insert at the end - see storeVerifyResult()
+        // for why this matters at the limit. The one path that reaches this with the key
+        // already present is the same address appearing twice in ONE batch: both copies miss
+        // the cache in the pre-flight pass, so both are billed and the second response row
+        // refreshes the entry the first one wrote. That double billing is tracked as
+        // LOQ-17015; de-duplicating it must not disturb the one-response-row-per-sent-item
+        // assumption the count guard in verifyMultipleAddresses() depends on - see the
+        // ACCEPTED LIMITS note on that method.
+        unset($store[$key]);
+
+        // Cache keys always contain '|' separators, so they are never numeric keys and
+        // array_shift() cannot renumber them.
+        while ($store !== [] && count($store) >= self::BATCH_VERIFY_CACHE_LIMIT) {
+            array_shift($store);
+        }
+
+        // 'valid' rather than 'error' keeps the payload shape distinct from the single-address
+        // cache's, which is the second guard against the two caches answering each other's
+        // lookups. The schema stamp is a different guard, against a session that outlives a
+        // deploy; see self::VERIFY_KEY_SCHEMA_VERSION for why this store needs it MORE than
+        // the other one.
+        $store[$key] = $this->serializer->serialize([
+            'valid' => true,
+            'schema' => self::VERIFY_KEY_SCHEMA_VERSION,
+        ]);
+        $this->shopperSession->setData(self::BATCH_VERIFY_CACHE_SESSION_KEY, $store);
+    }
+
+    /**
+     * Namespace a batch address signature into its session cache key.
+     *
+     * Same shape as buildVerifyCacheKey() - store view, threshold fingerprint, signature -
+     * for the same reasons, but over a DIFFERENT threshold: this path's verdicts come from
+     * the address quality index (checkQualityIndex()), so the fingerprint is taken over
+     * loqate_settings/address_settings/address_quality_index via
+     * resolveQualityIndexThreshold(), NOT over resolveComparerAvcString(). Hashing the AVC
+     * comparer here would namespace an AQI verdict by a threshold it was never judged
+     * against: tightening the AQI would not invalidate anything, and a live session would
+     * keep passing rows the merchant has just decided are too poor to accept.
+     *
+     * The store view segment is required for the same reason as over there: the threshold
+     * is read at SCOPE_STORE (Data::getConfigValue()) while one session can span store
+     * views (?___store=, a language switcher).
+     *
+     * Truncated to 12 hex characters, so it can never contain the '|' the signature parts
+     * are joined with and the session payload does not carry 64 characters per entry.
+     *
+     * @param string $signature
+     * @return string Empty when $signature is empty, keeping the '' sentinel intact.
+     */
+    private function buildBatchVerifyCacheKey(string $signature): string
+    {
+        if ($signature === '') {
+            return '';
+        }
+
+        // TYPE and text, because the threshold is compared raw: null, '' and 0 behave
+        // differently under <= in PHP 8 (see resolveQualityIndexThreshold()), so they must
+        // not share a fingerprint. Non-scalars contribute their type alone - a non-scalar
+        // threshold makes the comparison meaningless anyway, and (string) would throw.
+        $threshold = $this->resolveQualityIndexThreshold();
+        $thresholdSource = gettype($threshold) . ':' . (is_scalar($threshold) ? (string)$threshold : '');
+        $thresholdFingerprint = substr(hash('sha256', $thresholdSource), 0, 12);
+
+        return $this->helper->getCurrentStore() . '|' . $thresholdFingerprint . '|' . $signature;
+    }
+
+    /**
+     * Debug-log the outcome of one batch verdict cache lookup, so the drop in billable
+     * addresses on the admin/import path can be reconciled without waiting for the Loqate
+     * invoice: misses map one-to-one onto billed addresses.
+     *
+     * A sibling of logVerifyCacheOutcome() rather than a call to it, for one concrete
+     * reason: that method hashes buildVerifyCacheKey(), the AVC-namespaced key, which for
+     * an address on this path names a cache entry that does not exist - the log line would
+     * correlate with the wrong cache.
+     *
+     * The literal "family=strict" segment is a vestige of the single-address cache once
+     * having had two key shapes. There is one signature builder now, so it distinguishes
+     * nothing; it is left in place because this line's format is pinned by
+     * ValidatorBatchVerifyCacheTest and existing log tooling parses it.
+     *
+     * Same PII rule, which is absolute: NEVER log the address or the raw signature. A log
+     * file is not the customer session - it is readable by anyone with server access, it
+     * outlives the session and it is shipped to log aggregators. A truncated SHA-256 of the
+     * namespaced key correlates the hits and misses of one address with each other and with
+     * a request count, which is all the reconciliation needs. See logVerifyCacheOutcome()
+     * for how to turn DEBUG records on.
+     *
+     * @param string $outcome 'hit' or 'miss'.
+     * @param string $signature Signature the lookup was made with; never logged as-is.
+     * @return void
+     */
+    private function logBatchVerifyCacheOutcome(string $outcome, string $signature): void
+    {
+        $key = $this->buildBatchVerifyCacheKey($signature);
+
+        $this->logger->debug(sprintf(
+            'Loqate batch verify cache %s [family=strict, key=%s]',
+            $outcome,
             $key === '' ? 'unkeyed' : substr(hash('sha256', $key), 0, 12)
         ));
     }

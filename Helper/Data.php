@@ -81,4 +81,21 @@ class Data extends AbstractHelper
     {
         return $this->scopeConfig->getValue($configPath, ScopeInterface::SCOPE_STORE);
     }
+
+    /**
+     * Get config value as a NAMED store view resolves it.
+     *
+     * getConfigValue() reads SCOPE_STORE with no store, which resolves to whatever store is
+     * current - and in the admin area that is the default store, so a per-store-view override
+     * is invisible to it. Anything that has to reason about the configuration of stores OTHER
+     * than the current one has to name the store, which is what this is for.
+     *
+     * @param $configPath
+     * @param $storeId
+     * @return mixed
+     */
+    public function getConfigValueForStore($configPath, $storeId)
+    {
+        return $this->scopeConfig->getValue($configPath, ScopeInterface::SCOPE_STORE, $storeId);
+    }
 }
