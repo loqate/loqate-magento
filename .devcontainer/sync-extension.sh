@@ -41,11 +41,23 @@ echo "Syncing $EXTENSION_DIR -> $TARGET (real copy)"
 rm -rf "$TARGET"
 mkdir -p "$TARGET"
 # Mirror the module, excluding VCS / dev-container / nested composer + node deps.
+#
+# .claude is excluded because it can hold git WORKTREES (.claude/worktrees/<id>/), each a
+# full second copy of this module INCLUDING its own vendor/ with phpunit in it. --exclude=./vendor
+# is anchored at the top level and does not catch those. Copying them in breaks the build twice
+# over: setup:di:compile walks vendor/ and dies on phpunit's classes ("Class
+# SebastianBergmann\CodeUnit\CodeUnit not found"), and the whole-module source scans in
+# Test/Unit (ShopperScopedSessionStoresTest, ValidatorImportRunDedupeTest) count every call site
+# twice per worktree. Excluded rather than exclude=vendor globbed, so a worktree cannot
+# contribute source either.
 tar --exclude=.git \
     --exclude=.devcontainer \
     --exclude=./vendor \
     --exclude=node_modules \
     --exclude=.github \
+    --exclude=.claude \
+    --exclude=.phpunit.cache \
+    --exclude=.naas \
     -C "$EXTENSION_DIR" -cf - . | tar -C "$TARGET" -xf -
 
 cd "$MAGENTO_DIR"
@@ -54,7 +66,15 @@ composer dump-autoload >/dev/null 2>&1 || true
 
 case "$MODE" in
   none)  echo "Copied (no build). Run 'bin/magento setup:upgrade && setup:di:compile' as needed." ;;
-  full)  bin/magento setup:upgrade && bin/magento setup:di:compile && bin/magento cache:flush ;;
+  # One command per line, NOT an && chain. Under `set -e` a failure in any position of an
+  # `a && b && c` list except the last does NOT abort the script, so a failing setup:upgrade
+  # used to skip di:compile and cache:flush and then print "Done." - reporting success while
+  # leaving the copied source uncompiled and the old code still live.
+  full)
+    bin/magento setup:upgrade
+    bin/magento setup:di:compile
+    bin/magento cache:flush
+    ;;
   flush) bin/magento cache:flush ;;
 esac
 
