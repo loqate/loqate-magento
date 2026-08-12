@@ -8,6 +8,7 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\ShopperScopedAddressStores;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\App\RequestInterface;
@@ -70,7 +71,21 @@ use stdClass;
  *  - the ENROLMENT assertion: an attribute missing from the flush list is refused by both
  *    getData() and setData() rather than quietly reached through the guard without ever
  *    being flushed, see testAnUnenrolledAttributeIsRejectedByBothGetDataAndSetData() and
- *    its mirror testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData().
+ *    its mirror testEveryEnrolledAttributeIsAcceptedByBothGetDataAndSetData();
+ *  - a session storage EMPTIED mid-request, which is the one door the owner marker cannot
+ *    hold shut, because the wipe takes the marker with the stores it describes - the
+ *    destroy() inside Magento\Customer\Model\Session::logout() and
+ *    Magento\Framework\Session\SessionManager::clearStorage() both do it. Three tests, and
+ *    all three are needed. The verdicts of the run in progress must not cross the wipe into
+ *    the identity that follows it, see
+ *    testAVerdictSurvivesNeitherTheStorageWipeNorTheIdentityChangeThatFollowsIt(); the price
+ *    of that - one re-bill when the identity did NOT change - is asserted deliberately in
+ *    testEmptyingTheStorageUnderOneIdentityRebillsWhatThatRunHadRemembered() rather than
+ *    left to be met later as a "regression"; and, in the opposite direction, an unmarked
+ *    session must still be able to report an UNCHANGED epoch twice running, see
+ *    testConsecutiveLookupsOnAnUnmarkedSessionReportOneUnchangedOwnershipEpoch(), because
+ *    "unchanged" is the answer that licenses a caller to keep derived data and a guard that
+ *    can never give it re-bills every repeated row of every import.
  *
  * The end of the chain - that the two helpers really do reach those attributes only through
  * this class - is asserted behaviourally for all three stores
@@ -92,6 +107,9 @@ use stdClass;
  */
 class ShopperScopedAddressStoresTest extends TestCase
 {
+    /** The serializer double, shared with every other harness that reads a payload back. */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key lets both helpers build their API connectors. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -1151,6 +1169,322 @@ class ShopperScopedAddressStoresTest extends TestCase
     }
 
     /**
+     * The same identity change on the IMPORT shape of the call - verifyMultipleAddresses($batch,
+     * FALSE) - where NOTHING else in the request touches a shopper-scoped attribute first.
+     *
+     * NOT A DUPLICATE OF THE TEST ABOVE, and the difference is the whole point. That one passes
+     * $checkForCaptured at its default of true, so the captured-address read happens BEFORE any
+     * verdict is looked up, and that read runs the ownership check as a side effect. Every later
+     * lookup in the request therefore sees a generation taken AFTER the flush no matter how the
+     * generation is obtained - which means it cannot distinguish a guard that enforces ownership
+     * from one that merely reports a stale counter.
+     *
+     * Plugin\Admin\ValidateImportAddress::afterValidateData() passes FALSE. On that path the
+     * run-scoped verdict map is consulted before a single session attribute is read, so the
+     * ownership check has to happen INSIDE the generation lookup itself; if it does not, the
+     * first address of the request is answered out of the previous shopper's verdicts, and
+     * because a hit short-circuits before the session store is read, no attribute is touched and
+     * NO flush ever happens - the whole chunk is served from the old identity's memory.
+     *
+     * That is a licence to skip a billable verify being handed to a shopper who never earned it,
+     * which is precisely what ShopperScopedAddressStores exists to prevent, arriving through a
+     * store this class cannot see. Asserted here because the batch tests one layer up cannot see
+     * it either: the run map answers them identically either way.
+     */
+    public function testABatchVerdictDoesNotSurviveALoginOnTheImportPathThatReadsNoCapturedStore(): void
+    {
+        $shopper = $this->createShopper();
+        $batch = [0 => self::ADDRESS];
+
+        $first = $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            [0 => true],
+            $first,
+            'The address must pass on its own AQI first, or this test is measuring a rejection rather than a '
+            . 'remembered verdict.'
+        );
+        $this->assertSame(1, $this->apiCallCount($shopper), 'The first chunk must be billed.');
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            1,
+            $this->apiCallCount($shopper),
+            'A repeated address must be remembered for the shopper who earned it, or the flush asserted '
+            . 'below is indistinguishable from a memory that never answers.'
+        );
+
+        $shopper['identity']['customerId'] = 7;
+        $afterLogin = $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'On the import shape of the call NOTHING touches a shopper-scoped attribute before the verdict '
+            . 'is looked up, so the identity change must be detected by the lookup itself. A generation '
+            . 'reported without enforcing ownership hands the new identity the previous one\'s verdict, and '
+            . 'the hit short-circuits before any session attribute is read - so the stores are never '
+            . 'flushed either, and the entire chunk is answered from the old shopper\'s memory.'
+        );
+        $this->assertSame([0 => true], $afterLogin, 'The re-verified chunk stands on its own verdict.');
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'And the new shopper\'s own verdicts must then be remembered as usual: a guard that discarded '
+            . 'the map on every lookup would re-bill every repeated row of every import, which is the '
+            . 'saving LOQ-17148 exists to deliver.'
+        );
+    }
+
+    /**
+     * THE SAME HAND-OFF, arriving through the one door the owner marker cannot hold shut: a
+     * session storage EMPTIED between the two identities. A verdict earned by customer 7 must
+     * not be served to the guest that follows, even though the marker that would have proved
+     * the identity changed was erased in the same breath.
+     *
+     * WHY THIS IS REACHABLE, and not a thought experiment.
+     * Magento\Customer\Model\Session::logout() calls destroy(), whose default 'clear_storage'
+     * option is TRUE, so a logout empties EVERY attribute of the session storage - the three
+     * shopper-scoped stores and, sitting beside them, the ownership marker that names who they
+     * belonged to. Magento\Framework\Session\SessionManager::clearStorage() does the same for
+     * any other module that calls it. The next access therefore finds NO marker, which is the
+     * ADOPTION branch, not the flush branch: nothing is flushed, because the storage the flush
+     * would have cleared is already empty.
+     *
+     * WHY THAT IS NOT HARMLESS. It is harmless for the three SESSION stores - they went with
+     * the marker - but Validator::verifyMultipleAddresses() also remembers this run's batch
+     * verdicts in a plain map on the Validator INSTANCE, which the storage wipe does not
+     * touch. That map is a set of licences to skip a billable Cleansing call, so its lifetime
+     * has to be the ownership one; if the guard counts only FLUSHES, the wipe-then-change
+     * sequence moves no counter, the map is kept, and the guest is answered out of customer
+     * 7's verdicts. What that measures ON THE WIRE is one billable call where two are owed:
+     * one identity served a verdict another identity paid for, which is the hand-off
+     * LOQ-16978 exists to stop, reaching a store LOQ-16978's flush cannot see.
+     *
+     * WHY $checkForCaptured IS FALSE, and why the test is worthless without it. That is the
+     * import shape of the call (Plugin\Admin\ValidateImportAddress::afterValidateData() passes
+     * false), and on it NOTHING reads the captured-address store first. With the default true,
+     * that read runs the ownership check as a side effect and re-establishes ownership before
+     * a single verdict is looked up, so the run map is discarded for a reason that has nothing
+     * to do with what this test is about - and the assertion below would pass with the counter
+     * tied to flushes alone.
+     *
+     * THE FIRST TWO CALLS ARE THE PRECONDITION, not decoration: they prove the run map really
+     * does answer a repeat for the identity that earned it. Without that, "billed again after
+     * the wipe" is indistinguishable from a memory that never answers anything.
+     */
+    public function testAVerdictSurvivesNeitherTheStorageWipeNorTheIdentityChangeThatFollowsIt(): void
+    {
+        $shopper = $this->createShopper();
+        $batch = [0 => self::ADDRESS];
+
+        $shopper['identity']['customerId'] = 7;
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            1,
+            $this->apiCallCount($shopper),
+            'Customer 7 must pay once and have the repeat answered from this run\'s memory, or everything '
+            . 'asserted below is measuring a memory that never answers rather than one that stops answering '
+            . 'across an identity change.'
+        );
+
+        // The logout: destroy() empties the storage - stores AND owner marker - and the
+        // identity becomes the guest.
+        $this->emptyTheSessionStorage($shopper);
+        $shopper['identity']['customerId'] = null;
+
+        $afterTheWipe = $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'The guest left at the browser after the wipe must be BILLED for this address rather than handed '
+            . 'the verdict customer 7 paid for. The wipe erased the owner marker along with the stores, so '
+            . 'the next access is an ADOPTION and flushes nothing - which means a guard that opened a new '
+            . 'ownership epoch only on a FLUSH reports an unmoved epoch here, the run-scoped verdict map is '
+            . 'kept, and the identity that follows is served out of the identity that preceded it. That is '
+            . 'the hand-off LOQ-16978 exists to stop, arriving through a store its flush cannot reach.'
+        );
+        $this->assertSame(
+            [0 => true],
+            $afterTheWipe,
+            'The re-verified address stands on its own freshly earned verdict.'
+        );
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'And from there the guest\'s OWN repeats must be free again: the epoch moved once, when ownership '
+            . 'was re-established, and not on every lookup - or every repeated row of every import is '
+            . 're-billed and the saving LOQ-17148 delivers is gone.'
+        );
+    }
+
+    /**
+     * THE PRICE OF THE RULE ABOVE, asserted deliberately rather than left to be discovered as a
+     * "regression": emptying the session storage under an UNCHANGED identity costs that identity
+     * one re-bill of everything the run had remembered.
+     *
+     * This is the case where the wipe is NOT accompanied by an identity change - a module
+     * calling Magento\Framework\Session\SessionManager::clearStorage() mid-request, say - and
+     * the run map is discarded anyway, because the marker that PROVED ownership was continuous
+     * went with it. The licence to skip a billable Cleansing call is only valid while ownership
+     * is demonstrably unbroken; after a wipe the guard cannot tell this from the logout in the
+     * test above, and the two are indistinguishable from inside the class by construction, so
+     * paying is the only safe reading. Correctness is not affected in either direction: the row
+     * is asked about again and answered on its own merits.
+     *
+     * PINNED SO IT CANNOT BE "FIXED" QUIETLY. The obvious way to make this one call cheaper is
+     * to stop opening a new epoch on adoption - and that is exactly the defect the test above
+     * exists to catch, so the two must be read together. The same price is already paid by the
+     * three session stores the wipe emptied; this only says the derived map pays it too.
+     */
+    public function testEmptyingTheStorageUnderOneIdentityRebillsWhatThatRunHadRemembered(): void
+    {
+        $shopper = $this->createShopper();
+        $batch = [0 => self::ADDRESS];
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            1,
+            $this->apiCallCount($shopper),
+            'The repeat must be free while the storage is intact, or the extra call asserted below is not '
+            . 'the price of the wipe but the price of a memory that never worked.'
+        );
+
+        // No login, no logout: the same shopper throughout, with the storage emptied under them.
+        $this->emptyTheSessionStorage($shopper);
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'ACCEPTED COST, asserted so it cannot change unnoticed: a storage wipe re-bills the run\'s '
+            . 'remembered verdicts even when the identity did not change. The wipe erased the ownership '
+            . 'marker, so the guard can no longer show the stores have belonged to one identity throughout - '
+            . 'and a licence to skip a BILLABLE call is only valid while it can. Making this call free again '
+            . 'means not opening an epoch on adoption, which is precisely what lets a wipe followed by a '
+            . 'logout hand one identity\'s verdicts to the next: read this test with '
+            . 'testAVerdictSurvivesNeitherTheStorageWipeNorTheIdentityChangeThatFollowsIt().'
+        );
+
+        $shopper['validator']->verifyMultipleAddresses($batch, false);
+
+        $this->assertSame(
+            2,
+            $this->apiCallCount($shopper),
+            'And the cost is ONE re-bill, not a permanent one: ownership is re-established by the access '
+            . 'that noticed, so the run remembers again from there.'
+        );
+    }
+
+    /**
+     * The structural half of the epoch contract, and the one the billing tests above cannot
+     * see: with NO marker recorded and NO identity change, two consecutive lookups must report
+     * the SAME epoch.
+     *
+     * WHY THIS NEEDS ITS OWN TEST. "Open a new epoch on adoption" is satisfiable by simply
+     * bumping the counter whenever no marker is found - without RECORDING the identity that
+     * adopted. Every wipe test above still passes: the epoch moves after the wipe, so the run
+     * map is discarded and the address is billed. What such an implementation loses is the
+     * ability to ever say "unchanged" on a session that started life unmarked, because every
+     * subsequent lookup finds no marker and opens yet another epoch - so every derived memory
+     * is thrown away on every access, and every repeated row of every import is re-billed.
+     * That is the LOQ-17148 saving itself, and it is invisible to a test that only asks whether
+     * data is over-shared.
+     *
+     * ADOPTION MUST THEREFORE END OWNERSHIP BEING OPEN: the epoch is stable exactly because the
+     * adopting identity is written to the marker, which is what the second assertion pins.
+     * "Unchanged" is the strong statement in this contract - it is the answer that licenses a
+     * caller to KEEP derived data - so an implementation that can never make it is not a
+     * conservative one, it is one that has no contract left.
+     *
+     * The guest case is not academic: on the adminhtml import path, the only path that reads
+     * this epoch in anger, the customer session carries no customer id at all.
+     *
+     * @param int|string|null $customerId Identity at the browser for the whole test.
+     */
+    #[DataProvider('unmarkedSessionIdentityProvider')]
+    public function testConsecutiveLookupsOnAnUnmarkedSessionReportOneUnchangedOwnershipEpoch(
+        $customerId,
+        int $expectedOwner
+    ): void {
+        $harness = $this->createGuard($this->seededStores(), $customerId);
+
+        $first = $harness['guard']->ownershipGeneration();
+        $second = $harness['guard']->ownershipGeneration();
+
+        $this->assertSame(
+            $first,
+            $second,
+            'Two lookups in a row, with nothing whatever happening in between, must report the same '
+            . 'ownership epoch. A guard that opens a new epoch on every unmarked lookup can never report '
+            . '"unchanged", so every holder of derived data discards it on every access - which re-bills '
+            . 'every repeated row of every import while every over-sharing test in this file stays green.'
+        );
+        $this->assertSame(
+            $expectedOwner,
+            $harness['session'][$this->ownerKey()] ?? null,
+            'The adopting identity must be RECORDED, which is what makes the epoch above stable: an adoption '
+            . 'that opens an epoch without writing the marker leaves the session unmarked forever, so the '
+            . 'next lookup adopts all over again.'
+        );
+
+        $harness['guard']->getData(self::VERIFY_CACHE_SESSION_KEY);
+
+        $this->assertSame(
+            $first,
+            $harness['guard']->ownershipGeneration(),
+            'Reaching a store in between must not move the epoch either: for one identity with the marker '
+            . 'in place, every access is the same epoch, whichever method it arrives through.'
+        );
+    }
+
+    /**
+     * Both identities a session with no owner marker can be adopted by.
+     *
+     * @return array<string, array{0: int|string|null, 1: int}>
+     */
+    public static function unmarkedSessionIdentityProvider(): array
+    {
+        return [
+            // The adminhtml/import case: no customer id for the whole of the session.
+            'a guest' => [null, 0],
+            'a logged-in customer' => [7, 7],
+        ];
+    }
+
+    /**
+     * Empty the session storage the way Magento does, in place and behind the guard's back.
+     *
+     * Magento\Framework\Session\SessionManager::clearStorage() and the destroy() inside
+     * Magento\Customer\Model\Session::logout() (whose 'clear_storage' option defaults to true)
+     * both remove EVERY attribute, so the ownership marker goes with the stores it describes -
+     * which is the whole point of the tests that call this. Removing the keys rather than
+     * nulling them matters: a null marker is what the guard reads as "never marked", and
+     * writing one would model the wipe by hand instead of reproducing it.
+     *
+     * @param array $shopper Harness from createShopper().
+     */
+    private function emptyTheSessionStorage(array $shopper): void
+    {
+        foreach (array_keys($shopper['session']->getArrayCopy()) as $key) {
+            unset($shopper['session'][$key]);
+        }
+    }
+
+    /**
      * THE ACCEPTED LIMIT, pinned as documented behaviour rather than left implicit: on the
      * only path that writes the batch cache in production, the flush is a NO-OP.
      *
@@ -1430,9 +1764,11 @@ class ShopperScopedAddressStoresTest extends TestCase
         );
         $helper->method('getCurrentStore')->willReturn(0);
 
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(static fn ($value) => json_decode($value, true));
+        // Fails the way the PRODUCTION serializer fails - see the trait. It matters here because
+        // the flush this class exists to perform writes null over the three stores, and null is
+        // one of the values the production serializer REJECTS outright rather than decoding: a
+        // lenient double would let a reader that lost its guard look safe.
+        $serializer = $this->createSerializerDouble();
 
         $validator = new Validator(
             $this->createMock(Logger::class),

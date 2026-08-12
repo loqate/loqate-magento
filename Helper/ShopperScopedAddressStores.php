@@ -55,20 +55,26 @@ use Magento\Customer\Model\Session;
  * unchanged, so the four test files that pin these names as literals keep passing and no
  * live session loses its stores at deploy time.
  *
- * ADOPTION, stated so it is not mistaken for a hole. When NOTHING has been recorded yet,
- * the current identity ADOPTS whatever is in the stores instead of flushing it. That case
- * is reachable only for data written BEFORE this class existed, because from now on the
- * marker is written on the first access of a session, long before anything can be stored.
- * Adopted data was, by definition, written in THIS session - though not necessarily by
- * whoever is at the browser NOW: a session that was already live at deploy time, in which
- * shopper A logged out before the module's first post-release access, lands in the
- * adoption branch and hands A's stores to the guest that follows. That is accepted rather
- * than defended against, on three grounds: it is exactly the pre-change behaviour, so it
- * is not a regression this ticket introduces; it is bounded to one release and to sessions
- * that were mid-flight during it; and it closes the moment ANY identity change is observed
- * after the marker is written. The alternative - flushing on first access - would buy
- * nothing for every session started after the deploy and would throw away every live
- * shopper's capture bypass at deploy time.
+ * ADOPTION, stated so it is not mistaken for a hole - and so its reach is not understated,
+ * which an earlier revision of this paragraph did (LOQ-17148 mutation review). When NOTHING
+ * has been recorded yet, the current identity ADOPTS whatever is in the SESSION stores
+ * instead of flushing them. Two things reach that branch, not one:
+ *  - data written BEFORE this class existed. A session that was already live at deploy time,
+ *    in which shopper A logged out before the module's first post-release access, hands A's
+ *    stores to the guest that follows. Accepted rather than defended against, on three
+ *    grounds: it is exactly the pre-change behaviour, so it is not a regression this ticket
+ *    introduces; it is bounded to one release and to sessions mid-flight during it; and it
+ *    closes the moment ANY identity change is observed after the marker is written. The
+ *    alternative - flushing on first access - would buy nothing for any session started
+ *    after the deploy and would throw away every live shopper's capture bypass at deploy
+ *    time;
+ *  - a session storage that is EMPTIED mid-flight, which erases the marker along with the
+ *    stores it describes (Magento\Framework\Session\SessionManager::clearStorage(), the
+ *    destroy() inside Magento\Customer\Model\Session::logout(), or another module). That is
+ *    not bounded to a release: it is reachable at any time and the identity may have changed
+ *    in the same breath. Harmless for the three SESSION stores, which were emptied too, but
+ *    NOT for data DERIVED from them and held elsewhere - which is why adoption opens a new
+ *    ownership epoch; see enforceOwnership() and ownershipGeneration().
  *
  * ACCEPTED LIMITS, stated (the style of Validator::verifyMultipleAddresses()):
  *  - THE GUARD SCOPES BY CUSTOMER IDENTITY ONLY. The marker tracks
@@ -106,6 +112,16 @@ use Magento\Customer\Model\Session;
  * an attribute through this class does NOT enrol it in the flush; only that list does, and
  * getData()/setData() now REJECT any key missing from it so that an un-enrolled attribute
  * cannot quietly acquire the guard's appearance without its protection.
+ *
+ * ADDING A STORE THAT IS NOT A SESSION ATTRIBUTE: use ownershipGeneration() (LOQ-17148).
+ * Verdict data does not have to live in the session to belong to one shopper -
+ * Validator::verifyMultipleAddresses() now also remembers batch verdicts in a PLAIN PHP MAP
+ * on the Validator instance, for the length of one import run - and a store this class
+ * cannot flush is a store that survives the flush, which re-opens exactly the hand-off the
+ * class exists to close. Such a store is enrolled by asking ownershipGeneration() before it
+ * is read or written and discarding its own contents when the answer has moved on: one
+ * ownership model, two mechanisms, rather than a second identity check written at a call
+ * site where it would rot independently of this one.
  *
  * THE MODULE HAS OTHER SESSION ATTRIBUTES, and they are NOT enrolled here - named so the
  * next reader does not conclude there are only three. Out of scope for LOQ-16978, which is
@@ -204,6 +220,26 @@ class ShopperScopedAddressStores
     private $session;
 
     /**
+     * How many OWNERSHIP EPOCHS this instance has seen: the number of times ownership of the
+     * stores has been established or re-established since it was constructed.
+     *
+     * NOT A FLUSH COUNT, and the distinction is the whole point (LOQ-17148 mutation review):
+     * enforceOwnership() advances it whenever it WRITES the owner marker - on a flush, and
+     * equally on an ADOPTION, where the marker was absent and nothing was flushed. The contract
+     * a reader depends on is stated on ownershipGeneration(); the mechanism, and why adoption
+     * has to count, at the increment in enforceOwnership().
+     *
+     * A COUNTER RATHER THAN A BOOLEAN OR AN OWNER ID: a reader has to tell "same epoch as when
+     * I last looked" from "two epochs have passed", a flag cleared by its reader would be wrong
+     * as soon as there were two readers, and an A -> B -> A cycle within one request returns to
+     * the same owner id while the stores were genuinely flushed in between.
+     *
+     * Not persisted anywhere, deliberately. It describes THIS request's view of the stores,
+     * which is the only lifetime the derived data it protects has.
+     */
+    private int $ownershipGeneration = 0;
+
+    /**
      * @param Session $session The per-shopper customer session the stores live in.
      */
     public function __construct(Session $session)
@@ -247,6 +283,55 @@ class ShopperScopedAddressStores
         $this->enforceOwnership();
 
         $this->session->setData($key, $value);
+    }
+
+    /**
+     * Enforce ownership NOW and report which OWNERSHIP EPOCH the caller is looking at, so data
+     * DERIVED from these stores - held anywhere, not only in the session - can be discarded
+     * the moment the stores stop demonstrably belonging to the identity that earned it
+     * (LOQ-17148).
+     *
+     * WHAT THE NUMBER MEANS, stated first because it is the contract: it counts how many times
+     * ownership has been ESTABLISHED, not how many flushes have happened. enforceOwnership()
+     * advances it whenever it writes the owner marker - on an identity change, and equally on
+     * an adoption, where no marker was recorded and so nothing was flushed. "Unchanged" is
+     * therefore the strong statement (the stores have demonstrably belonged to one identity
+     * throughout), and that is the direction that must be strong, because it is the answer
+     * that licenses a caller to KEEP derived data.
+     *
+     * WHAT PROBLEM THIS SOLVES. Validator::verifyMultipleAddresses() remembers batch verdicts
+     * for one import run in a plain map on the Validator instance, and that map holds the same
+     * kind of data as self::BATCH_VERIFY_CACHE_SESSION_KEY - licences to skip a billable verify
+     * - so it must have the same OWNERSHIP lifetime, which a plain request-scoped map does not
+     * give it. See Validator::$runScopedBatchVerdicts and
+     * Validator::discardRunScopedVerdictsIfShopperChanged() for that side of it.
+     *
+     * WHY A GENERATION RATHER THAN A CALLBACK OR A FLUSH LIST. This class holds no reference to
+     * its holders and must not start holding one: it is constructed inside Controller's and
+     * Validator's constructors, so reaching back into them would invert that dependency and make
+     * the flush order matter. A counter inverts the responsibility instead - the guard states a
+     * fact, each holder decides what its own derived data means when that fact changes - and it
+     * composes, since no reader can consume the signal from under another.
+     *
+     * ENFORCES OWNERSHIP ITSELF, and that is the load-bearing half. A caller that consulted its
+     * own map BEFORE touching any session attribute - exactly what the run map does on the import
+     * path, where the captured-address read is skipped - would otherwise read a generation from
+     * before the flush and serve a stale verdict on the first address of the request.
+     *
+     * NO KEY, AND THEREFORE NO assertEnrolled() CALL: there is no attribute to enrol, this
+     * reports on the whole flush unit named by self::SHOPPER_SCOPED_SESSION_KEYS.
+     *
+     * @return int The ownership epoch as of this call. Compare it against the value seen last
+     *             time; ANY difference means ownership was re-established in between - by a
+     *             flush or by an adoption - and anything derived from these stores must be
+     *             discarded. A caller with nothing recorded yet must treat that as a
+     *             difference too, which it gets for free by starting from null.
+     */
+    public function ownershipGeneration(): int
+    {
+        $this->enforceOwnership();
+
+        return $this->ownershipGeneration;
     }
 
     /**
@@ -306,12 +391,20 @@ class ShopperScopedAddressStores
 
     /**
      * Flush every shopper-scoped store if the logged-in identity is not the one they were
-     * written for, then record the current identity as their owner.
+     * written for, then record the current identity as their owner and open a new OWNERSHIP
+     * EPOCH.
      *
      * Costs TWO session reads on the hot path - the ownership marker here, and the
      * customer id inside resolveOwnerId() - and, when the marker matches, no writes at
      * all. That is cheap enough to run on EVERY access rather than once per request, which
      * is what makes it impossible to reach a store through a path that skipped the check.
+     *
+     * THREE OUTCOMES, and only the first is free. The marker matches, so nothing happens at
+     * all. The marker disagrees, so the stores are flushed. Or the marker is ABSENT, so there
+     * is nothing to flush and the current identity ADOPTS whatever is there. The last two both
+     * (re)establish ownership and both therefore advance self::$ownershipGeneration; see the
+     * comment on the increment below for why adoption has to count, and the class docblock's
+     * ADOPTION paragraph for what adoption means for the session stores themselves.
      *
      * NOTE THAT THIS WRITES ON A READ PATH: getData() reaches here, and a first access or
      * an identity change makes it store the owner marker (and possibly three nulls). That
@@ -350,6 +443,22 @@ class ShopperScopedAddressStores
                 $this->session->setData($key, null);
             }
         }
+
+        // A NEW OWNERSHIP EPOCH, counted for the flush branch above AND for the adoption that
+        // falls straight through to here, because both end with ownership being (re)established
+        // by a write of the marker. Counting only the flush was a defect (LOQ-17148 mutation
+        // review): anything that EMPTIES the session storage mid-request - clearStorage(), the
+        // destroy() inside Magento\Customer\Model\Session::logout(), another module - erases the
+        // marker along with the stores, so the next access is an ADOPTION rather than a flush,
+        // and a holder of derived data (see ownershipGeneration()) would read an unmoved
+        // generation and go on serving the PREVIOUS identity's verdicts to the one that follows.
+        // Measured on the batch path as one billable call where two are owed.
+        //
+        // AND IT COSTS NOTHING IT SHOULD NOT: a holder that has recorded no generation yet resets
+        // regardless of this counter, and what it holds then is empty. The only case that pays is
+        // a storage wipe under an UNCHANGED identity, which re-earns some verdicts of the run in
+        // progress - billing, not correctness, and the price the wiped stores already pay.
+        $this->ownershipGeneration++;
 
         $this->session->setData(self::SESSION_OWNER_KEY, $owner);
     }

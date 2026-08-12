@@ -6,14 +6,15 @@ use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\Module\ModuleListInterface;
-use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
+use ReflectionMethod;
 use ReflectionProperty;
 
 /**
@@ -28,9 +29,9 @@ use ReflectionProperty;
  * values were all truthy, so the search always returned false, which coerces to the array
  * key 0: every response row overwrote $result[0], the captured addresses' own verdicts were
  * never merged in at all, and a mixed batch came back as a single entry. That matters to
- * two callers - Plugin\Admin\OrderSave.php:51-57 reports the key to the admin
+ * two callers - Plugin\Admin\OrderSave::aroundExecute() reports the key to the admin
  * ("The provided address is invalid: #billing_address"), and
- * Plugin\Admin\ValidateImportAddress.php:94 array_merge()s the per-chunk arrays and derives
+ * Plugin\Admin\ValidateImportAddress::afterValidateData() array_merge()s the per-chunk arrays and derives
  * the import row number from the merged $index + 1. The ORDER half is what the import
  * depends on: array_merge() renumbers integer keys BY INSERTION ORDER, not by key value, so
  * a chunk returned as [1, 3, 0, 2, 4] - precisely what filling cache hits during the first
@@ -50,7 +51,37 @@ use ReflectionProperty;
  *    quality index (checkQualityIndex()) and the other cache's from the AVC thresholds - one
  *    must never answer the other's lookup, see
  *    testTheTwoVerdictCachesAreInvisibleToEachOtherInBothDirections();
- *  - only PASSING verdicts are stored, see testAFailingVerdictIsNeverCached().
+ *  - only PASSING verdicts are stored IN THE SESSION, see
+ *    testAFailingVerdictIsNeverWrittenToTheSessionVerdictStore(), whose paired opposite -
+ *    testAFailingVerdictIsRememberedForTheRestOfTheRunRatherThanRebilled() - pins that a
+ *    readable rejection IS remembered for the length of one run.
+ *
+ * TWO MEMORIES ANSWER THIS PATH SINCE LOQ-17148, and every test in this file that measures a
+ * SESSION-store property has to be read with that in mind. Validator keeps a RUN-scoped verdict
+ * map on the instance, holding BOTH polarities and bounded by nothing but the file being
+ * imported, because a customer import chunks at 100 rows and verifies every chunk inside ONE PHP
+ * request. It is consulted before the session store and answers first. So a second
+ * verifyMultipleAddresses() call on the SAME Validator can no longer see what the session store
+ * did: it measures the run map. Anything about the session store - eviction, the key-scheme
+ * stamp, the stored shape, a corrupted payload, what is and is not written - is therefore
+ * asserted either by READING THE STORE DIRECTLY, or across a SECOND REQUEST built with
+ * createShopper($this->sessionStore), which is a fresh Validator over the same session double
+ * and is exactly what an admin re-submitting an order or re-running an import gets. Do not
+ * "simplify" those second requests back onto $this->validator: it makes the test measure the
+ * other memory and every one of them would still be green.
+ *
+ * WHICH REPLAY HALVES ARE NOW ANSWERED BY THE RUN MAP, listed so the next reader does not
+ * mistake them for session-store evidence. These five replay on $this->validator, so their
+ * second lookup is answered by the run-scoped map and not by the session store:
+ * testOnlyTheAddressesNotAlreadyVerifiedAreSentToTheApi(),
+ * testADuplicatedAddressInOneBatchIsAnsweredUnderBothKeys(),
+ * testAnUnverifiedCountyVariantIsNeverServedACachedBatchPass(),
+ * testChangingOnlyTheCountyCostsASecondBillableAddress() and
+ * testALegitimateQualityIndexStillPassesAndIsStillCached(). Every invariant they state still
+ * holds and is still worth holding - what the key does and does not conflate, what is billed,
+ * what is answered under which input key - because each of those is a property of the KEY or of
+ * the billing, which both memories share. What they are NOT is evidence about the session
+ * store's contents; where a test needs that, it reads the store or builds a second request.
  *
  * THE KEY ITSELF IS THE SAME RULE AS THE SINGLE-ADDRESS ONE: an address shares a verdict
  * with another submission only when the two ask Loqate about the same address, the
@@ -67,7 +98,7 @@ use ReflectionProperty;
  *
  * POSITIONAL ATTRIBUTION is the precondition both tickets rest on, and it is the third thing
  * pinned here, because the connector makes it unverifiable per row:
- * Verify::verifyAddress() (vendor/lqt/api-connector/src/Client/Verify.php:50-52) ends in
+ * Verify::verifyAddress(), in the api-connector package, ends in
  * array_column($response, 'Matches'), which SILENTLY DROPS every record with no 'Matches' key
  * and REINDEXES the survivors into a clean 0..N-1 list. A three-address batch whose middle
  * record came back as an error envelope therefore arrives as a TWO-element list in which
@@ -83,8 +114,8 @@ use ReflectionProperty;
  *    partly reported, see testATruncatedResponseIsRejectedRatherThanReportingTheRowsItHolds().
  *
  * READABLE VERDICTS is the fourth property pinned here, on the AQI side of the same method.
- * checkQualityIndex() (Helper/Validator.php:841-843) FAILS CLOSED on an AQI it cannot read,
- * mirroring verifyAddress()'s AVC guard (Helper/Validator.php:377). Under PHP 8's <= rules null,
+ * checkQualityIndex() FAILS CLOSED on an AQI it cannot read, mirroring the unreadable-AVC guard
+ * in verifyAddress(). Under PHP 8's <= rules null,
  * '', false and 0 all compare as BETTER than any letter threshold, so an unreadable AQI used to
  * be answered VALID - including Loqate's own "no match for this address" ("Matches":[]), which
  * the row-count guard above cannot see, because array_column() preserves the row count for it.
@@ -103,6 +134,15 @@ use ReflectionProperty;
  */
 class ValidatorBatchVerifyCacheTest extends TestCase
 {
+    /**
+     * The serializer double, shared with every other harness that reads a serialised payload
+     * back. What it buys THIS class: the production serializer's \InvalidArgumentException is
+     * what makes testAnUnreadableBatchCacheDegradesToOneExtraBilledAddress() and
+     * testRefreshingAnEntryWhileTheCacheIsFullEvictsNoUnrelatedVerdict() - both of which plant
+     * an undecodable payload and claim the read must "not throw" - claims that can be false.
+     */
+    use ProductionSerializerDouble;
+
     /** Any non-empty key makes the batch path reach the billable call. */
     private const API_KEY = 'TEST-API-KEY-0000';
 
@@ -325,9 +365,18 @@ class ValidatorBatchVerifyCacheTest extends TestCase
                     return self::API_KEY;
                 }
 
-                // Anything not explicitly configured reads as empty, which is what the
-                // admin form leaves behind for an untouched field.
-                return $configStore[$configPath] ?? '';
+                // offsetExists(), NOT '??'. A '??' reader cannot deliver a CONFIGURED null: it
+                // sees the null and substitutes '', so the "an unset threshold" case of
+                // unreadableThresholdProvider() silently became the "a blank threshold" case -
+                // two data sets running one fixture, while the justification on each described
+                // a comparison the test never performed. null and '' are genuinely different
+                // inputs here (buildBatchVerifyCacheKey() fingerprints gettype(), and
+                // 'A' <= null and 'A' <= '' are different comparisons), so the harness must be
+                // able to express both. Mirrors ValidatorImportRunDedupeTest::createRequest().
+                //
+                // A path the store does not hold still reads as '', which is what an untouched
+                // admin field leaves behind.
+                return $configStore->offsetExists($configPath) ? $configStore[$configPath] : '';
             }
         );
         // Verdicts are namespaced per STORE VIEW, because the AQI threshold behind them is
@@ -337,13 +386,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         // the wrong reason.
         $helper->method('getCurrentStore')->willReturn($storeId);
 
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(
-            static fn ($value) => json_encode($value)
-        );
-        $serializer->method('unserialize')->willReturnCallback(
-            static fn ($value) => json_decode($value, true)
-        );
+        $serializer = $this->createSerializerDouble();
 
         $validator = new Validator(
             $logger,
@@ -462,11 +505,21 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     /**
      * The half of the mapping that is easiest to lose silently: a FAILING verdict.
      *
-     * false is what every caller acts on, and the result array is filtered on the way out
-     * (rows Loqate did not answer are dropped), so a filter written as array_filter($result)
-     * would discard exactly the verdicts that matter and report a batch of invalid addresses
-     * as entirely clean. Asserted with the failure in the LAST position of a mixed batch,
-     * which is where the pre-fix single-slot bug hid it.
+     * false is what every caller acts on, and every verdict array leaves
+     * verifyMultipleAddresses() through one terminal pass over the whole result - so a pass
+     * written as array_filter($result) would discard exactly the verdicts that matter and
+     * report a batch of invalid addresses as entirely clean. Asserted with the failure in the
+     * LAST position of a mixed batch, which is where the pre-fix single-slot bug hid it.
+     *
+     * THE FILTER THIS TEST IS NAMED AFTER NO LONGER EXISTS, and the correction matters to
+     * anyone reading the name. That terminal pass used to be array_filter($result, fn ($v) =>
+     * $v !== null), which DROPPED rows Loqate did not answer; it is now sealBatchVerdicts(),
+     * which keeps every slot and coerces it with '=== true', so an unanswered row reports
+     * INVALID instead of vanishing. The name is kept because the guarantee it pins - a false
+     * survives the terminal pass under its own key - is unchanged and is the one that matters
+     * to Plugin\Admin\OrderSave. What CHANGED is the direction the terminal pass fails in, and
+     * that is pinned separately by
+     * testAnUnfilledVerdictSlotSurvivesTheTerminalSealAsFalseRatherThanBeingDropped().
      */
     public function testAFailingVerdictSurvivesTheResultFilterUnderItsOwnKey(): void
     {
@@ -490,6 +543,162 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             $result,
             'The failing address must keep its own key, or the admin is told the wrong address is invalid.'
         );
+    }
+
+    /**
+     * THE TERMINAL SEAL FAILS CLOSED: a slot nobody filled leaves verifyMultipleAddresses() as
+     * the key it came in under, carrying false - it is NOT dropped.
+     *
+     * WHY THE DIRECTION IS LOAD-BEARING, and it is the whole of this test. The terminal pass
+     * used to be array_filter($result, fn ($v) => $v !== null), justified on the grounds that a
+     * dropped slot degrades to a MISSING KEY "which callers already read as nothing to report".
+     * That is true of Plugin\Admin\ValidateImportAddress::afterValidateData(), which reports
+     * only the keys it receives. It is the exact opposite of true for
+     * Plugin\Admin\OrderSave::aroundExecute(), whose loop raises its error only for keys that
+     * are PRESENT: a dropped 'billing_address' puts that address on the order UNVERIFIED and
+     * SILENTLY, which is the one outcome the whole verification exists to prevent. Coercing
+     * keeps the slot and reports INVALID, so the two callers fail the same way and both fail
+     * safe.
+     *
+     * ASSERTED THROUGH THE PRIVATE METHOD, deliberately, and this is the one place in this file
+     * that does so. No input can produce an unfilled slot today - every reserved slot is
+     * captured, decided by the pre-flight threshold guard, answered from a memory, or sent and
+     * therefore answered - which is precisely why the guarantee needs pinning HERE: it exists to
+     * contain the edit that changes that, so there is no behavioural route to it until the day
+     * the bug it guards against is written, at which point a test that could only reach it
+     * behaviourally would already be too late. The routing half - that both of the method's
+     * exits really do go through this seal - has no behavioural signature either, for the two
+     * reasons set out on testBothVerdictExitsReturnThroughTheTerminalSeal(), which is where it
+     * is pinned.
+     */
+    public function testAnUnfilledVerdictSlotSurvivesTheTerminalSealAsFalseRatherThanBeingDropped(): void
+    {
+        $seal = new ReflectionMethod(Validator::class, 'sealBatchVerdicts');
+        $seal->setAccessible(true);
+
+        // OrderSave's own key shape, with the unfilled slot between two answered ones so a drop
+        // is visible as a lost key AND as a re-ordering.
+        $sealed = $seal->invoke($this->validator, [
+            'shipping_address' => true,
+            'billing_address' => null,
+            2 => false,
+        ]);
+
+        $this->assertSame(
+            ['shipping_address', 'billing_address', 2],
+            array_keys($sealed),
+            'EVERY key must survive the terminal pass, in order. Plugin\Admin\OrderSave::aroundExecute() '
+            . 'raises its error only for keys that are PRESENT, so a dropped key is an address accepted '
+            . 'onto an order with no verification and no message; and '
+            . 'Plugin\Admin\ValidateImportAddress::afterValidateData() array_merge()s the per-chunk '
+            . 'results, which renumbers by INSERTION order, so a dropped key shifts every import row '
+            . 'number after it.'
+        );
+        $this->assertSame(
+            ['shipping_address' => true, 'billing_address' => false, 2 => false],
+            $sealed,
+            'An unfilled slot must report INVALID. This is the fail-closed correction of the '
+            . 'array_filter() that used to sit here: filtering answered "nothing to report" for a row '
+            . 'nobody had judged, which is the fail-OPEN direction on the admin order path.'
+        );
+    }
+
+    /**
+     * ...and BOTH exits of verifyMultipleAddresses() must go through that seal, so one future
+     * edit cannot produce two different behaviours depending on cache state.
+     *
+     * The all-hit exit used to return $result RAW while the post-response exit was coerced, so
+     * whatever guarantee the terminal pass made - dropping unfilled slots then, coercing them
+     * now - simply did not apply to a batch that happened to be fully cached, and which
+     * behaviour a batch got depended on nothing more than whether its addresses had been asked
+     * about before.
+     *
+     * THIS IS THE ONE TEST IN THE SUITE THAT READS PRODUCTION SOURCE, and the justification has
+     * to be exact, because the technique is otherwise a bad one. THERE IS NO BEHAVIOURAL ROUTE
+     * TO THIS PROPERTY. Two independent facts close every one of them, and both were established
+     * by execution rather than by reading:
+     *
+     *  - NO SLOT CAN BE UNFILLED. Every branch of the pre-flight loop either fills its slot
+     *    (captured, threshold-refused, answered from a memory) or appends to $requestArray, and
+     *    a request is issued unless $requestArray is empty; a response of a different length
+     *    returns false before the attribution loop. So sealing or not sealing makes no
+     *    difference to any reachable input.
+     *  - NO NON-BOOLEAN CAN REACH A SLOT EITHER, which is what defeats the obvious trick of
+     *    writing a non-boolean into the run map by reflection and watching whether it survives.
+     *    It cannot: getRunScopedBatchVerdict() and getCachedBatchVerifyResult() are both
+     *    declared ': ?bool', this file is not under strict_types, and PHP therefore coerces the
+     *    return on the way out - an injected int 1 arrives at the call site as true. That was
+     *    tried, it produced a test that passed identically with the seal removed, and it is
+     *    recorded here so it is not tried again.
+     *
+     * So the guarantee is a CONTAINMENT one with no observable signature, and the code is the
+     * only artefact that can carry it. Asserted on the method's own tokens with comments
+     * stripped, so the prose about the old raw return in the production comments cannot satisfy
+     * or break it.
+     *
+     * IF THIS FAILS BECAUSE YOU ADDED AN EXIT: seal it. The count is asserted, not merely the
+     * absence of a raw return, so a new exit has to be looked at rather than absorbed.
+     */
+    public function testBothVerdictExitsReturnThroughTheTerminalSeal(): void
+    {
+        $code = self::verifyMultipleAddressesCode();
+
+        $this->assertSame(
+            0,
+            preg_match_all('/\breturn\s+\$result\s*;/', $code),
+            'verifyMultipleAddresses() must not return its verdict array RAW from any exit. The all-hit '
+            . 'exit did exactly that while the post-response exit was coerced, so the terminal guarantee '
+            . 'held on one exit and not the other and one edit would have produced two different wrong '
+            . 'behaviours depending on cache state. See this test\'s docblock for why the property has no '
+            . 'behavioural signature and is asserted on the source.'
+        );
+        $this->assertSame(
+            2,
+            preg_match_all('/\breturn\s+\$this->sealBatchVerdicts\(\$result\)\s*;/', $code),
+            'verifyMultipleAddresses() must have exactly TWO verdict-array exits and both must be sealed: '
+            . 'the all-hit short-circuit (every address captured, refused by the pre-flight threshold guard '
+            . 'or answered from a memory) and the post-response one. A third would be a new way for a '
+            . 'result array to leave this method, and it needs the same fail-closed pass rather than this '
+            . 'assertion being raised to 3 to make the suite green.'
+        );
+    }
+
+    /**
+     * The source of Validator::verifyMultipleAddresses(), comments stripped.
+     *
+     * Comments MUST go: the production comments beside both exits discuss the raw return that
+     * used to be there, so a check run over the raw text would match the prose describing the
+     * defect instead of the code, and would keep matching after the defect was fixed. Tokenising
+     * is what makes the assertion about code; the whitespace is left as it is, and the patterns
+     * above allow for it.
+     *
+     * @return string
+     */
+    private static function verifyMultipleAddressesCode(): string
+    {
+        $method = new ReflectionMethod(Validator::class, 'verifyMultipleAddresses');
+        $lines = explode("\n", (string)file_get_contents((string)$method->getFileName()));
+        $body = implode("\n", array_slice(
+            $lines,
+            $method->getStartLine() - 1,
+            $method->getEndLine() - $method->getStartLine() + 1
+        ));
+
+        $code = '';
+        foreach (token_get_all('<?php ' . $body) as $token) {
+            if (!is_array($token)) {
+                $code .= $token;
+                continue;
+            }
+
+            if ($token[0] === T_COMMENT || $token[0] === T_DOC_COMMENT) {
+                continue;
+            }
+
+            $code .= $token[1];
+        }
+
+        return $code;
     }
 
     /**
@@ -520,7 +729,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     /**
      * THE return-ORDER regression, and the property the customer import actually depends on.
      *
-     * Plugin\Admin\ValidateImportAddress.php:94 array_merge()s the per-chunk result arrays
+     * Plugin\Admin\ValidateImportAddress::afterValidateData() array_merge()s the per-chunk result arrays
      * and reports ($index + 1) of the MERGED array as the import row number. array_merge()
      * renumbers integer keys BY INSERTION ORDER, not by key value, so a chunk that came back
      * as [1, 3, 0, 2, 4] - which is exactly what filling cache hits during the first pass
@@ -581,7 +790,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'Each merged position must still carry the verdict of the row that occupied it.'
         );
 
-        // The arithmetic ValidateImportAddress.php:107-117 performs on that merged array.
+        // The arithmetic ValidateImportAddress::afterValidateData() performs on that merged array.
         $reportedRows = [];
         foreach ($merged as $index => $validAddress) {
             if (!$validAddress) {
@@ -619,9 +828,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      */
     public function testAnIdenticalBatchSubmittedTwiceBillsItsAddressesOnce(): void
     {
-        // Every address passes: a rejection is deliberately never cached (see
-        // testAFailingVerdictIsNeverCached()), so a batch containing one could not make the
-        // "no second request at all" claim this test is about.
+        // Every address passes, so this holds for BOTH memories and stays a statement about the
+        // merchant-facing guarantee rather than about which memory answered: a rejection is
+        // remembered for the run but never in the session (see
+        // testAFailingVerdictIsNeverWrittenToTheSessionVerdictStore() and its paired opposite),
+        // so a batch containing one could not make the "no second request at all" claim this
+        // test is about once the admin comes back on a later request.
         $batch = [];
         for ($i = 0; $i < 5; $i++) {
             $batch[] = $this->distinctAddress($i);
@@ -802,14 +1014,34 @@ class ValidatorBatchVerifyCacheTest extends TestCase
     }
 
     /**
-     * A FAILING verdict is never cached, and that is load-bearing rather than tidiness.
+     * A FAILING verdict is never written to the SESSION verdict store, and that is
+     * load-bearing rather than tidiness.
      *
-     * Because no rejection is ever stored, an admin or an import can never be stranded on a
-     * replayed "invalid" they cannot clear - the checkout dead-end the single-address cache
-     * has to avoid by keying rejections on the exact address Loqate judged. The cost is
-     * stated and asserted here: a failing address is re-billed on every submission.
+     * Because no rejection is ever stored THERE, an admin or an import can never be stranded
+     * across requests on a replayed "invalid" they cannot clear - the checkout dead-end the
+     * single-address cache has to avoid by keying rejections on the exact address Loqate
+     * judged - and the bounded FIFO store keeps spending its slots on the sparse PASSES,
+     * which is what makes it worth having on a default install where most rows fail
+     * (Validator::BATCH_VERIFY_CACHE_LIMIT carries the measurements). The cost is stated and
+     * asserted here: a failing address is re-billed by every later request.
+     *
+     * THIS IS ONE HALF OF A PAIR, and the halves are two different guarantees since LOQ-17148
+     * gave the run its own memory. The other half -
+     * testAFailingVerdictIsRememberedForTheRestOfTheRunRatherThanRebilled() - pins that the
+     * SAME run does NOT re-bill it. Neither implies the other, so neither may be asserted
+     * through the other: an implementation that cached failures in the session would satisfy
+     * the run-scoped half and violate this one, and an implementation that forgot rejections
+     * the instant the response was read would satisfy this one and violate that.
+     *
+     * MEASURED ACROSS TWO REQUESTS ON PURPOSE. What the session store holds is only
+     * observable to a Validator that did not earn the verdicts: within one run the rejection
+     * is answered from the run-scoped memory, which is the other half's subject. So the
+     * second submission here is made by a FRESH Validator over the SAME session double, which
+     * is exactly the admin re-submitting the order or re-running the import in the same
+     * browser session - and what it puts on the wire is decided by the session store and by
+     * nothing else.
      */
-    public function testAFailingVerdictIsNeverCached(): void
+    public function testAFailingVerdictIsNeverWrittenToTheSessionVerdictStore(): void
     {
         $good = $this->distinctAddress(1);
         $bad = $this->distinctAddress(2);
@@ -822,24 +1054,99 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             1,
             $this->batchStore($this->shopper),
             'Only the PASSING verdict may be cached: a stored rejection is what would make it possible for '
-            . 'an admin or an import to be stranded on an "invalid" they cannot clear.'
+            . 'an admin or an import to be stranded on an "invalid" they cannot clear, and it would spend a '
+            . 'slot of a bounded store that exists to hold the passes.'
+        );
+        $this->assertSame(
+            [['valid' => true, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION]],
+            array_map(
+                static fn ($entry) => json_decode((string)$entry, true),
+                array_values($this->batchStore($this->shopper))
+            ),
+            'The one entry the store holds must be a PASS: counting entries alone would still pass if a '
+            . 'rejection were stored in place of the pass rather than alongside it.'
         );
 
-        $second = $this->validator->verifyMultipleAddresses([$good, $bad], false);
+        // A LATER REQUEST in the same browser session: same session store, brand new Validator.
+        $laterRequest = $this->createShopper($this->sessionStore);
+        $second = $laterRequest['validator']->verifyMultipleAddresses([$good, $bad], false);
 
-        $this->assertSame(2, $this->apiCallCount(), 'The failing address must be sent again.');
+        $this->assertSame(
+            1,
+            $this->shopperCallCount($laterRequest),
+            'The failing address must be sent again by a later request: nothing in the session store '
+            . 'answers for it, so there is a request to make.'
+        );
         $this->assertSame(
             [$bad['street'][0]],
-            array_column($this->apiRequests[1]['Addresses'], 'Address1'),
-            'ONLY the failing address may be re-sent: the passing one is cached, so re-billing it too '
-            . 'would defeat the fix.'
+            array_column($laterRequest['requests'][0]['Addresses'], 'Address1'),
+            'ONLY the failing address may be re-sent: the passing one IS in the session store, so '
+            . 're-billing it too would defeat the fix, and re-sending neither would mean the rejection had '
+            . 'been stored after all.'
         );
         $this->assertSame(
             3,
-            $this->addressesBilled(),
-            'Two addresses submitted twice, one of them cacheable: three billed addresses.'
+            $this->addressesBilled() + $this->addressesBilledBy($laterRequest),
+            'Two addresses submitted in two requests, one of them cacheable: three billed addresses.'
         );
         $this->assertSame([true, false], array_values($second), 'The verdicts must be unchanged.');
+    }
+
+    /**
+     * The other half of the pair, and the saving LOQ-17148 exists for: a READABLE REJECTION is
+     * remembered for the rest of the RUN, so a rejected address repeated later in the same run
+     * is not sent - or billed - a second time.
+     *
+     * A customer import chunks at 100 rows and verifies every chunk inside ONE PHP request,
+     * and etc/config.xml ships address_quality_index at 'A', the strictest grade, so on a
+     * default install most rows FAIL. A rejection that is forgotten the instant the response
+     * is read is therefore re-sent in every chunk the address appears in, and the Cleansing
+     * API is billed per ADDRESS, not per request.
+     *
+     * SEPARATELY FAILING FROM ITS SIBLING BY CONSTRUCTION: both submissions here are made by
+     * the SAME Validator, which is the lifetime a run has, and the session store is asserted
+     * NOT to have grown - so this test cannot be satisfied by starting to cache failures in
+     * the session, which is the change deliberately rejected on billing grounds.
+     */
+    public function testAFailingVerdictIsRememberedForTheRestOfTheRunRatherThanRebilled(): void
+    {
+        $good = $this->distinctAddress(1);
+        $bad = $this->distinctAddress(2);
+        $this->apiVerdicts[$bad['street'][0]] = 'fail';
+
+        $first = $this->validator->verifyMultipleAddresses([$good, $bad], false);
+
+        $this->assertSame([true, false], array_values($first), 'The second address must be rejected.');
+        $this->assertSame(2, $this->addressesBilled(), 'The first chunk bills both of its addresses.');
+
+        $second = $this->validator->verifyMultipleAddresses([$good, $bad], false);
+
+        $this->assertSame(
+            1,
+            $this->apiCallCount(),
+            'A chunk whose every address this run has already judged must issue NO request at all - not an '
+            . 'empty payload to a billable endpoint, and not a request carrying the rejected address again.'
+        );
+        $this->assertSame(
+            2,
+            $this->addressesBilled(),
+            'The rejected address must appear on the invoice ONCE for the run, not once per chunk it '
+            . 'appears in: this is the whole saving of LOQ-17148, and it is measured in ADDRESSES because '
+            . 'that is what Loqate bills.'
+        );
+        $this->assertSame(
+            [true, false],
+            array_values($second),
+            'The remembered rejection must come back as the REJECTION it was. Remembering the address but '
+            . 'answering it true would turn a billing fix into an unverified import.'
+        );
+        $this->assertCount(
+            1,
+            $this->batchStore($this->shopper),
+            'And the saving must come from the RUN memory, not from the session store, which must still '
+            . 'hold the single pass: caching failures there is a measured billing REGRESSION on this '
+            . 'workload, because failures crowd the sparse passes out of a bounded FIFO store.'
+        );
     }
 
     /**
@@ -850,16 +1157,16 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * envelope) into a row nothing can be read out of, and Loqate's own "no match for this
      * address" arrives the same way, as "Matches":[]. Reporting either as "valid" is the
      * maximally wrong answer, so checkQualityIndex()'s shape guard
-     * (Helper/Validator.php:841-843) rejects it, exactly as verifyAddress() already rejected an
-     * unreadable AVC (Helper/Validator.php:377): both verify paths now draw the "readable
+     * in checkQualityIndex() rejects it, exactly as verifyAddress() already rejected an
+     * unreadable AVC: both verify paths now draw the "readable
      * verdict" line in the same place. A TOP-LEVEL error envelope is NOT in this class - it makes
      * HttpClient::searchForError() throw, Verify::verifyAddress() catches it into
-     * ['error' => true, ...], and the branch at Helper/Validator.php:616-623 answers it instead.
+     * ['error' => true, ...], and verifyMultipleAddresses()' transport-failure branch answers it instead.
      *
      * EVERY shape asserted here survives the connector's array_column($response, 'Matches') with
      * the ROW COUNT PRESERVED (see self::UNREADABLE_ROW_SHAPES), so the row-count guard
-     * (Helper/Validator.php:643-651) catches none of them and they all reach the attribution loop
-     * (Helper/Validator.php:703-711) as an AQI of null. This guard is the only thing between them
+     * in verifyMultipleAddresses() catches none of them and they all reach that method's
+     * attribution loop as an AQI of null. This guard is the only thing between them
      * and a PASS. That includes "Matches":null, which was missing from this taxonomy until the
      * guard was written and is a survivor of array_column() just like [] is (verified on 8.3).
      *
@@ -885,7 +1192,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         // reach the attribution loop, because the connector's array_column($response, 'Matches')
         // keeps a record whose 'Matches' is [] or null instead of dropping it. Were that not so,
         // the row count would differ and this test would silently be exercising the count guard
-        // (Helper/Validator.php:643-651) rather than the AQI shape guard it is written for.
+        // in verifyMultipleAddresses() rather than the AQI shape guard it is written for.
         $this->assertSame(
             [self::UNREADABLE_ROW_SHAPES[$token]],
             array_column([['Matches' => self::UNREADABLE_ROW_SHAPES[$token]]], 'Matches'),
@@ -901,7 +1208,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'An AQI the module could not read is NOT a verdict, so it must fail CLOSED. Answering true - '
             . 'which is what null <= any letter threshold used to produce - let ONE malformed or '
             . 'match-less response row PASS an address: admin order create went straight through '
-            . '(Plugin\Admin\OrderSave.php:50-58 sees true and raises no error) and the import row was '
+            . '(Plugin\Admin\OrderSave::aroundExecute() sees true and raises no error) and the import row was '
             . 'accepted unverified. For the "Matches":[] shape that meant reporting Loqate\'s own "no '
             . 'match for this address" as VALID.'
         );
@@ -1043,6 +1350,14 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * serialised on every request, and an import can present thousands of rows. Bounded but
      * newest-first would be worse than useless, because the entry most likely to be needed
      * again is the one just written.
+     *
+     * BOTH PROBES ARE MADE BY A LATER REQUEST, and that is the only lifetime in which
+     * eviction is observable at all. The run that filled the store remembers every one of
+     * those verdicts in its own map, which is deliberately UNBOUNDED - it dies with the
+     * request - so asking the filling Validator would measure that map and report a perfect
+     * hit rate whatever the session store had thrown away. The second request is a fresh
+     * Validator over the same session double, so what it puts on the wire is decided by the
+     * session store alone: nothing else survived.
      */
     public function testTheBatchCacheIsBoundedAndEvictsTheOldestVerdictFirst(): void
     {
@@ -1065,25 +1380,34 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             . 'bounded) and no fewer (a cache that under-fills re-bills addresses it had room to keep).'
         );
 
-        $callsAfterFill = $this->apiCallCount();
-        $billedAfterFill = $this->addressesBilled();
+        $laterRequest = $this->createShopper($this->sessionStore);
 
         // The newest address must have survived...
-        $this->validator->verifyMultipleAddresses([$batch[$limit + 4]], false);
+        $laterRequest['validator']->verifyMultipleAddresses([$batch[$limit + 4]], false);
         $this->assertSame(
-            $billedAfterFill,
-            $this->addressesBilled(),
+            0,
+            $this->addressesBilledBy($laterRequest),
             'The most recently verified address must survive eviction: it is the likeliest to be asked '
             . 'about again.'
         );
-        $this->assertSame($callsAfterFill, $this->apiCallCount(), 'An all-hit batch must issue no request.');
+        $this->assertSame(
+            0,
+            $this->shopperCallCount($laterRequest),
+            'An all-hit batch must issue no request.'
+        );
 
         // ...while the oldest five have been evicted and must be verified again.
-        $this->validator->verifyMultipleAddresses([$batch[0]], false);
+        $laterRequest['validator']->verifyMultipleAddresses([$batch[0]], false);
         $this->assertSame(
-            $billedAfterFill + 1,
-            $this->addressesBilled(),
+            1,
+            $this->addressesBilledBy($laterRequest),
             'The oldest entries must be the ones evicted once the cache is full.'
+        );
+        $this->assertSame(
+            [$batch[0]['street'][0]],
+            array_column($laterRequest['requests'][0]['Addresses'], 'Address1'),
+            'And the address it re-bills must be the EVICTED one: a store that had evicted something else '
+            . 'entirely would run up the same invoice.'
         );
         $this->assertCount(
             $limit,
@@ -1094,14 +1418,29 @@ class ValidatorBatchVerifyCacheTest extends TestCase
 
     /**
      * The bound must be a bound, not a cliff: every one of the BATCH_VERIFY_CACHE_LIMIT
-     * verdicts the cache claims to hold has to be genuinely replayable.
+     * verdicts the SESSION STORE claims to hold has to be genuinely replayable on a LATER
+     * REQUEST.
      *
-     * Asserted by filling the cache to exactly the limit and then re-submitting the whole
-     * batch with no further BILLED ADDRESS, which is what distinguishes a real FIFO cache of
-     * LIMIT entries from one that keeps only the newest verdict (or one whose effective limit
-     * is far smaller than advertised) - both of which satisfy a bare "count <= limit"
-     * assertion. It also pins the property the limit was chosen for: two full import chunks
-     * of 100 rows must fit at once, or a re-run import re-bills rows the cache had room for.
+     * Asserted by filling the store to exactly the limit and then re-submitting the whole batch
+     * with no further BILLED ADDRESS, which is what distinguishes a real FIFO store of LIMIT
+     * entries from one that keeps only the newest verdict (or one whose effective limit is far
+     * smaller than advertised) - both of which satisfy a bare "count <= limit" assertion. It
+     * also pins the property the limit was chosen for: two full import chunks of 100 rows must
+     * fit at once, or a RE-RUN IMPORT re-bills rows the store had room for.
+     *
+     * THE REPLAY IS A SECOND REQUEST, AND ONLY A SECOND REQUEST CAN MAKE THIS CLAIM. Every
+     * assertion here is about what the session store retained, and since LOQ-17148 the run map
+     * answers first - so a replay on $this->validator is answered out of the map, which is
+     * unbounded and holds all LIMIT verdicts whatever the store did with them. This test was
+     * left on $this->validator when its six siblings were moved, and the proof of what that
+     * cost is a one-line mutation: make getCachedBatchVerifyResult() `return null;`
+     * unconditionally - deleting the session store's every answer - and the pre-repair version
+     * still passed. A re-run import is by definition a later request in the same browser
+     * session, so this fixture is also the one the docblock above always claimed to describe.
+     *
+     * The order the second request asks in is deliberate: the whole batch first, then every
+     * address individually OLDEST FIRST, because the oldest entries are the ones a store that
+     * silently evicted below its bound has lost.
      */
     public function testEveryVerdictUpToTheBatchCacheLimitIsRetainedAndReplayable(): void
     {
@@ -1121,22 +1460,35 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $this->assertCount(
             $limit,
             $this->batchStore($this->shopper),
-            'A cache bounded to ' . $limit . ' entries must actually be able to hold ' . $limit . ' verdicts.'
+            'A store bounded to ' . $limit . ' entries must actually be able to hold ' . $limit . ' verdicts.'
         );
 
-        // Re-submit the whole batch, and then every address individually, oldest first.
-        $replayed = $this->validator->verifyMultipleAddresses($batch, false);
+        // The re-run: a fresh Validator over the same session double, so nothing but the
+        // session store can answer it. Re-submit the whole batch, then every address
+        // individually, oldest first.
+        $rerun = $this->createShopper($this->sessionStore);
+        $replayed = $rerun['validator']->verifyMultipleAddresses($batch, false);
         for ($i = 1; $i <= $limit; $i++) {
-            $this->validator->verifyMultipleAddresses([$this->distinctAddress($i)], false);
+            $rerun['validator']->verifyMultipleAddresses([$this->distinctAddress($i)], false);
         }
 
         $this->assertSame(
+            0,
+            $this->addressesBilledBy($rerun),
+            'Every verdict up to the limit must have survived in the SESSION STORE: a re-run import must '
+            . 'replay all ' . $limit . ' addresses without one further billed address. Measured on the '
+            . 'RE-RUN\'s own connector, because that is the only invoice the session store decides.'
+        );
+        $this->assertSame(
+            0,
+            $this->shopperCallCount($rerun),
+            'And not a single request either: an all-hit batch must not reach the billable endpoint at all.'
+        );
+        $this->assertSame(
             $limit,
             $this->addressesBilled(),
-            'Every verdict up to the limit must still be cached: replaying all ' . $limit
-            . ' addresses must not cost a single further billed address.'
+            'The first request\'s invoice must be unchanged - ' . $limit . ' addresses, billed once.'
         );
-        $this->assertSame(1, $this->apiCallCount(), 'And not a single further request either.');
         $this->assertSame(
             array_fill(0, $limit, true),
             array_values($replayed),
@@ -1144,8 +1496,8 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         );
         $this->assertCount(
             $limit,
-            $this->batchStore($this->shopper),
-            'Replaying cached verdicts must not grow the cache.'
+            $this->batchStore($rerun),
+            'Replaying cached verdicts must not grow the store past its bound.'
         );
     }
 
@@ -1155,9 +1507,15 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * merchant tightens or loosens that threshold, verdicts computed under the old one must
      * not be replayed.
      *
-     * The threshold is showInStore="1" and read at SCOPE_STORE, so the store view has to be
-     * part of the namespace too - one session can span store views (?___store=, a language
-     * switcher) - and that half is asserted here as well.
+     * The store view is part of the namespace too, and that half is asserted here as well -
+     * but for the reason etc/adminhtml/system.xml gives, which is NOT the one an earlier
+     * revision of this docblock gave. The field ships showInDefault="1" showInWebsite="0"
+     * showInStore="0", so a merchant CANNOT set it per store view; the namespace is there
+     * because Helper\Data::getConfigValue() is a SCOPE_STORE read with no store named, and one
+     * browser session can span store views (?___store=, a language switcher), so the value the
+     * verdict was judged under is whatever store the request resolved as current. The key
+     * accommodates a per-view threshold if the field is ever widened; it does not claim one
+     * exists today.
      */
     public function testChangingTheQualityIndexThresholdInvalidatesCachedVerdicts(): void
     {
@@ -1201,6 +1559,65 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'The fingerprint must be 12 hex characters: hex so it can never contain the "|" the signature '
             . 'parts are joined with, and truncated so the session payload does not carry 64 characters '
             . 'per entry.'
+        );
+    }
+
+    /**
+     * The threshold fingerprint is taken over the value's TYPE as well as its text, so null, the
+     * empty string, the INT 0 and the STRING '0' get four different namespaces.
+     *
+     * WHAT WOULD COLLIDE WITHOUT THE TYPE. buildBatchVerifyCacheKey() hashes
+     * gettype($threshold) . ':' . $threshold. Drop the gettype() and the four values collapse
+     * into two: null and '' both stringify to '', and the int 0 and the string '0' both
+     * stringify to '0'. Those are not academic pairs - they are exactly the pairs
+     * resolveQualityIndexThreshold()'s docblock refuses to cast between, because 0 <= null is
+     * TRUE (numeric comparison) while 0 <= '' is FALSE (string comparison), so two thresholds
+     * sharing a namespace would replay each other's verdicts while disagreeing about them.
+     *
+     * ASSERTED THROUGH THE KEY BUILDER, and the reason is worth recording because it is a change
+     * in what this fingerprint is FOR. None of these four values can produce a cache key
+     * behaviourally any more: every one of them is unreadable, and since LOQ-17148's pre-flight
+     * guard an unreadable threshold returns before the memories are consulted or written, so
+     * there is no entry, no log line and no lookup to observe. The type segment is therefore no
+     * longer load-bearing for any reachable configuration - it is what stops the collision
+     * coming back if the pre-flight guard is ever narrowed, moved or removed, which is precisely
+     * when nobody would think to re-derive this. Pinning it at the builder is the only way to
+     * hold it at all.
+     */
+    public function testTheThresholdFingerprintTellsTheseFourApart(): void
+    {
+        $signature = 'ONE ADDRESS|SIGNATURE';
+        $builder = new ReflectionMethod(Validator::class, 'buildBatchVerifyCacheKey');
+        $builder->setAccessible(true);
+
+        $keys = [];
+        foreach (['null' => null, 'blank' => '', 'int zero' => 0, 'string zero' => '0'] as $label => $value) {
+            $shopper = $this->createShopper(
+                null,
+                0,
+                new ArrayObject(self::configWith([self::AQI_CONFIG_PATH => $value]))
+            );
+
+            $keys[$label] = (string)$builder->invoke($shopper['validator'], $signature);
+        }
+
+        $fingerprints = array_map(static fn (string $key): string => self::fingerprintSegment($key), $keys);
+
+        $this->assertSame(
+            $fingerprints,
+            array_unique($fingerprints),
+            'Four thresholds of three different types must produce four different namespaces. Hashing the '
+            . 'text alone makes null indistinguishable from "" and the int 0 indistinguishable from the '
+            . 'string "0" - the very pairs PHP compares by DIFFERENT rules - so a merchant moving between '
+            . 'two of them would be served verdicts earned under a threshold that answers differently. '
+            . 'Fingerprints: ' . json_encode($fingerprints)
+        );
+        $this->assertSame(
+            array_fill_keys(array_keys($keys), $signature),
+            array_map(static fn (string $key): string => self::signatureSegment($key), $keys),
+            'And the threshold must NAMESPACE the key rather than leak into the address signature: one '
+            . 'address must project to one signature under every threshold, or the fingerprint above is '
+            . 'not what is telling them apart.'
         );
     }
 
@@ -1356,7 +1773,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * branch can be broken - deleting it, and demoting it below the row-count guard - are each
      * INVISIBLE to one of them. The connector reports a transport failure as
      * ['error' => true, 'message' => ...], a TWO-ELEMENT array, so its element count collides
-     * with the address count of precisely the batch Plugin\Admin\OrderSave.php:29-36 sends:
+     * with the address count of precisely the batch Plugin\Admin\OrderSave::aroundExecute() sends:
      * billing plus shipping, TWO addresses.
      *  - TWO addresses pins that the branch EXISTS. count($response) === 2 === count($sentItems),
      *    so the row-count guard does NOT fire and cannot stand in for the branch. Delete the
@@ -1522,6 +1939,14 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * module writing to the key, a half-migrated session payload) or an entry that cannot be
      * read as a verdict must degrade to "not cached" - one extra billed address - and never
      * throw in the middle of an import.
+     *
+     * Each corruption is presented to a SEPARATE REQUEST, because that is the only lifetime
+     * in which the session store is what answers: the Validator that wrote the entry
+     * remembers the verdict for its own run and would answer from that map without reading
+     * the corrupted store at all, so both corruptions would go unexercised and this test
+     * would be green whether the defensive reads existed or not. Corruption arriving on a
+     * later request is also the realistic case - a session payload is corrupted between
+     * requests, not during one.
      */
     public function testAnUnreadableBatchCacheDegradesToOneExtraBilledAddress(): void
     {
@@ -1529,9 +1954,14 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $this->assertCount(1, $this->batchStore($this->shopper), 'The verdict must be cached normally first.');
 
         $this->sessionStore[self::BATCH_VERIFY_CACHE_SESSION_KEY] = 'not-an-array';
-        $this->validator->verifyMultipleAddresses([self::ADDRESS], false);
+        $unreadableStoreRequest = $this->createShopper($this->sessionStore);
+        $unreadableStoreRequest['validator']->verifyMultipleAddresses([self::ADDRESS], false);
 
-        $this->assertSame(2, $this->apiCallCount(), 'An unreadable store must fall back to verifying, not throw.');
+        $this->assertSame(
+            1,
+            $this->addressesBilledBy($unreadableStoreRequest),
+            'An unreadable store must fall back to verifying, not throw.'
+        );
         $this->assertCount(
             1,
             $this->batchStore($this->shopper),
@@ -1545,15 +1975,28 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $store[$key] = '{not json';
         $this->sessionStore[self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
-        $this->validator->verifyMultipleAddresses([self::ADDRESS], false);
+        $corruptedEntryRequest = $this->createShopper($this->sessionStore);
+        $corruptedEntryRequest['validator']->verifyMultipleAddresses([self::ADDRESS], false);
 
-        $this->assertSame(3, $this->apiCallCount(), 'A corrupted entry must be re-verified, not throw.');
+        $this->assertSame(
+            1,
+            $this->addressesBilledBy($corruptedEntryRequest),
+            'A corrupted entry must be re-verified, not throw, and not be read as a verdict.'
+        );
         $this->assertSame(
             ['valid' => true, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION],
             json_decode((string)($this->batchStore($this->shopper)[$key] ?? ''), true),
             'The re-verified verdict must overwrite the corrupted entry with a usable one - carrying the '
             . 'key-scheme stamp, so recovering from corruption cannot quietly write an entry the next read '
             . 'would discard as stale.'
+        );
+        $this->assertSame(
+            3,
+            $this->addressesBilled()
+            + $this->addressesBilledBy($unreadableStoreRequest)
+            + $this->addressesBilledBy($corruptedEntryRequest),
+            'ONE address, three requests, two of them meeting a store they could not read: three billed '
+            . 'addresses and no more. Degrading to a miss costs exactly one re-verification each time.'
         );
     }
 
@@ -1564,6 +2007,11 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      *
      * This is the second, independent guard behind the separate session attribute, and it is
      * the one that still holds after somebody "simplifies" the two stores into one.
+     *
+     * The plant is presented to a SECOND REQUEST, because the shape guard lives on the
+     * session-store read: the Validator that earned the key remembers its own verdict for the
+     * run and would answer from there without ever looking at the planted entry, leaving the
+     * guard unexercised and this test green with the shape check deleted.
      */
     public function testASingleAddressVerdictPlantedInTheBatchStoreIsNotReadAsAVerdict(): void
     {
@@ -1581,14 +2029,21 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $store[$key] = json_encode(['error' => false, 'schema' => self::VERIFY_KEY_SCHEMA_VERSION]);
         $this->sessionStore[self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
-        $this->validator->verifyMultipleAddresses([self::ADDRESS], false);
+        $laterRequest = $this->createShopper($this->sessionStore);
+        $verdicts = $laterRequest['validator']->verifyMultipleAddresses([self::ADDRESS], false);
 
         $this->assertSame(
-            2,
-            $this->apiCallCount(),
+            1,
+            $this->addressesBilledBy($laterRequest),
             'A verdict in the single-address cache\'s shape must not satisfy a batch lookup: these '
             . 'verdicts answer different questions - the AVC thresholds versus the address quality '
             . 'index - so reading one as the other would apply a threshold the merchant did not choose.'
+        );
+        $this->assertSame(
+            [0 => true],
+            $verdicts,
+            'And the LIVE verdict must be the one returned, so the plant can be seen not to have answered '
+            . 'the lookup rather than merely to have agreed with it.'
         );
     }
 
@@ -1638,6 +2093,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * LOQ-17015, "the same address repeated within one batch is billed once per occurrence"; the
      * assertion below is what will have to change when it is done, so the current cost is visible
      * rather than rediscovered from an invoice.
+     *
+     * TWO COPIES IS THE CASE THIS TEST RUNS, AND ONLY TWO. Generalising from it is what produced
+     * a published - and false - bound of "one duplicate charge per distinct address per run".
+     * Three copies, and the free later chunk, are measured in
+     * Test\Unit\Helper\ValidatorImportRunDedupeTest::
+     * testEveryCopyInTheChunkAnAddressFirstAppearsInIsBilledAndEveryLaterChunkIsFree().
      */
     public function testADuplicatedAddressInOneBatchIsAnsweredUnderBothKeys(): void
     {
@@ -1916,7 +2377,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * An AQI that is PRESENT but not readable as a quality index FAILS CLOSED and is never
      * cached - the second route into the same guard.
      *
-     * The guard is a READABILITY test - is this a non-empty string (Helper/Validator.php:841-843)
+     * The guard is a READABILITY test - is this a non-empty string (checkQualityIndex())
      * - and deliberately not a null check, and that difference is the whole point of this test:
      * under PHP 8's <= rules '' <= 'A', false <= 'A' and 0 <= 'A' are ALL true, so every value
      * here used to be answered VALID, and a guard written as "$qualityIndex !== null" would still
@@ -1927,7 +2388,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      *
      * The rejection is the correct answer, not a compromise: an unreadable AQI is not a verdict,
      * so the batch path answers it the way verifyAddress() answers an unreadable AVC
-     * (Helper/Validator.php:377). Nothing being cached follows from the same rule - a false
+     * in verifyAddress(). Nothing being cached follows from the same rule - a false
      * verdict is never stored - so a fault answers this one row and dies with the request, and the
      * next identical batch asks the API again.
      *
@@ -1951,9 +2412,9 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             'An AQI that is present but unreadable must fail CLOSED. It used to answer "valid" - '
             . '"" <= "C", false <= "C" and 0 <= "C" are all true under PHP 8 - so ONE malformed response '
             . 'row made that address PASS: admin order create went through '
-            . '(Plugin\Admin\OrderSave.php:50-58 sees true and raises no error) and the import row was '
+            . '(Plugin\Admin\OrderSave::aroundExecute() sees true and raises no error) and the import row was '
             . 'accepted unverified, while verifyAddress() already failed CLOSED on the equivalent '
-            . 'unreadable AVC (Helper/Validator.php:377). The two paths must agree, and this is where the '
+            . 'unreadable AVC in verifyAddress(). The two paths must agree, and this is where the '
             . 'AQI side is held.'
         );
         $this->assertSame(
@@ -2009,7 +2470,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * CACHED.
      *
      * Fail-closed is only correct if it rejects EXACTLY the unreadable values. Without this test
-     * the guard at Helper/Validator.php:841-843 could be strengthened all the way to "reject
+     * the guard in checkQualityIndex() could be strengthened all the way to "reject
      * everything" - a whitelist of today's grade letters, empty(), a falsy test, is_numeric() -
      * with every other test in this class still green: the two fail-closed tests above would keep
      * passing, and so would every cache test, because a rejection is never cached anyway. What
@@ -2018,8 +2479,8 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      *
      * Three cases, deliberately not one:
      *  - 'A' against a threshold of 'A': the EQUALITY case, and the shipped default
-     *    (etc/config.xml:20 sets address_quality_index to 'A' and the field is not exposed in
-     *    etc/adminhtml/system.xml, so this is what most merchants actually run);
+     *    (etc/config.xml sets address_quality_index to 'A' - the strictest grade - so this is
+     *    what a merchant who has not touched the new admin field is running);
      *  - 'B' against a looser 'C' threshold, so this test does not accidentally prove only that
      *    equality survives - a guard narrowed to "$qualityIndex === $threshold" would pass the
      *    case above and fail this one;
@@ -2059,7 +2520,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             $first,
             sprintf(
                 'A READABLE AQI that meets the configured threshold MUST still pass; this case pins that '
-                . '%s. The fail-closed guard (Helper/Validator.php:841-843) rejects only values whose '
+                . '%s. The fail-closed guard in checkQualityIndex() rejects only values whose '
                 . 'SHAPE is unreadable - no string, or the empty string - and widening it to empty(), to '
                 . 'a falsy test, to a whitelist of the grade letters Loqate uses today or to is_numeric() '
                 . 'would over-reject genuine verdicts and block valid addresses at admin order create and '
@@ -2104,6 +2565,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * the batch payload's distinct shape already guarded the two caches from each other. That
      * is a different guard: shape stops cross-CACHE conflation, the stamp stops cross-DEPLOY
      * staleness, and both key builders share one signature so a key-meaning change hits both.
+     *
+     * A DEPLOY IS BY DEFINITION A LATER REQUEST, and the fixture matches: the stale entry is
+     * presented to a fresh Validator over the same session. The Validator that earned the
+     * entry holds the same verdict in its own run memory and would answer from there, so
+     * asking it would exercise no stamp check at all - the check lives on the session-store
+     * read, which is the only place a verdict can be older than the running code.
      */
     public function testABatchVerdictWrittenUnderAnEarlierKeySchemeIsDiscardedRatherThanReplayed(): void
     {
@@ -2129,11 +2596,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $store[$key] = json_encode($payload);
         $this->shopper['session'][self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
-        $verdicts = $this->validator->verifyMultipleAddresses([$address], false);
+        $laterRequest = $this->createShopper($this->sessionStore);
+        $verdicts = $laterRequest['validator']->verifyMultipleAddresses([$address], false);
 
         $this->assertSame(
-            2,
-            $this->apiCallCount(),
+            1,
+            $this->addressesBilledBy($laterRequest),
             'A batch verdict stamped with another key scheme must be discarded and the address verified '
             . 'again: the key it is filed under no longer names the same address. Replaying it would be a '
             . 'false ACCEPT, since this store holds nothing but passes.'
@@ -2154,6 +2622,10 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * supplied for a missing key cannot equal the current version. Relaxing that default -
      * '?? null' to '?? self::VERIFY_KEY_SCHEMA_VERSION' - would silently admit every unstamped
      * entry, which is precisely the set written by the deploy before the stamp existed.
+     *
+     * Presented to a LATER REQUEST for the same reason as its sibling above: an entry written
+     * by an older deploy can only be met on a session-store read, and the Validator that
+     * earned this key would answer it out of its own run memory instead.
      */
     public function testABatchVerdictWithNoKeySchemeStampIsDiscardedRatherThanReplayed(): void
     {
@@ -2167,11 +2639,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $store[$key] = json_encode(['valid' => true]);
         $this->shopper['session'][self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
-        $verdicts = $this->validator->verifyMultipleAddresses([$address], false);
+        $laterRequest = $this->createShopper($this->sessionStore);
+        $verdicts = $laterRequest['validator']->verifyMultipleAddresses([$address], false);
 
         $this->assertSame(
-            2,
-            $this->apiCallCount(),
+            1,
+            $this->addressesBilledBy($laterRequest),
             'An UNSTAMPED batch verdict must be re-verified: it was written before the key scheme was '
             . 'recorded, so nothing establishes that its key still names this address. Admitting it would '
             . 'be a false ACCEPT, since this store holds nothing but passes.'
@@ -2241,6 +2714,14 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * already failed closed incidentally, and are pinned so that stays true by rule rather
      * than by accident of comparison semantics.
      *
+     * 'an unset threshold' AND 'a blank threshold' ARE TWO CASES, and they only became two when
+     * createShopper()'s configuration reader was changed from '??' to offsetExists(). Until
+     * then the harness substituted '' for a configured null, so both data sets ran the identical
+     * fixture while each carried a justification about a comparison that never happened. They
+     * are genuinely different inputs - different PHP comparison rules, and different cache-key
+     * fingerprints, see testTheThresholdFingerprintTellsTheseFourApart() - so the harness has to
+     * be able to tell them apart, and now can.
+     *
      * @return array<string, array{0: mixed, 1: string}>
      */
     public static function unreadableThresholdProvider(): array
@@ -2262,13 +2743,15 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             ],
             'an unset threshold' => [
                 null,
-                "null already failed closed via 'E' <= null being false; pinned so the guard, not "
-                . 'PHP comparison semantics, is what guarantees it',
+                "a config path never written to reads as null, and 'E' <= null is false only because "
+                . 'PHP coerces null to 0 and compares numerically; pinned so the guard, and not that '
+                . 'coercion, is what refuses it',
             ],
             'a blank threshold' => [
                 '',
-                "the empty string already failed closed the same incidental way; pinned for the same "
-                . 'reason',
+                "an admin field saved empty reads as '', and 'E' <= '' is false only because two "
+                . 'strings are compared byte by byte - a DIFFERENT accident from null\'s, which is why '
+                . 'these are two cases and not one',
             ],
             'a numeric threshold' => [
                 3,
@@ -2290,7 +2773,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             "AQI 'A' at the shipped default threshold 'A'" => [
                 'A',
                 'A',
-                'the strongest grade, judged against the threshold etc/config.xml:20 ships - the equality '
+                'the strongest grade, judged against the threshold etc/config.xml ships - the equality '
                 . 'case, and the configuration most merchants run',
             ],
             "AQI 'B' under a looser 'C' threshold" => [
@@ -2325,6 +2808,15 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * whenever the same address appears twice in one batch. This test uses the unreadable
      * payload, because that is the case that arrives with the cache already full after an
      * import.
+     *
+     * THREE REQUESTS, one per act, and the split is what makes the assertions mean anything.
+     * The store is filled by request one; request two meets the corrupted entry and performs
+     * the refresh; request three asks for the OLDEST address. Each is a fresh Validator over
+     * the same session double, so no run-scoped memory carries an answer between them - the
+     * Validator that filled the store remembers all of it, and the one that refreshed the
+     * newest entry remembers that. Asking either of them about $batch[0] would report a hit
+     * out of its own map no matter what array_shift() had done to the session store, which is
+     * precisely the eviction this test exists to detect.
      */
     public function testRefreshingAnEntryWhileTheCacheIsFullEvictsNoUnrelatedVerdict(): void
     {
@@ -2347,11 +2839,12 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $store[$keys[$limit - 1]] = '{not json';
         $this->sessionStore[self::BATCH_VERIFY_CACHE_SESSION_KEY] = $store;
 
-        $this->validator->verifyMultipleAddresses([$batch[$limit - 1]], false);
+        $refreshRequest = $this->createShopper($this->sessionStore);
+        $refreshRequest['validator']->verifyMultipleAddresses([$batch[$limit - 1]], false);
 
         $this->assertSame(
-            $limit + 1,
-            $this->addressesBilled(),
+            1,
+            $this->addressesBilledBy($refreshRequest),
             'Fixture guard: the corrupted entry must genuinely have missed, or the refresh under test '
             . 'never happened.'
         );
@@ -2363,18 +2856,26 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         );
 
         // THE assertion: the entry at the far end of the FIFO queue - the one with nothing to do
-        // with the refresh - must still be replayable.
-        $replayed = $this->validator->verifyMultipleAddresses([$batch[0]], false);
+        // with the refresh - must still be replayable, by a request that has never seen it.
+        $replayRequest = $this->createShopper($this->sessionStore);
+        $replayed = $replayRequest['validator']->verifyMultipleAddresses([$batch[0]], false);
 
         $this->assertSame(
-            $limit + 1,
-            $this->addressesBilled(),
+            0,
+            $this->addressesBilledBy($replayRequest),
             'The OLDEST verdict must survive a refresh of the newest one. Without the unset-then-append, '
             . 'the eviction loop counts the key it is about to overwrite as if it needed room and shifts '
             . 'this entry out - so a corrupted or repeated address quietly costs an unrelated, perfectly '
             . 'good verdict, and every such write shrinks the cache by one.'
         );
         $this->assertSame([0 => true], $replayed, 'And it must replay as the verdict it was, not as a miss.');
+        $this->assertSame(
+            $limit + 1,
+            $this->addressesBilled() + $this->addressesBilledBy($refreshRequest)
+            + $this->addressesBilledBy($replayRequest),
+            'Across all three requests the invoice must show the ' . $limit . ' distinct addresses plus the '
+            . 'ONE re-verification the corrupted payload forced, and nothing else.'
+        );
     }
 
     /**
@@ -2446,14 +2947,14 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      * Whole RESPONSE-ROW shapes that carry no readable AQI at all, keyed by the $apiVerdicts
      * token that produces them. Each value is one element of the list the CONNECTOR emits - that
      * is, one record's 'Matches' value after Verify::verifyAddress()'s
-     * array_column($response, 'Matches') (vendor/lqt/api-connector/src/Client/Verify.php:50-52).
+     * array_column($response, 'Matches').
      *
      * ALL THREE SURVIVE that array_column() with the row count PRESERVED, verified on PHP 8.3: it
      * drops only records that lack the 'Matches' KEY, so a record whose 'Matches' is [] - or even
-     * null - still contributes an element. The row-count guard (Helper/Validator.php:643-651)
+     * null - still contributes an element. The row-count guard in verifyMultipleAddresses()
      * therefore cannot see any of them; they reach the attribution loop
-     * (Helper/Validator.php:703-711), where $addressResponse[0]['AQI'] ?? null is null for every
-     * one, and only checkQualityIndex()'s shape guard (Helper/Validator.php:841-843) stands
+     * there, where $addressResponse[0]['AQI'] ?? null is null for every
+     * one, and only checkQualityIndex()'s shape guard stands
      * between them and a PASS. See
      * testARowWithNoReadableQualityIndexFailsClosedAndIsNeverCached().
      *
@@ -2595,8 +3096,24 @@ class ValidatorBatchVerifyCacheTest extends TestCase
      */
     private function addressesBilled(): int
     {
+        return $this->addressesBilledBy($this->shopper);
+    }
+
+    /**
+     * addressesBilled() for a specific shopper built by createShopper().
+     *
+     * Needed by every test that measures a SESSION-store property, because those properties
+     * are only observable across REQUESTS: a second request builds its own Validator (and so
+     * its own connector), and the invoice it runs up is the one that says what the session
+     * store did or did not answer. Summing the two shoppers would hide exactly that.
+     *
+     * @param array $shopper Shopper harness from createShopper().
+     * @return int
+     */
+    private function addressesBilledBy(array $shopper): int
+    {
         $billed = 0;
-        foreach ($this->apiRequests as $payload) {
+        foreach ($shopper['requests'] as $payload) {
             $billed += count((array)($payload['Addresses'] ?? []));
         }
 
@@ -2647,9 +3164,7 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $helper->method('getConfigValue')->willReturn('');
         $helper->method('getCurrentStore')->willReturn(0);
 
-        $serializer = $this->createMock(SerializerInterface::class);
-        $serializer->method('serialize')->willReturnCallback(static fn ($value) => json_encode($value));
-        $serializer->method('unserialize')->willReturnCallback(static fn ($value) => json_decode($value, true));
+        $serializer = $this->createSerializerDouble();
 
         return new Validator(
             $this->createMock(Logger::class),
