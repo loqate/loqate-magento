@@ -144,19 +144,53 @@ predate it and are described by their git tags and commit history.
   street field looked like it survived, on both front ends, only because the shopper
   typed into it and real `input` events had already fired.
 
-  The module's own wrapper now dispatches, from the capture control's `populate`
-  event, the one event the SDK omits: a bubbling `input` for an input or textarea,
-  `change` for anything else. It is strictly additive — nothing the SDK already
-  dispatches is repeated, and each populated field still sees exactly one `input`
-  and one `change` — so **Luma, multishipping, the customer address book and the
-  admin order-create and customer-edit screens are unchanged**. The country field
-  and the region `<select>` are untouched: both are populated by paths that already
-  fire a native `change` of their own.
+  The bundled SDK's own event dispatcher, `pca.reactTriggerChange`, now sends both
+  events for a text input: one bubbling `input`, then one bubbling `change`, in the
+  order a browser would (`input` while editing, `change` on commit). The value the
+  shopper picked therefore reaches Hyvä's component state, survives the next
+  re-render, and is the address the order is placed with. Fixing it in the dispatcher
+  rather than on the capture control's `populate` event also closes three sibling
+  write paths a `populate` hook missed — the drill-down write back to the search
+  field, the country list restoring the search text when it is dismissed, and
+  clearing the address — and it removes a re-vendor trap: a hook that added only
+  `input` would have depended on a separate local change further down the same file to
+  keep supplying `change`, so the next clean re-vendor of the SDK would have broken
+  Luma silently.
 
-  This is a front-end-only change with no automated coverage — the repository has no
-  JS test runner. It ships with a standalone Alpine harness that reproduces the wipe
-  and proves the fix without needing a Hyvä install, plus a manual pass covering
-  every screen the script serves; see `Test/manual/LOQ-17502-manual-qa.md`.
+  **Luma, multishipping, the customer address book and the admin order-create and
+  customer-edit screens behave the same for every consumer of `change`.** The
+  dispatcher still sends `change` for every node type it already sent it for, in the
+  same cases, and `select`, `input[type=file]`, checkbox, radio and textarea are not
+  touched at all — a text input is the only node type whose behaviour changed.
+
+  What is new on those screens too is that **every text input the SDK writes now also
+  receives one native bubbling `input`, immediately before the `change`** — the event
+  a browser would have sent and the SDK never did. No Magento binding on those screens
+  acts on `input`: Luma's Knockout `value` binding, the address-book and multishipping
+  forms and the admin UI components all listen for `change`. So no shopper-visible
+  behaviour is expected to change there, but a custom listener or third-party
+  extension bound to both events on a captured field will now run twice, and any
+  integration that treats an `input` on those fields as "the shopper typed" will now
+  see one. The regression steps for each of those screens are in
+  `Test/manual/LOQ-17502-manual-qa.md`.
+
+  The event contract is now asserted by an automated test: exactly one `input`, then
+  exactly one `change`, per populated text field. The country field and the region
+  `<select>` are unaffected; both are populated by paths that fire their own `change`.
+
+  This is a front-end-only change, and it now has automated coverage: a JavaScript
+  suite run by `npm test` — Node's built-in test runner with jsdom and the real Alpine
+  package, in `Test/js/`, wired into CI as its own job — which loads the real
+  `capture.js` rather than a re-implementation and asserts the event contract above,
+  that an Alpine `x-model` component ends up holding the populated city and postcode
+  and keeps them across a simulated Magewire commit and re-render, that the drill-down
+  and country-list-cancel paths dispatch `input` as well, that the extra event starts
+  no lookup loop, and that the capture control is constructed only once. Nothing
+  automated runs against a real Hyvä Checkout, so a manual pass over every screen the
+  script serves is still required before release; see
+  `Test/manual/LOQ-17502-manual-qa.md`. The standalone Alpine harness that ships
+  alongside it demonstrates the binding behaviour that caused the defect, but it does
+  not load `capture.js` and so proves nothing about the shipped code.
 - Repeated billable `/Cleansing/International/Batch` requests for the same address
   in one session, at checkout and on admin order create (LOQ-16969, LOQ-16976).
   Verify verdicts are cached per shopper for the session, keyed on the region value

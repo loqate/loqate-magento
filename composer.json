@@ -17,6 +17,10 @@
     }
   ],
   "autoload": {
+    "exclude-from-classmap": [
+      "/node_modules/",
+      "/.claude/"
+    ],
     "files": [
       "registration.php"
     ],
