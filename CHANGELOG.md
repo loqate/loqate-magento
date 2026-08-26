@@ -126,6 +126,37 @@ predate it and are described by their git tags and commit history.
 
 ### Fixed
 
+- **An address picked from the lookup no longer empties itself again on Hyvä
+  Checkout** (LOQ-17502). The shopper searched, picked a suggestion, watched city,
+  postcode and region fill in, and then lost them the moment focus moved to another
+  field — leaving the checkout without the data it had just shown. Reported on
+  Magento 2.4.8-p5 with module 2.0.16, reproducible on Hyvä's own default theme, and
+  not reproducible once the checkout was switched to Luma. Every release up to and
+  including v2.1.1 is affected; upgrading alone does not fix it.
+
+  Hyvä Checkout's fields are Magewire `wire:model.defer`, which Magewire rewrites
+  into an Alpine `x-model`, and Alpine syncs a text input to the component state on
+  `input` — `change` only on a select, checkbox or radio. The bundled capture SDK
+  dispatched `change` and nothing else for a text input, so the component never
+  learned the field had been filled in, and its next render morphed the stale empty
+  value back over what the shopper could see. Luma is unaffected because Knockout's
+  `value` binding listens for `change`, which is exactly what was being sent. The
+  street field looked like it survived, on both front ends, only because the shopper
+  typed into it and real `input` events had already fired.
+
+  The module's own wrapper now dispatches, from the capture control's `populate`
+  event, the one event the SDK omits: a bubbling `input` for an input or textarea,
+  `change` for anything else. It is strictly additive — nothing the SDK already
+  dispatches is repeated, and each populated field still sees exactly one `input`
+  and one `change` — so **Luma, multishipping, the customer address book and the
+  admin order-create and customer-edit screens are unchanged**. The country field
+  and the region `<select>` are untouched: both are populated by paths that already
+  fire a native `change` of their own.
+
+  This is a front-end-only change with no automated coverage — the repository has no
+  JS test runner. It ships with a standalone Alpine harness that reproduces the wipe
+  and proves the fix without needing a Hyvä install, plus a manual pass covering
+  every screen the script serves; see `Test/manual/LOQ-17502-manual-qa.md`.
 - Repeated billable `/Cleansing/International/Batch` requests for the same address
   in one session, at checkout and on admin order create (LOQ-16969, LOQ-16976).
   Verify verdicts are cached per shopper for the session, keyed on the region value

@@ -7893,6 +7893,41 @@
     }
   }
 
+  /**
+   * Dispatch the event a populated field needs but the bundled SDK never sends.
+   *
+   * For a text input the SDK dispatches `change` and nothing else — its
+   * `reactTriggerChange` matches the `input[type=text]` branch, so the branch that
+   * would dispatch `input` is unreachable. For a `<select>` it dispatches nothing
+   * at all, because `pca.setValue` returns as soon as it has set `selectedIndex`.
+   *
+   * `change` is enough for the Luma checkout, where Knockout's `value` binding
+   * listens for it. It is not enough for Hyvä Checkout: its fields are Magewire
+   * `wire:model.defer`, which Magewire rewrites into an Alpine `x-model`, and
+   * Alpine listens for `input` on a text input — `change` only on a select,
+   * checkbox or radio. Without the `input` event Hyvä's component state never
+   * learns the field was filled in, so the next render morphs the stale empty
+   * value back into the DOM and the address the shopper picked disappears
+   * (LOQ-17502).
+   *
+   * Only the missing event is sent, so nothing the SDK already dispatches is
+   * duplicated: `input` for an input or textarea, `change` for anything else.
+   */
+  function dispatchPopulateEvents(element) {
+    if (!element) {
+      return;
+    }
+
+    if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") {
+      element.dispatchEvent(
+        new Event("input", { bubbles: true, cancelable: false })
+      );
+      return;
+    }
+
+    dispatchChange(element);
+  }
+
   function mapRegionSelectValue(selectElement, details) {
     if (!selectElement || selectElement.tagName !== "SELECT" || !details) {
       return false;
@@ -8076,20 +8111,30 @@
         },
       });
 
-      const regionSelectFields = addressFieldsWithElements.filter(
-        (field) =>
-          field.field === "ProvinceName" &&
-          field.element &&
-          field.element.tagName === "SELECT"
+      const isRegionSelect = (field) =>
+        field.field === "ProvinceName" &&
+        field.element &&
+        field.element.tagName === "SELECT";
+
+      // Every field the SDK is allowed to write to. The country field is not one
+      // of them: pca.fieldMode.COUNTRY does not carry the POPULATE bit, so the
+      // country is filled in by the SDK's own country list, which already fires a
+      // native change event of its own.
+      const populatedFields = addressFieldsWithElements.filter(
+        (field) => field.element && (field.mode & pca.fieldMode.POPULATE) !== 0
       );
 
-      if (regionSelectFields.length) {
-        control.listen("populate", function (details) {
-          regionSelectFields.forEach((regionField) => {
-            mapRegionSelectValueWithRetry(regionField.element, details);
-          });
+      control.listen("populate", function (details) {
+        populatedFields.forEach((field) => {
+          if (isRegionSelect(field)) {
+            // Resolves the option to select and dispatches its own change event.
+            mapRegionSelectValueWithRetry(field.element, details);
+            return;
+          }
+
+          dispatchPopulateEvents(field.element);
         });
-      }
+      });
 
       pcaInstances[instanceKey] = { anchorElement, control };
     }
