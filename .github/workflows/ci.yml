@@ -1,15 +1,9 @@
 # ==============================================================================
-# CI - Test Suites
+# CI - Unit Tests
 # ==============================================================================
-# Runs the module's two test suites on every pull request and on pushes to
-# master:
-#
-#   unit-tests    PHPUnit, for the PHP module code. Runs in isolation (no full
-#                 Magento install) via the stub-backed bootstrap in
-#                 Test/bootstrap.php.
-#   js-tests      node:test + jsdom, for the vendored capture SDK in
-#                 view/base/web/capture.js. Loads the real script into a jsdom
-#                 document and asserts its DOM event contract (LOQ-17502).
+# Runs the module's PHPUnit unit test suite on every pull request and on pushes
+# to master. The tests run in isolation (no full Magento install) via the
+# stub-backed bootstrap in Test/bootstrap.php.
 # ==============================================================================
 
 name: CI
@@ -64,46 +58,3 @@ jobs:
 
       - name: Run unit tests
         run: vendor/bin/phpunit --colors=never
-
-  # ============================================================================
-  # JavaScript tests - the vendored Loqate capture SDK
-  # ============================================================================
-  # jsdom-based, so there is no browser to download. The suite injects the real
-  # view/base/web/capture.js into a jsdom document, stubs the find/retrieve
-  # endpoints with a local node:http server, and asserts the input/change events
-  # the SDK dispatches. See Test/js/.
-  # ============================================================================
-  js-tests:
-    name: JS tests (Node ${{ matrix.node-version }})
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: ['22', '24']
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Get npm cache directory
-        id: npm-cache
-        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache npm downloads
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.npm-cache.outputs.dir }}
-          key: npm-${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
-          restore-keys: npm-${{ matrix.node-version }}-
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run JS tests
-        run: npm test

@@ -9,13 +9,3 @@ composer.lock
 
 # Local code-review reports — working notes, not product
 /.naas/
-
-# JavaScript / npm / node:test
-# `package-lock.json` IS committed, unlike composer.lock above. The asymmetry is
-# deliberate: composer.json is the manifest consumers install this module with,
-# so pinning its resolution would fight their own dependency graph. package.json
-# is dev-only test tooling that is never shipped in the Magento package, so
-# locking it costs nothing and buys deterministic CI (`npm ci`).
-/node_modules/
-/coverage/
-npm-debug.log*
