@@ -9,7 +9,19 @@
         - options.endpoint.retrieve - the retrieve endpoint to use
         - options.endpoint.unwrapped - whether to assume the response from the endpoints will be unwrapped (i.e not in the `Items` array)
     - Updated the `pca.fetch` method to pass through an options object, this is necessary for the unwrapped option to be toggleable
-    - Updated event logic to init the 'change' event for text inputs (see commit #6e3fa015c69f657572009a578ea15f1efbe09af3)
+    - Updated event logic in `pca.reactTriggerChange` so that a text input is matched by the
+      `select`/`input[type=file]` branch and therefore gets a 'change' event
+      (see commit #6e3fa015c69f657572009a578ea15f1efbe09af3)
+    - Extended that same branch so a text input deliberately emits BOTH 'input' and 'change',
+      in that order (LOQ-17502). Both events are required, for different front ends:
+        - 'change' is what Luma checkout (Knockout's `value` binding), the customer address
+          book, multishipping and the admin Magento UI components listen for.
+        - 'input' is what Alpine's `x-model` needs, which is what Magewire generates from the
+          `wire:model.defer` bindings Hyva Checkout uses for its address fields. Alpine syncs a
+          text input on 'input' only; it uses 'change' only for select/checkbox/radio.
+      DO NOT drop either event when re-vendoring the SDK: losing 'change' breaks Luma and the
+      admin, losing 'input' breaks Hyva Checkout (populated values are reverted by the next
+      Magewire re-render). Other node types are untouched by this change.
   */
 
   /*! Copyright © 2009-2025 Postcode Anywhere (Holdings) Ltd. (http://www.postcodeanywhere.co.uk)
@@ -3192,6 +3204,23 @@
           (nodeName === "input" && type === "file") ||
           (nodeName === "input" && type === "text")
         ) {
+          // LOCAL CHANGE (LOQ-17502): a text input must emit BOTH `input` and
+          // `change`, in that order (native semantics: `input` while editing,
+          // `change` on commit). Alpine's `x-model` - which Magewire generates
+          // from the `wire:model.defer` bindings Hyva Checkout uses - only syncs
+          // a text input to component state on `input`, while Knockout's `value`
+          // binding (Luma checkout) and the admin Magento UI components only
+          // listen for `change`. Dispatching just one of the two breaks one of
+          // the two front ends. Only text inputs are widened here: `select`,
+          // `input[type=file]` and every other supported type keep their
+          // upstream behaviour.
+          if (nodeName === "input" && type === "text") {
+            // Dispatch input.
+            event = document.createEvent("HTMLEvents");
+            event.initEvent("input", true, false);
+            node.dispatchEvent(event);
+          }
+
           // IE9-IE11, non-IE
           // Dispatch change.
           event = document.createEvent("HTMLEvents");
@@ -8076,17 +8105,48 @@
         },
       });
 
-      const regionSelectFields = addressFieldsWithElements.filter(
-        (field) =>
-          field.field === "ProvinceName" &&
-          field.element &&
-          field.element.tagName === "SELECT"
-      );
+      /**
+       * The region can be mapped to more than one element (Magento renders both a
+       * `region` text input and a `region_id` select), so every ProvinceName
+       * entry is kept and only the ones that resolve to a `<select>` are mapped.
+       *
+       * The names are kept as strings rather than the elements resolved at init:
+       * a `region_id` select is frequently rendered after this point - Magewire
+       * re-renders the Hyva Checkout address form, and Magento loads the region
+       * list on demand once a country is chosen - so an element snapshotted now
+       * would be null forever. It is resolved from the DOM on every populate
+       * instead.
+       *
+       * No `mode & pca.fieldMode.POPULATE` filter is needed: every ProvinceName
+       * entry in all three mappings (`default`, `billingFields`,
+       * `shippingFields`) already carries POPULATE, and `country_id` - the only
+       * non-POPULATE entry in any of them - is excluded structurally because its
+       * `field` is `CountryIso2`, not `ProvinceName`. Add the mode check here if
+       * a future mapping ever gains a ProvinceName entry without POPULATE, so it
+       * is not silently acted on.
+       */
+      const regionFieldNames = fieldMapping
+        .filter((field) => field.field === "ProvinceName")
+        .map((field) => field.element);
 
-      if (regionSelectFields.length) {
+      if (regionFieldNames.length) {
         control.listen("populate", function (details) {
-          regionSelectFields.forEach((regionField) => {
-            mapRegionSelectValueWithRetry(regionField.element, details);
+          regionFieldNames.forEach((name) => {
+            const element = getElementByName(name, context);
+
+            if (!element || element.tagName !== "SELECT") {
+              return;
+            }
+
+            // `pca.setValue` returns as soon as it has set `selectedIndex` on a
+            // select, so it skips `pca.reactTriggerChange` and the select is
+            // updated without a single event being dispatched. It also only
+            // matches an option on its exact value or label, which misses the
+            // region codes Magento carries in data attributes. This resolves the
+            // option itself and dispatches the change event a select needs - the
+            // event Knockout, the admin UI components and Alpine's `x-model` all
+            // listen for on a select.
+            mapRegionSelectValueWithRetry(element, details);
           });
         });
       }

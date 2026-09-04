@@ -1,0 +1,17 @@
+{
+  "name": "loqate-magento-js-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "JavaScript test suite for the vendored Loqate capture SDK (view/base/web/capture.js).",
+  "license": "OSL-3.0",
+  "scripts": {
+    "test": "node --test --test-reporter=spec \"Test/js/**/*.test.mjs\""
+  },
+  "devDependencies": {
+    "alpinejs": "3.16.3",
+    "jsdom": "30.0.1"
+  },
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  }
+}

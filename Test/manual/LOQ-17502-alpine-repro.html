@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LOQ-17502 — Alpine x-model binding demonstration (not a test of capture.js)</title>
+<!--
+  LOQ-17502 — Alpine `x-model` binding demonstration.
+
+  READ THIS FIRST: this page does NOT verify the fix
+  -------------------------------------------------
+  It never loads `view/base/web/capture.js`. The event dispatch it exercises is a
+  dozen lines of its own, in `populate()` below. So it can show what Alpine does
+  when it is given, or not given, an `input` event — and nothing more. It cannot
+  show that the shipped script sends one.
+
+  What does exercise the real script is the automated JS suite: `npm test` (Node's
+  built-in test runner, jsdom plus real Alpine from npm) over `Test/js/`. Those
+  tests load the actual `capture.js` and assert the event contract on it. CI runs
+  the suite as its own job. A manual pass on a real Hyva Checkout is still
+  required on top of both — nothing automated runs against Hyva Checkout itself.
+  See `Test/manual/LOQ-17502-manual-qa.md`.
+
+  What this page IS for
+  ---------------------
+  Understanding WHY the defect happened, which neither a unit test nor a QA script
+  explains well.
+
+  Hyva Checkout binds its address fields with Magewire's `wire:model.defer`.
+  Magewire (Livewire v3 derived) rewrites that into an Alpine `x-model` with the
+  `defer`/`lazy` modifiers stripped, and Alpine chooses its listener as:
+
+      el.tagName === 'select' || ['checkbox','radio'].includes(el.type)
+          || modifiers.includes('lazy')  ?  'change'  :  'input'
+
+  So a plain text input is synced to the component state on `input` ONLY; a
+  `change` event is never observed. On the next commit Magewire re-renders the
+  section from its own (still empty) state and morphs the stale value back into
+  the DOM — the wipe. Every field below is bound with a real Alpine `x-model`, so
+  that half is not simulated. The Magewire commit/morph is modelled by
+  `commitAndRerender()`: take whatever Alpine holds, round-trip it through a fake
+  server, write it back into the DOM. That is what morphdom does.
+
+  The shipped fix, for reference (it lives in the SDK, not here)
+  -------------------------------------------------------------
+  The fix is in the SDK's own event dispatcher, `pca.reactTriggerChange`
+  (`view/base/web/capture.js:3202-3228`). An `input[type=text]` now emits exactly
+  one bubbling `input` (lines 3218-3223) followed by exactly one bubbling `change`
+  (lines 3225-3228), in that order — native semantics: `input` while editing,
+  `change` on commit. `select`, `input[type=file]`, checkbox, radio, textarea and
+  every other `supportedInputTypes` key are unchanged.
+
+  Because it sits in the dispatcher rather than on the control's `populate` event,
+  it covers every path the SDK writes a field from: the populate loop
+  (`capture.js:7354`), the drill-down `filterSearch` write back to the search
+  field (`capture.js:7165`), the country list's `hide` restore of the stored
+  search (`capture.js:6549`) and `address.clear()` (`capture.js:7609`).
+
+  Usage
+  -----
+  Open this file in a browser (needs network access for the Alpine CDN script) and
+  press "Run both scenarios". Scenario A (`change` only, the old dispatcher) loses
+  the populated values from the component state; scenario B (`input` then `change`,
+  the new dispatcher) keeps them.
+-->
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .5rem; }
+  p.lede { margin: 0 0 1rem; opacity: .75; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .75rem 1rem; }
+  label { display: block; font-weight: 600; font-size: .8rem; margin-bottom: .2rem; }
+  input, select { width: 100%; box-sizing: border-box; padding: .4rem .5rem; font: inherit; }
+  .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+  button { padding: .5rem .8rem; font: inherit; cursor: pointer; }
+  button.primary { font-weight: 600; }
+  pre { padding: .75rem; overflow-x: auto; border: 1px solid currentColor; border-radius: 4px; opacity: .9; }
+  .pass { color: #0a7d33; font-weight: 700; }
+  .fail { color: #b3261e; font-weight: 700; }
+  .note { opacity: .7; font-size: .85rem; }
+  .warn { border: 2px solid #b3261e; border-radius: 4px; padding: .75rem 1rem; margin: 0 0 1.5rem; }
+  .warn strong { color: #b3261e; }
+  fieldset { border: 1px solid currentColor; border-radius: 4px; padding: 1rem; margin: 0 0 1rem; }
+  legend { font-weight: 700; padding: 0 .4rem; }
+</style>
+</head>
+<body>
+
+<h1>LOQ-17502 &mdash; why a populate that fires only <code>change</code> is lost on Hyv&auml;</h1>
+<p class="lede">
+  Every field below is bound with a real Alpine <code>x-model</code>, exactly as Magewire
+  rewrites Hyv&auml; Checkout's <code>wire:model.defer</code>. "Component state" is what a
+  Magewire commit would send to the server &mdash; if a populated value is missing from it,
+  that value is already lost.
+</p>
+
+<p class="warn">
+  <strong>This page does not verify the fix.</strong> It never loads
+  <code>view/base/web/capture.js</code>; the dispatch below is a model of it, written by hand.
+  It demonstrates <em>Alpine's binding behaviour</em> &mdash; that a text input synced by
+  <code>x-model</code> needs <code>input</code>, and that a value which never reached component
+  state is lost on the next commit and morph. What exercises the real script is the automated
+  suite: <code>npm test</code> over <code>Test/js/</code>, which loads the actual
+  <code>capture.js</code>. A manual pass on a real Hyv&auml; Checkout is still required; see
+  <code>Test/manual/LOQ-17502-manual-qa.md</code>.
+</p>
+
+<div x-data="harness()" x-init="init()">
+
+  <fieldset>
+    <legend>Shipping address (Alpine <code>x-model</code> bound)</legend>
+    <div class="grid">
+      <div>
+        <label for="street0">street[0] &mdash; <span class="note">text</span></label>
+        <input id="street0" name="street[0]" type="text" x-model="form.street0">
+      </div>
+      <div>
+        <label for="street1">street[1] &mdash; <span class="note">text, blank in this retrieve</span></label>
+        <input id="street1" name="street[1]" type="text" x-model="form.street1">
+      </div>
+      <div>
+        <label for="company">company &mdash; <span class="note">text, POPULATE|PRESERVE, blank</span></label>
+        <input id="company" name="company" type="text" x-model="form.company">
+      </div>
+      <div>
+        <label for="city">city &mdash; <span class="note">text</span></label>
+        <input id="city" name="city" type="text" x-model="form.city">
+      </div>
+      <div>
+        <label for="postcode">postcode &mdash; <span class="note">text</span></label>
+        <input id="postcode" name="postcode" type="text" x-model="form.postcode">
+      </div>
+      <div>
+        <label for="region_id">region_id &mdash; <span class="note">select</span></label>
+        <select id="region_id" name="region_id" x-model="form.region_id">
+          <option value="">Please select a region</option>
+          <option value="121">Noord-Brabant</option>
+          <option value="122">Noord-Holland</option>
+          <option value="123">Zuid-Holland</option>
+        </select>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Somewhere else on the form</legend>
+    <label for="telephone">telephone &mdash; <span class="note">focusing this commits, like Hyv&auml;'s wire:auto-save</span></label>
+    <input id="telephone" name="telephone" type="text" x-model="form.telephone"
+           @focus="commitAndRerender('focus moved to telephone')">
+  </fieldset>
+
+  <div class="actions">
+    <button class="primary" @click="runBothScenarios()">Run both scenarios</button>
+    <button @click="reset(); populate('before')">Populate &mdash; before the fix (change only)</button>
+    <button @click="reset(); populate('after')">Populate &mdash; after the fix (input, then change)</button>
+    <button @click="commitAndRerender('manual commit')">Commit + re-render</button>
+    <button @click="reset()">Reset</button>
+  </div>
+
+  <h2>Component state <span class="note">(what a Magewire commit would send)</span></h2>
+  <pre x-text="JSON.stringify(form, null, 2)"></pre>
+
+  <h2>Result</h2>
+  <pre x-html="report"></pre>
+
+</div>
+
+<script>
+/**
+ * The address the Loqate retrieve service returns for "Fatimastraat 19", as the
+ * capture script would map it onto the module's `default` field mapping. Note
+ * that two of the fields come back blank, which is normal.
+ */
+const RETRIEVED = {
+  street0:   'Fatimastraat 19',
+  street1:   '',
+  company:   '',
+  city:      'Oss',
+  postcode:  '5348 LC',
+  region_id: '121'
+};
+
+/** Text fields with a value, whose populate must survive a commit. */
+const TEXT_FIELDS = ['street0', 'city', 'postcode'];
+
+/** Text fields the retrieve returns blank. They are written and dispatched too. */
+const BLANK_FIELDS = ['street1', 'company'];
+
+function harness() {
+  return {
+    form: {},
+    server: {},
+    report: 'Press "Run both scenarios".',
+
+    init() { this.reset(); },
+
+    reset() {
+      this.form = {
+        street0: '', street1: '', company: '', city: '',
+        postcode: '', region_id: '', telephone: ''
+      };
+      this.server = { ...this.form };
+    },
+
+    /* ------------------------------------------------------------------ *
+     * The two dispatch policies, MODELLED. This is not the real code — see
+     * the warning at the top of the file — but it models what the real
+     * dispatcher does, and no more than that.
+     *
+     * 'before' is what `pca.reactTriggerChange` did up to v2.1.1: a text input
+     *   was matched by the `select`/`input[type=file]` branch and therefore got
+     *   a `change` event, and nothing else.
+     *
+     * 'after' is what it does now (`capture.js:3202-3228`): a text input emits
+     *   one bubbling `input` (lines 3218-3223) and then one bubbling `change`
+     *   (lines 3225-3228), in that order.
+     *
+     * The region `<select>` behaves the same in both scenarios, for an unrelated
+     *   reason: `pca.setValue` returns as soon as it has set `selectedIndex` on a
+     *   select (`capture.js:3364-3373`), so it never reaches the dispatcher and
+     *   the SDK sends no event at all. The module's own `populate` listener
+     *   resolves the option and dispatches the `change` a select needs
+     *   (`capture.js:8120-8144`) — and `change` is exactly what Alpine listens
+     *   for on a select, so the region always worked.
+     *
+     * There is deliberately NO filter on the value here: the real code writes
+     * and dispatches for empty values too (`street[1]` and `company` come back
+     * blank from this retrieve, and `address.clear()` blanks every field), so
+     * this models the same policy. Only a missing element is skipped.
+     * ------------------------------------------------------------------ */
+    populate(strategy) {
+      Object.keys(RETRIEVED).forEach((key) => {
+        const el = document.getElementById(key);
+        if (!el) return;
+
+        el.value = RETRIEVED[key];
+
+        if (el.tagName === 'SELECT') {
+          // Stands in for mapRegionSelectValueWithRetry(); see the note above.
+          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          return;
+        }
+
+        // Text input. Order matters: `input` while editing, `change` on commit.
+        if (strategy === 'after') {
+          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: false }));
+        }
+
+        el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+      });
+    },
+
+    /**
+     * Stand-in for a Magewire commit: whatever the component holds is sent to the
+     * server, and the response is morphed back over the DOM. Values the component
+     * never learned about are overwritten with the stale ones — the reported wipe.
+     */
+    commitAndRerender(trigger) {
+      this.server = { ...this.form };                       // request
+      Object.keys(this.server).forEach((key) => {           // morph the response in
+        const el = document.getElementById(key);
+        if (el) el.value = this.server[key];
+        this.form[key] = this.server[key];
+      });
+      console.log('[LOQ-17502] commit + re-render (' + trigger + ')', { ...this.server });
+    },
+
+    /** Before/after demonstration over the populated fields. */
+    runBothScenarios() {
+      const lines = [];
+      let brokeAsExpected = false;
+      let fixedHolds = true;
+      let blanksHold = true;
+
+      ['before', 'after'].forEach((strategy) => {
+        this.reset();
+        this.populate(strategy);
+        this.commitAndRerender('automated ' + strategy);
+
+        const survived = TEXT_FIELDS.filter((k) => this.form[k] === RETRIEVED[k]);
+        const lost     = TEXT_FIELDS.filter((k) => this.form[k] !== RETRIEVED[k]);
+        const ok       = lost.length === 0;
+        const blanksOk = BLANK_FIELDS.every((k) => this.form[k] === '');
+
+        if (strategy === 'before') brokeAsExpected = !ok;
+        if (strategy === 'after')  fixedHolds = ok;
+        blanksHold = blanksHold && blanksOk;
+
+        lines.push(
+          (strategy === 'before'
+            ? 'A. Before the fix (change only)       '
+            : 'B. After the fix (input, then change) ') +
+          (ok ? '<span class="pass">values survived</span>'
+              : '<span class="fail">values wiped: ' + lost.join(', ') + '</span>') +
+          (survived.length ? '\n   survived: ' + survived.join(', ') : '') +
+          '\n   region_id (select): ' +
+          (this.form.region_id === RETRIEVED.region_id
+            ? '<span class="pass">survived</span>' : '<span class="fail">wiped</span>') +
+          '\n   blank-valued fields (' + BLANK_FIELDS.join(', ') + '), written and ' +
+          'dispatched like any other: ' +
+          (blanksOk ? '<span class="pass">still blank</span>'
+                    : '<span class="fail">unexpected value</span>')
+        );
+      });
+
+      const verdict = (brokeAsExpected && fixedHolds && blanksHold)
+        ? '<span class="pass">BEHAVIOUR DEMONSTRATED</span> — A loses the populated values, '
+          + 'B keeps them.\nThis says nothing about the shipped capture.js: run `npm test` '
+          + 'for that, and the\nHyv&auml; pass in LOQ-17502-manual-qa.md for the real checkout.'
+        : '<span class="fail">BEHAVIOUR NOT DEMONSTRATED</span> — expected A to lose the values '
+          + 'and B to keep them,\nwith the blank fields left blank in both. Check that Alpine '
+          + 'loaded (the CDN script\nneeds network access).';
+
+      this.reset();
+      this.report = lines.join('\n\n') + '\n\n' + verdict;
+    }
+  };
+}
+</script>
+</body>
+</html>
