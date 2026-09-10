@@ -126,6 +126,62 @@ predate it and are described by their git tags and commit history.
 
 ### Fixed
 
+- **Every Loqate API call the module makes failed on PHP 8.5, and works again**
+  (LOQ-17709). Reported by a merchant on Magento 2.4.9 / PHP 8.5. Address lookup and
+  retrieve, the email and phone checks, the single and batch address verifications and
+  set-country-by-IP all returned an error envelope instead of a result — 100% of the
+  time, in production and developer mode alike — so the lookup offered no suggestions,
+  every verification came back as a fault, and the checkout and customer address forms
+  stopped pre-selecting the shopper's country. The map's reverse-geocode lookup never
+  broke: the browser asks Loqate for that one directly, never this module's PHP.
+
+  It is a deprecation promoted to an exception: PHP 8.5 deprecated `curl_close()`, and
+  the `lqt/api-connector` dependency called it after every request in
+  `src/Client/Http/HttpClient.php` (this module makes no cURL calls of its own). On
+  Magento that is not a log line. `app/bootstrap.php` calls `error_reporting(E_ALL)`
+  unconditionally, and `Magento\Framework\App\ErrorHandler`, which throws on
+  `E_DEPRECATED`, is installed by both entry points: by
+  `Magento\Framework\App\Bootstrap::run()` on the web path, before it consults
+  `MAGE_MODE` at all, and by `bin/magento` itself before it runs the CLI application —
+  so the CLI paths that carry the batch verification (customer import, cron, the
+  consumers) failed exactly as web requests did. The throw lands inside
+  `HttpClient::get()` and `::post()` before either returns, and the SDK's own `catch
+  (Throwable)` turns it into `['error' => true, 'message' => …]`, which the module acts
+  on and `Helper/Controller.php:159` writes to `var/log/`. The handler adds its own
+  level, file and line around PHP's wording, so **the string to grep for is**
+  `Deprecated Functionality: Function curl_close() is deprecated since 8.5, as it has no
+  effect since PHP 8.0 in …/Client/Http/HttpClient.php on line 28` (line 51 on the
+  address verifications, which POST). PHP 8.5 is itself past Adobe's platform matrix for
+  2.4.9, which stops at 8.4, but `app/bootstrap.php` enforces only `>= 8.1.0`, so
+  nothing stops a merchant running it.
+
+  The fix is upstream, in the next `lqt/api-connector` patch release (expected
+  **1.1.3**), which drops the SDK's reference to the handle with `unset()` instead of
+  calling `curl_close()`. On PHP 8 that function was already a no-op — the handle is a
+  garbage-collected object, freed when the method returned — so `unset()` now frees it a
+  few statements earlier, at the same point in the code. On PHP 7, where the handle is a
+  refcounted resource, `unset()` frees it at exactly the statement `curl_close()` used
+  to. **Nothing changes for merchants on PHP 8.3 or 8.4**: the requests sent, the
+  responses parsed and the errors the module raises from them are identical there. On
+  8.5 the change is the difference between every call failing and every call working.
+
+  **To pick it up, name the package: `composer update lqt/api-connector`**, and check
+  the result with `composer show lqt/api-connector`, which must report 1.1.3 or later.
+  It needs that SDK release to be published. No version bump of this module is required
+  and none would help: the existing `"lqt/api-connector": "^1.1"` constraint is already
+  satisfied by 1.1.2, so Composer will not move it unless the package is named. Do not
+  run a bare `composer update` in a Magento root — that updates the whole install's
+  dependency tree.
+
+  CI now also runs the module's unit suite on PHP 8.5, alongside 8.3 and 8.4. That is
+  PHP 8.5 coverage for the module, **not** a regression guard for this defect, for two
+  reasons: the suite makes no HTTP requests at all and stays green with the unfixed SDK
+  in `vendor/`, and `phpunit.xml.dist` sets `failOnWarning` and `failOnRisky` but not
+  `failOnDeprecation`, so even a test that did drive the real `HttpClient` would pass.
+  The guard for this defect lives in the SDK repository instead (`composer test`), which
+  drives `HttpClient` at a local stub under a throwing error handler on PHP 7.0 through
+  8.5.
+
 - **An address picked from the lookup no longer empties itself again on Hyvä
   Checkout** (LOQ-17502). The shopper searched, picked a suggestion, watched city,
   postcode and region fill in, and then lost them the moment focus moved to another
