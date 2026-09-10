@@ -155,8 +155,8 @@ predate it and are described by their git tags and commit history.
   2.4.9, which stops at 8.4, but `app/bootstrap.php` enforces only `>= 8.1.0`, so
   nothing stops a merchant running it.
 
-  The fix is upstream, in the next `lqt/api-connector` patch release (expected
-  **1.1.3**), which drops the SDK's reference to the handle with `unset()` instead of
+  The fix is upstream, in `lqt/api-connector` **1.1.3**, which is released and on
+  Packagist. It drops the SDK's reference to the handle with `unset()` instead of
   calling `curl_close()`. On PHP 8 that function was already a no-op — the handle is a
   garbage-collected object, freed when the method returned — so `unset()` now frees it a
   few statements earlier, at the same point in the code. On PHP 7, where the handle is a
@@ -165,22 +165,32 @@ predate it and are described by their git tags and commit history.
   responses parsed and the errors the module raises from them are identical there. On
   8.5 the change is the difference between every call failing and every call working.
 
-  **To pick it up, name the package: `composer update lqt/api-connector`**, and check
-  the result with `composer show lqt/api-connector`, which must report 1.1.3 or later.
-  It needs that SDK release to be published. No version bump of this module is required
-  and none would help: the existing `"lqt/api-connector": "^1.1"` constraint is already
-  satisfied by 1.1.2, so Composer will not move it unless the package is named. Do not
-  run a bare `composer update` in a Magento root — that updates the whole install's
-  dependency tree.
+  **To pick it up, upgrade this module to v2.1.3 or later.** That release requires
+  `"lqt/api-connector": "^1.1.3"`, so the fixed SDK is installed with it and no separate
+  step is needed. A merchant who stays on an older module version can still take the fix
+  by naming the package — `composer update lqt/api-connector` — because those releases
+  carry the looser `"^1.1"` constraint, which 1.1.2 already satisfies, so Composer will
+  not move the SDK unless it is named. Either way, check the result with `composer show
+  lqt/api-connector`, which must report 1.1.3 or later. Do not run a bare `composer
+  update` in a Magento root — that updates the whole install's dependency tree.
 
-  CI now also runs the module's unit suite on PHP 8.5, alongside 8.3 and 8.4. That is
-  PHP 8.5 coverage for the module, **not** a regression guard for this defect, for two
-  reasons: the suite makes no HTTP requests at all and stays green with the unfixed SDK
-  in `vendor/`, and `phpunit.xml.dist` sets `failOnWarning` and `failOnRisky` but not
-  `failOnDeprecation`, so even a test that did drive the real `HttpClient` would pass.
-  The guard for this defect lives in the SDK repository instead (`composer test`), which
-  drives `HttpClient` at a local stub under a throwing error handler on PHP 7.0 through
-  8.5.
+  CI now also runs the module's unit suite on PHP 8.5, alongside 8.3 and 8.4, and the
+  suite carries a module-side regression guard for this defect:
+  `Test/Unit/Dependency/ApiConnectorCompletesRequestsTest.php` drives the real vendored
+  `HttpClient` — one case for `get()`, one for `post()`, the two call sites that broke —
+  over a real socket at a stub endpoint on `127.0.0.1`, under a replica of Magento's
+  throwing `ErrorHandler` with `error_reporting(E_ALL)`, and asserts that the decoded
+  response body comes back. It needs no API key, no network and no billable request, and
+  on PHP 8.5 it fails against the unfixed 1.1.2 — which is what makes the `^1.1.3`
+  constraint an enforced guarantee rather than a hopeful one.
+
+  **That guard only has teeth on the 8.5 leg.** `curl_close()` is not deprecated below
+  8.5, so the same test passes on 8.3 and 8.4 even with the unfixed SDK in `vendor/`. It
+  also installs that error handler and widens `error_reporting()` itself, because
+  `phpunit.xml.dist` sets `failOnWarning` and `failOnRisky` but not `failOnDeprecation`
+  — PHPUnit alone would not fail the run on the deprecation. The SDK repository keeps
+  its own guard as well (`composer test`), which drives `HttpClient` at a local stub
+  under a throwing error handler on PHP 7.0 through 8.5.
 
 - **An address picked from the lookup no longer empties itself again on Hyvä
   Checkout** (LOQ-17502). The shopper searched, picked a suggestion, watched city,
