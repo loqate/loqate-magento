@@ -177,7 +177,7 @@ async function startStubServer({ find, retrieve }) {
  * `region_id` options in which the region name is in BOTH the option text and
  * `data-title`. This is the shape Magento renders for GB, and it is matched by
  * `pca.setValue` itself: its SELECT loop compares `option.text` and
- * `option.value` (capture.js:3364-3372), finds "Kent", sets `selectedIndex` and
+ * `option.value`, finds "Kent", sets `selectedIndex` and
  * returns early - which is exactly why the select never gets an event from
  * `pca.reactTriggerChange` and needs `mapRegionSelectValue` to dispatch one.
  */
@@ -190,7 +190,7 @@ export const TEXT_MATCHED_REGION_OPTIONS = `
  * equal the Loqate ProvinceName, and the region code lives in a data attribute.
  * This is the other shape Magento renders in the wild, and it is the one
  * `pca.setValue` cannot match at all - only `mapRegionSelectValue`'s
- * `data-code` / `data-region-code` candidates do (capture.js:7946-7952).
+ * `data-code` / `data-region-code` candidates do.
  *
  * Retrieve `ProvinceName: "KEN"` matches option 1 on `data-code`;
  * `ProvinceName: "SRY"` matches option 2 on `data-region-code`. Neither matches
@@ -201,7 +201,7 @@ export const CODE_MATCHED_REGION_OPTIONS = `
       <option value="44" data-title="Surrey" data-region-code="SRY">Surrey County</option>`;
 
 /**
- * The `default` field mapping from capture.js:7787-7817 expects exactly these
+ * The `fieldMappings.default` mapping in capture.js expects exactly these
  * `name` attributes. The anchor is `input[name="street[0]"]` and the lookup
  * context is `anchorElement.closest("form")`, hence the `<form>` wrapper.
  *
@@ -241,8 +241,8 @@ function addressFormHtml({
  * own bootstrap creates, and can count how many times it is constructed.
  *
  * This is safe to do from a separate <script> because capture.js resolves
- * `pca.Address` as a property lookup at call time (`new pca.Address(...)`,
- * capture.js:8097), and `loqateInit` is deferred to DOMContentLoaded - i.e. it
+ * `pca.Address` as a property lookup at call time (`new pca.Address(...)` in
+ * `initializeLoqateForField`), and `loqateInit` is deferred to DOMContentLoaded - i.e. it
  * runs after this script has installed the wrapper.
  */
 const ADDRESS_SPY_SOURCE = `
@@ -298,11 +298,13 @@ export async function createHarness({
   retrieve = [retrieveItem()],
   alpine = false,
   regionOptions = TEXT_MATCHED_REGION_OPTIONS,
+  // Custom form markup (e.g. Hyva's `street` / `street[]` shapes); replaces the default form.
+  formHtml = addressFormHtml({ alpine, regionOptions }),
 } = {}) {
   const server = await startStubServer({ find, retrieve });
 
   // In-page diagnostics. `jsdomError` alone is not enough: the SDK reports a
-  // misconfigured harness through `console.error` - capture.js:7999,
+  // misconfigured harness through `console.error` - `loqateInit` logs
   // 'Element with ID "loqate-urls" not found', after which it returns and never
   // initialises - and swallowing that turns a configuration mistake into a
   // mysterious assertion failure several lines later. `console.warn` is captured
@@ -325,7 +327,7 @@ export async function createHarness({
   <body>
     <!-- capture.js refuses to initialise without this element. -->
     <div id="loqate-urls" data-find-url="/find" data-retrieve-url="/retrieve"></div>
-    ${addressFormHtml({ alpine, regionOptions })}
+    ${formHtml}
     ${alpine ? `<script>${alpineSource()}<\/script>` : ""}
     <script>${CAPTURE_JS_SOURCE}<\/script>
     <script>${ADDRESS_SPY_SOURCE}<\/script>
@@ -337,13 +339,13 @@ export async function createHarness({
    * it that way - this is load-bearing, so do not add `resources: "usable"`:
    *
    *   - jsdom's default resource loader fetches nothing external, so the SDK's
-   *     four `preloadImage` calls (capture.js:7771-7778), which point at
+   *     four `preloadImage` calls, which point at
    *     `//services.postcodeanywhere.co.uk/images/...`, never leave the process:
    *     `new Image(); img.src = url` is inert without a usable resource loader.
    *   - the only other outbound call the SDK can make on its own is IP
    *     geolocation, and `options.setCountryByIP` defaults to `false`
-   *     (documented capture.js:6150, defaulted capture.js:6224-6227) and is not
-   *     enabled here, so `address.setCountryByIP` (capture.js:6700-6701) is
+   *     (see the `pca.Address` options docs) and is not
+   *     enabled here, so `address.setCountryByIP` is
    *     never reached.
    *
    * Every request the suite makes therefore goes to the local stub server, and
@@ -419,15 +421,15 @@ export async function createHarness({
 
     /**
      * Drives the SDK's own search UI: puts text in the search field and fires
-     * the keyup that capture.js binds (capture.js:1762-1788 - it binds
+     * the keyup that capture.js binds (`autocomplete.attach` - it binds
      * keyup/keydown/keypress/paste/click/dblclick/change and nothing else).
-     * Returns once the SDK has rendered suggestion items.
+     * Returns once the SDK has rendered suggestion items. Pass `element` to type
+     * into one of several same-named inputs.
      */
-    async search(text, { fieldName = "street[0]" } = {}) {
-      const element = field(fieldName);
+    async search(text, { fieldName = "street[0]", element = field(fieldName) } = {}) {
       element.focus();
       // keydown first: that is the handler which tells the SDK's autocomplete
-      // which field is being typed into (capture.js:2138-2143 -> autocomplete.focus).
+      // which field is being typed into (`autocomplete.keydown` -> `autocomplete.focus`).
       element.dispatchEvent(
         new window.KeyboardEvent("keydown", { bubbles: true, key: "g" })
       );
@@ -441,10 +443,14 @@ export async function createHarness({
       );
     },
 
-    /** The suggestion elements the SDK rendered in its own autocomplete list. */
+    /** The suggestion elements the SDK rendered in any control's autocomplete list. */
     suggestionElements() {
-      const list = this.control?.autocomplete?.list?.element;
-      return list ? Array.from(list.querySelectorAll(".pcaitem")) : [];
+      // Destroyed controls keep their .pcaitem children, so only search live ones.
+      return window.__pcaControls
+        .filter((c) => c.autocomplete?.element?.isConnected)
+        .flatMap((c) =>
+          Array.from(c.autocomplete?.list?.element?.querySelectorAll(".pcaitem") ?? [])
+        );
     },
 
     /** Clicks a rendered suggestion, exactly as a shopper would. */
@@ -457,8 +463,8 @@ export async function createHarness({
     },
 
     /** Search, click the first suggestion, and wait for the populate to land. */
-    async searchAndPick(text = "10 Downing") {
-      await this.search(text);
+    async searchAndPick(text = "10 Downing", { fieldName } = {}) {
+      await this.search(text, { fieldName });
       this.clickSuggestion(0);
       await this.waitFor(() => field("city").value !== "", {
         label: "the retrieved address to be written to the form",

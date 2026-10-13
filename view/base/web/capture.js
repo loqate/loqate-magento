@@ -7903,7 +7903,17 @@
 
   function getElementByName(name, context) {
     context = context || document;
-    return context.querySelector(`[name="${name}"]`);
+    const element = context.querySelector(`[name="${name}"]`);
+    // Hyva renders street lines as repeated `street[]` inputs, or one `street` input when there is a single line.
+    const line = !element && /^street\[(\d+)\]$/.exec(name);
+    if (!line) {
+      return element;
+    }
+    return (
+      context.querySelectorAll('[name="street[]"]')[line[1]] ||
+      (line[1] === "0" && context.querySelector('[name="street"]')) ||
+      null
+    );
   }
 
   function normalizeRegionValue(value) {
@@ -7991,6 +8001,7 @@
   function loqateInit() {
     const loqateElement = document.getElementById("loqate-urls");
     const pcaInstances = {};
+    let defaultInstanceCount = 0;
 
     if (loqateElement) {
       loqateFindUrl = loqateElement.getAttribute("data-find-url");
@@ -8006,17 +8017,23 @@
         let anchorElement;
         
         if (key === "default") {
-          // For default mapping, find ALL street[0] fields and initialize each separately
-          const allStreetFields = document.querySelectorAll('input[name="street[0]"]');
+          // Candidate street inputs (Luma street[0], Hyva street[]/street); non-Line1 ones are skipped below
+          const allStreetFields = document.querySelectorAll(
+            'input[name="street[0]"], input[name="street[]"], input[name="street"]'
+          );
           
+          // Release controls whose form has left the DOM so the map does not grow without bound.
+          for (const [instanceKey, instance] of Object.entries(pcaInstances)) {
+            if (instanceKey.startsWith(key + '_') && !instance.anchorElement.isConnected) {
+              instance.control.destroy();
+              delete pcaInstances[instanceKey];
+            }
+          }
+
           allStreetFields.forEach((streetField) => {
-            // Check if this field is already registered
-            const fieldId = streetField.id || streetField.name + '_' + Array.from(allStreetFields).indexOf(streetField);
-            const instanceKey = key + '_' + fieldId;
-            
-            if (pcaInstances[instanceKey]?.anchorElement && 
-                document.body.contains(pcaInstances[instanceKey].anchorElement)) {
-              return; // Skip if already registered
+            // Key by the input itself: Hyva forms reuse ids like `street_1`, and page order shifts as forms are inserted.
+            if (Object.values(pcaInstances).some((instance) => instance.anchorElement === streetField)) {
+              return;
             }
 
             anchorElement = streetField;
@@ -8032,9 +8049,14 @@
               anchorElement.closest(".shipping-address-form") ||
               anchorElement.closest('[data-bind]')?.parentElement ||
               document;
+
+            // Anchor only on the input that resolves as Line1 in its form; later `street[]` inputs are other lines.
+            if (getElementByName("street[0]", context) !== anchorElement) {
+              return;
+            }
             
             // Initialize for this specific field
-            initializeLoqateForField(key, value, anchorElement, context, instanceKey);
+            initializeLoqateForField(key, value, anchorElement, context, key + '_' + defaultInstanceCount++);
           });
           
           // Skip the rest of the loop for default mapping since we handled it above
@@ -8077,12 +8099,15 @@
     }
 
     function initializeLoqateForField(mappingKey, fieldMapping, anchorElement, context, instanceKey) {
-      const addressFieldsWithElements = fieldMapping.map((field) => {
-        return {
-          ...field,
-          element: getElementByName(field.element, context),
-        };
-      });
+      const addressFieldsWithElements = fieldMapping
+        .map((field) => {
+          return {
+            ...field,
+            element: getElementByName(field.element, context),
+          };
+        })
+        // Drop street lines the form lacks so pca folds their text into the lines it has (e.g. a single `street`).
+        .filter((field) => field.element || !/^Line[2-5]$/.test(field.field));
 
       // Check if all required fields are found
       if (!addressFieldsWithElements[0]?.element) {

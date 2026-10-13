@@ -18,7 +18,7 @@ import {
   CODE_MATCHED_REGION_OPTIONS,
 } from "./support/harness.mjs";
 
-/** The text fields the `default` mapping populates (capture.js:7787-7817). */
+/** The text fields the `default` mapping populates (`fieldMappings.default`). */
 const POPULATED_TEXT_FIELDS = [
   "street[0]",
   "street[1]",
@@ -76,8 +76,8 @@ describe("(a) populate event contract", () => {
 
   test("the region_id select still receives its change event", () => {
     // Load-bearing: pca.setValue matches the "Kent" option on its TEXT and returns
-    // early for a SELECT (capture.js:3364-3372), so the change comes from
-    // mapRegionSelectValue's own dispatch (capture.js:7961, via
+    // early for a SELECT, so the change comes from
+    // mapRegionSelectValue's own dispatch (via
     // mapRegionSelectValueWithRetry). Knockout, the admin UI components and
     // Alpine all need it. A select must NOT get an `input`.
     assert.deepEqual(recorder.types("region_id"), ["change"]);
@@ -88,7 +88,7 @@ describe("(a) populate event contract", () => {
 describe("(c) F2 regression paths that bypass the populate event", () => {
   test("drill-down (filterSearch) emits input then change on the search field", async () => {
     // Arrange: a non-Address suggestion, which sends address.select down the
-    // filterSearch branch (capture.js:7181-7187 -> 7164-7169).
+    // `filterSearch` branch of the suggestion select handler.
     const harness = await createHarness({
       find: [
         findItem({
@@ -108,7 +108,7 @@ describe("(c) F2 regression paths that bypass the populate event", () => {
 
       // Act: click the container suggestion, exactly as a shopper would.
       harness.clickSuggestion(0);
-      // filterSearch rewrites the field and THEN searches (capture.js:7165-7178),
+      // filterSearch rewrites the field and THEN searches,
       // so waiting on the follow-up find also guarantees the rewrite has landed.
       // A fixed sleep here would be a race on a loaded runner.
       await harness.waitFor(
@@ -135,7 +135,7 @@ describe("(c) F2 regression paths that bypass the populate event", () => {
     // clicked here. The country list is opened and closed by calling the SDK's own
     // `switchToCountrySelect()` and `countrylist.autocomplete.hide()`. `hide()` is
     // the method the real UI calls, and it fires the `hide` event whose listener
-    // (capture.js:6548-6552) is the code under test. So the handler under test is
+    // (the countrylist autocomplete `hide` listener) is the code under test. So the handler under test is
     // the real one, but the route into it is an SDK API call rather than a click.
     const harness = await createHarness();
 
@@ -199,7 +199,7 @@ describe("(d) a synthetic input event is never billable", () => {
       await harness.tick(200);
 
       // Assert: capture.js binds keyup/keydown/keypress/paste/click/dblclick/
-      // change (capture.js:1762-1788, 1812-1837) and never `input`, so nothing
+      // change (`autocomplete.attach`) and never `input`, so nothing
       // was requested.
       assert.equal(harness.server.requests.find, 0, "no find request");
       assert.equal(harness.server.requests.retrieve, 0, "no retrieve request");
@@ -235,7 +235,7 @@ describe("(e) the control is constructed once", () => {
       // Arrange / Assert: one instance after the module's bootstrap.
       assert.equal(harness.addressConstructions, 1);
 
-      // Act: wake the MutationObserver (capture.js:8071-8079, debounced 50ms)
+      // Act: wake the MutationObserver (`loqateInit`'s `scanForFields`, debounced 50ms)
       // with unrelated DOM churn, twice, and wait well past the debounce. These
       // waits stay time-based deliberately: the assertion is that a debounced
       // callback did NOT construct a second control, so there is no condition to
@@ -271,9 +271,9 @@ describe("(f) region select matched by data attribute, not by option text", () =
   // The form used here is the OTHER shape Magento renders in the wild: the option
   // text is a display label ("Kent County") that does not equal the Loqate
   // ProvinceName, and the region code lives in a data attribute. `pca.setValue`
-  // compares only `option.value` and `option.text` (capture.js:3364-3372), so it
+  // compares only `option.value` and `option.text`, so it
   // matches nothing at all; `mapRegionSelectValue` also tries `data-title`,
-  // `data-code` and `data-region-code` (capture.js:7946-7952), and it is those
+  // `data-code` and `data-region-code` (`mapRegionSelectValue`), and it is those
   // attributes - not the text - that resolve the option here. The text-matching
   // shape stays covered by suite (a), which uses the default form.
 
@@ -294,7 +294,7 @@ describe("(f) region select matched by data attribute, not by option text", () =
       const select = harness.field("region_id");
       assert.equal(select.value, "43", "the Kent County option is selected");
       assert.equal(select.selectedIndex, 1);
-      // capture.js:7960 also mirrors the value onto the attribute, which is what
+      // `mapRegionSelectValue` also mirrors the value onto the attribute, which is what
       // survives a Magewire morph that re-reads attributes.
       assert.equal(select.getAttribute("value"), "43");
 
@@ -333,7 +333,7 @@ describe("(f) region select matched by data attribute, not by option text", () =
 
   test("data-region-code resolves the option when data-code is absent", async () => {
     // Arrange: ProvinceName "SRY" matches option 2 only on data-region-code -
-    // the last candidate before `option.value` (capture.js:7946-7952).
+    // the last candidate before `option.value` in `mapRegionSelectValue`.
     const harness = await createHarness({
       regionOptions: CODE_MATCHED_REGION_OPTIONS,
       retrieve: [retrieveItem({ ProvinceName: "SRY" })],
@@ -371,7 +371,7 @@ describe("(f) region select matched by data attribute, not by option text", () =
       const recorder = harness.recordEvents(["region_id"]);
       await harness.searchAndPick();
       // mapRegionSelectValueWithRetry retries at 75/150/300/600ms and then gives
-      // up (capture.js:7971-7989); wait past the whole ladder. Time-based on
+      // up (`mapRegionSelectValueWithRetry`); wait past the whole ladder. Time-based on
       // purpose: the assertion is that nothing further happens.
       await harness.tick(1400);
 
@@ -392,13 +392,13 @@ describe("(f) region select matched by data attribute, not by option text", () =
      * to be changed for this.
      *
      * When `pca.setValue`'s SELECT loop matches an option it sets `selectedIndex`
-     * and RETURNS (capture.js:3364-3372) - that is the text-matching case covered
+     * and RETURNS - that is the text-matching case covered
      * by suite (a), where the select gets exactly one change. When it matches
-     * NOTHING it does not return: it falls through to capture.js:3382-3387 and
+     * NOTHING it does not return: it falls through to its react-trigger branch and
      * calls `pca.reactTriggerChange(element)`, which for a select dispatches a
-     * `change` (capture.js:3202-3217) while the select still holds its OLD value.
+     * `change` while the select still holds its OLD value.
      * `mapRegionSelectValue` then resolves the option properly and dispatches a
-     * second `change` with the correct value (capture.js:7961).
+     * second `change` with the correct value.
      *
      * So a consumer sees change("") then change("43"). Both Knockout and Alpine
      * re-read `event.target.value` on every change, so they converge on the
