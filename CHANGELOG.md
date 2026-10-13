@@ -126,6 +126,12 @@ predate it and are described by their git tags and commit history.
 
 ### Fixed
 
+- **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
+  `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
+  Edit/New page and the Hyvä checkout "Add new address" modal now get Capture; before,
+  it silently did not. On any theme, including Luma and admin set to 1 street line, a
+  form with fewer street inputs than address lines folds every line into the ones it has.
+
 - **Every Loqate API call the module makes failed on PHP 8.5, and works again**
   (LOQ-17709). Reported by a merchant on Magento 2.4.9 / PHP 8.5. Address lookup and
   retrieve, the email and phone checks, the single and batch address verifications and
