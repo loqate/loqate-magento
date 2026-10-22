@@ -1,4 +1,5 @@
-FROM php:8.4-fpm
+# Patched PHP for CVE-2026-109618/109619 (LOQ-19163).
+FROM php:8.4.27-fpm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
