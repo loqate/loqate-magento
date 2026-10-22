@@ -32,6 +32,14 @@ jobs:
       fail-fast: false
       matrix:
         php-version: ['8.3', '8.4', '8.5']
+        # Patched floors for CVE-2026-109618/109619 (LOQ-19163).
+        include:
+          - php-version: '8.3'
+            php-min: '8.3.36'
+          - php-version: '8.4'
+            php-min: '8.4.27'
+          - php-version: '8.5'
+            php-min: '8.5.12'
 
     steps:
       - name: Checkout code
@@ -44,6 +52,16 @@ jobs:
           extensions: mbstring, dom, libxml, tokenizer, xml, xmlwriter, simplexml, curl, intl
           coverage: none
           tools: composer:v2
+        env:
+          # Pre-installed runner PHP is not patch-updated by default.
+          update: true
+
+      - name: Require patched PHP (CVE-2026-109618/109619, LOQ-19163)
+        env:
+          PHP_MIN: ${{ matrix.php-min }}
+        run: |
+          [ -n "$PHP_MIN" ] || { echo "::error::No php-min for PHP ${{ matrix.php-version }} in the matrix include"; exit 1; }
+          php -r 'exit(version_compare(PHP_VERSION, getenv("PHP_MIN"), ">=") ? 0 : 1);' || { echo "::error::PHP $(php -r 'echo PHP_VERSION;') is below required $PHP_MIN"; exit 1; }
 
       - name: Validate composer.json
         run: composer validate --no-check-publish
