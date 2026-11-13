@@ -10,10 +10,13 @@ use Magento\Framework\App\State;
 use Magento\Framework\Event\Observer;
 use Magento\Framework\Event\ObserverInterface;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\Session\Config\ConfigInterface as SessionConfig;
+use Magento\Framework\Stdlib\Cookie\CookieReaderInterface;
 
 /**
  * Validates address and phone on quote submit, covering both Luma REST and Hyvä GraphQL checkout paths,
- * and the guest email in the frontend area (Hyvä Checkout), where nothing else checks it.
+ * and the guest email in the frontend area (Hyvä Checkout) and on REST place orders that carry
+ * the storefront session cookie.
  * The sales_model_service_quote_submit_before event fires regardless of the checkout front-end used.
  */
 class QuoteSubmitBefore implements ObserverInterface
@@ -30,23 +33,35 @@ class QuoteSubmitBefore implements ObserverInterface
     /** @var State */
     private $appState;
 
+    /** @var SessionConfig */
+    private $sessionConfig;
+
+    /** @var CookieReaderInterface */
+    private $cookieReader;
+
     /**
      * @param Data $helper
      * @param Validator $validator
      * @param Logger $logger
      * @param State $appState Appended, never reordered: the existing three positions are
      *                        wired positionally by every di.xml/test that builds this class.
+     * @param SessionConfig $sessionConfig Appended for the same reason; names the session cookie.
+     * @param CookieReaderInterface $cookieReader Appended for the same reason.
      */
     public function __construct(
         Data $helper,
         Validator $validator,
         Logger $logger,
-        State $appState
+        State $appState,
+        SessionConfig $sessionConfig,
+        CookieReaderInterface $cookieReader
     ) {
         $this->helper  = $helper;
         $this->validator = $validator;
         $this->logger  = $logger;
         $this->appState = $appState;
+        $this->sessionConfig = $sessionConfig;
+        $this->cookieReader = $cookieReader;
     }
 
     /**
@@ -128,21 +143,24 @@ class QuoteSubmitBefore implements ObserverInterface
         }
 
         // --- Customer email validation ---
-        // Guests only, as on Luma, and only in 'frontend' (Hyvä Checkout's Magewire place order and
-        // Luma's frontend review-page place orders). webapi_rest is covered by
-        // CheckoutShippingInformation except virtual/downloadable-only carts (see CHANGELOG Known
-        // limitations); graphql, CLI and unresolvable areas often keep no session,
-        // so with Prevent Submit = No the guest would be warned on every submit. See CHANGELOG.md.
-        // shortcut: area allowlist until LOQ-20299 (email verdict cache) and LOQ-20300 (quote-scoped warn-once for GraphQL).
+        // Guests only, as on Luma, and only where a session persists: 'frontend' (Hyvä Checkout,
+        // Luma's review-page place orders) and webapi_rest with the storefront session cookie
+        // (Luma's REST place order, incl. virtual carts). A cookie-less REST client, graphql, CLI
+        // and unresolvable areas keep no session, so with Prevent Submit = No the guest would be
+        // warned on every submit. A pass from Luma's shipping step is reused, not re-billed (LOQ-20299).
+        // shortcut: session-only allowlist, until LOQ-20300 (quote-scoped warn-once for GraphQL/headless).
         // customer_is_guest OR no customer id, because not every checkout sets the flag before this event.
-        if ($areaCode === Area::AREA_FRONTEND
+        $hasSession = $areaCode === Area::AREA_FRONTEND
+            || ($areaCode === Area::AREA_WEBAPI_REST
+                && $this->cookieReader->getCookie($this->sessionConfig->getName()));
+        if ($hasSession
             && $this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
             && ($quote->getCustomerIsGuest() || !$quote->getCustomerId())
         ) {
             $email = $quote->getCustomerEmail() ?: ($billingAddress ? $billingAddress->getEmail() : null);
             if ($email) {
                 // false: an email API outage must not block the order, as validatePhone() below.
-                $errorMessage = $this->validator->validateEmail($email, false);
+                $errorMessage = $this->validator->validateEmail($email, blockOnApiError: false, usePassCache: true);
                 if ($errorMessage) {
                     $errors[] = $errorMessage;
                 }
@@ -221,8 +239,9 @@ class QuoteSubmitBefore implements ObserverInterface
     }
 
     /**
-     * The current area code, or null when it cannot be resolved - which every caller treats
-     * as "verify". See isAdminArea() for why that direction, and why any throwable is caught.
+     * The current area code, or null when it cannot be resolved. The admin guard treats null as
+     * "verify" (see isAdminArea() for why, and why any throwable is caught); the email check
+     * treats it as "do not verify", since such a request keeps no session.
      *
      * @return string|null
      */

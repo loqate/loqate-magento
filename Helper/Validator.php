@@ -347,7 +347,7 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        // $helper namespaces validateEmail()'s "already warned" digests by store view, as
+        // $helper namespaces validateEmail()'s "already warned" and pass digests by store view, as
         // Plugin\AbstractPlugin's phone digests are; without it every store view shares one list.
         $this->shopperSession = new ShopperScopedSessionStores($session, $helper);
         $this->regionFactory = $regionFactory;
@@ -399,10 +399,29 @@ class Validator
      * @param bool $blockOnApiError False lets an API error through (verifyEmail() has logged it).
      *                              Only Observer\QuoteSubmitBefore passes false: there an error
      *                              would block the order, as its phone check already avoids.
+     * @param bool $usePassCache True reuses, and records, this session's passes for the email
+     *                           (LOQ-20299). Only the guest checkout callers pass true; admin
+     *                           and account forms verify on every save.
+     *                           If a third caller context or flag ever appears, split this into
+     *                           named entry points rather than adding a third bool.
      * @return false|Phrase
      */
-    public function validateEmail($email, bool $blockOnApiError = true)
+    public function validateEmail($email, bool $blockOnApiError = true, bool $usePassCache = false)
     {
+        $passedKey = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $passedValue = null;
+        if ($usePassCache) {
+            // Whether an email passes depends on the catch-all setting, so a pass is keyed by it and
+            // flipping the setting re-verifies. Non-scalars stay as-is so contactDigest() refuses them.
+            $catchAll = (int)(bool)$this->helper->getConfigValue(
+                'loqate_settings/email_settings/enable_accept_valid_catch_all'
+            );
+            $passedValue = ($email === null || is_scalar($email)) ? $catchAll . '|' . $email : $email;
+            if ($this->shopperSession->hasContactDigest($passedKey, $passedValue)) {
+                return false;
+            }
+        }
+
         $errorMessage = __('The provided email address is invalid.');
         if (!$this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit')) {
             if (!$this->shopperSession->shouldVerify(ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY, $email)) {
@@ -425,6 +444,11 @@ class Validator
 
         if (isset($response['noKeyFound'])) {
             return false;
+        }
+
+        // Only a real pass is remembered, so an error or a missing key never marks it valid.
+        if ($usePassCache) {
+            $this->shopperSession->rememberContactDigest($passedKey, $passedValue);
         }
 
         return false;
@@ -1986,7 +2010,7 @@ class Validator
      * The map is verdict data, so it has the OWNERSHIP lifetime of the session verdict stores
      * and not merely the request's: one Validator can outlive a mid-request identity change,
      * and a plain request-scoped map would then answer the new shopper out of the previous
-     * shopper's verdicts while the guard had just flushed the seven stores beside it - reopening
+     * shopper's verdicts while the guard had just flushed the eight stores beside it - reopening
      * exactly the leak ShopperScopedSessionStores exists to close, through a store that class
      * cannot see. Pinned by
      * ShopperScopedSessionStoresTest::testABatchVerdictDoesNotSurviveALogin().
