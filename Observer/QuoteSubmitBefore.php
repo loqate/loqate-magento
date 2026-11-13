@@ -15,8 +15,8 @@ use Magento\Framework\Stdlib\Cookie\CookieReaderInterface;
 
 /**
  * Validates address and phone on quote submit, covering both Luma REST and Hyvä GraphQL checkout paths,
- * and the guest email in the frontend area (Hyvä Checkout) and on REST place orders that carry
- * the storefront session cookie.
+ * and the guest email in the frontend area (Hyvä Checkout), on REST place orders that carry
+ * the storefront session cookie and, with Prevent Submit = Yes, on every GraphQL and REST place order.
  * The sales_model_service_quote_submit_before event fires regardless of the checkout front-end used.
  */
 class QuoteSubmitBefore implements ObserverInterface
@@ -148,12 +148,18 @@ class QuoteSubmitBefore implements ObserverInterface
         // (Luma's REST place order, incl. virtual carts). A cookie-less REST client, graphql, CLI
         // and unresolvable areas keep no session, so with Prevent Submit = No the guest would be
         // warned on every submit. A pass from Luma's shipping step is reused, not re-billed (LOQ-20299).
-        // shortcut: session-only allowlist, until LOQ-20300 (quote-scoped warn-once for GraphQL/headless).
+        // graphql and cookie-less REST are checked when Prevent Submit = Yes (LOQ-20300): an invalid
+        // email simply blocks, so no warn-once state is needed, and without a session the pass cache
+        // just misses.
+        // shortcut: graphql and cookie-less REST with Prevent Submit = No are not checked; add them
+        // once a session-free warn-once exists (LOQ-20301).
         // customer_is_guest OR no customer id, because not every checkout sets the flag before this event.
         $hasSession = $areaCode === Area::AREA_FRONTEND
             || ($areaCode === Area::AREA_WEBAPI_REST
                 && $this->cookieReader->getCookie($this->sessionConfig->getName()));
-        if ($hasSession
+        $blocksWithoutSession = in_array($areaCode, [Area::AREA_GRAPHQL, Area::AREA_WEBAPI_REST], true)
+            && $this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit');
+        if (($hasSession || $blocksWithoutSession)
             && $this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
             && ($quote->getCustomerIsGuest() || !$quote->getCustomerId())
         ) {

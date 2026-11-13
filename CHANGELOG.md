@@ -9,6 +9,15 @@ predate it and are described by their git tags and commit history.
 
 ### Changed — behaviour
 
+- **With "Prevent Submit" = Yes, guest orders placed through the REST API by
+  integrations, and through GraphQL, are now email-checked** (LOQ-20300). This
+  covers OMS/ERP connectors and marketplace importers that place guest orders through
+  the guest-cart or cart endpoints with an integration token, as well as GraphQL
+  storefronts. An invalid email now rejects these orders; marketplace relay or
+  placeholder emails are the likely casualties. These requests keep no session, so
+  every place-order attempt is one billable email verification. With "Prevent
+  Submit" = No they are still not checked (tracked in LOQ-20301). See "Fixed" below.
+
 - **A guest email that passed verification is not verified again in the same
   session, and Luma's REST place order now checks the email** (LOQ-20299). Once an
   email passes, later checkout checks of it in that session reuse the pass and make no
@@ -23,12 +32,10 @@ predate it and are described by their git tags and commit history.
   storefront session cookie, which Luma's browser checkout always sends, so a Luma
   guest checkout of a virtual or downloadable-only cart now has its email checked:
   with Yes an invalid email blocks the order, with No the guest is warned once and
-  the next attempt goes through. **A REST place order
-  without the session cookie (a headless client) is still not email-checked**: it
-  keeps no session, so with No it would be warned on every attempt (tracked in
-  LOQ-20300). Admin customer save, admin order create and the storefront account
-  forms do not use the remembered passes and still verify on every save; logged-in
-  customers are still not checked at checkout.
+  the next attempt goes through. For REST without the session cookie and for
+  GraphQL, see LOQ-20300. Admin customer save, admin order create and the
+  storefront account forms do not use the remembered passes and still verify on
+  every save; logged-in customers are still not checked at checkout.
 
 - **Luma guest orders placed from a review page now have their email checked**
   (LOQ-19188). The new check runs on every place order in the storefront (frontend)
@@ -164,11 +171,23 @@ predate it and are described by their git tags and commit history.
   returns an error at that point, the order goes through and the error is logged,
   as the phone check there already does. Only guest emails are checked, as on Luma.
   Luma's REST place order is checked as well since LOQ-20299, when it carries the
-  storefront session cookie. GraphQL, REST clients without that cookie, other
-  headless checkouts and CLI or programmatic order placement are **not** covered:
-  they often keep no session, so with "Prevent Submit" = No the shopper would be
-  warned on every attempt and could never place the order
-  (tracked in LOQ-20300). See also "Changed — behaviour" above.
+  storefront session cookie, and GraphQL and cookie-less REST place orders with
+  "Prevent Submit" = Yes since LOQ-20300. GraphQL and cookie-less REST with
+  "Prevent Submit" = No are **not** covered: they often keep no session, so the
+  shopper would be warned on every attempt and could never place the order
+  (tracked in LOQ-20301). CLI and cron order placement are not covered either. See
+  also "Changed — behaviour" above.
+
+- **GraphQL and headless REST guest place orders now have their email checked when
+  "Prevent Submit" = Yes** (LOQ-20300). This covers GraphQL and REST place orders
+  without the storefront session cookie. An invalid email blocks the order; if the
+  email service returns an error, the order goes through and the error is logged. An
+  email that already passed earlier in the same session is not verified again
+  (LOQ-20299); without a session it is verified on every place order. With "Prevent
+  Submit" = No, these place orders are still not email-checked: warning once and
+  letting the next attempt through needs a session, which headless clients often do
+  not keep (tracked in LOQ-20301). CLI and cron order placement are still not
+  checked.
 
 - **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
   `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
