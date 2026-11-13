@@ -180,7 +180,7 @@ class ShopperScopedSessionStoresTest extends TestCase
     private const IP_COUNTRY_SESSION_KEY = 'loqate_ipcountry';
 
     /**
-     * Every production file that reaches ShopperScopedSessionStores' three key-taking
+     * Every production file that reaches ShopperScopedSessionStores' four key-taking
      * accessors, and how many statements in it do.
      *
      * Kept as a per-file breakdown rather than a single total because a total alone cannot say
@@ -190,8 +190,8 @@ class ShopperScopedSessionStoresTest extends TestCase
      */
     private const GUARDED_ACCESSOR_CALL_SITES = [
         'Helper/Controller.php' => 2,
-        'Helper/Validator.php' => 8,
-        'Plugin/AbstractPlugin.php' => 7,
+        'Helper/Validator.php' => 9,
+        'Plugin/AbstractPlugin.php' => 5,
         'Plugin/Frontend/PlaceOrder.php' => 1,
         'Plugin/Frontend/PlaceOrderGuest.php' => 1,
     ];
@@ -200,7 +200,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * The size of the set above, held SEPARATELY and asserted against its own sum, so that a
      * breakdown which no longer reconciles with its total cannot pass as it did once before.
      */
-    private const GUARDED_ACCESSOR_CALL_SITE_TOTAL = 19;
+    private const GUARDED_ACCESSOR_CALL_SITE_TOTAL = 18;
 
     /**
      * The second identity source ShopperScopedSessionStores deliberately does NOT read.
@@ -1112,7 +1112,8 @@ class ShopperScopedSessionStoresTest extends TestCase
      *
      * assertEnrolled() throws, and a throw inside checkout is only acceptable because the set of
      * statements that can reach it is small, known, and reviewed. That set is the calls to the
-     * three key-taking accessors - getData(), setData() and contactDigest(); isContactDigest()
+     * four key-taking accessors - getData(), setData(), contactDigest() and shouldVerify(), which
+     * calls contactDigest(); isContactDigest()
      * and the getIpCountry()/setIpCountry() pair do not reach it - and its size is what a
      * reviewer checks before accepting "unreachable for correct code".
      *
@@ -1187,7 +1188,7 @@ class ShopperScopedSessionStoresTest extends TestCase
     }
 
     /**
-     * Every production statement that reaches one of ShopperScopedSessionStores' three
+     * Every production statement that reaches one of ShopperScopedSessionStores' four
      * key-taking accessors, counted per file.
      *
      * FAILS RATHER THAN RETURNS AN EMPTY OR SHORT ANSWER at each point where it could be
@@ -1230,7 +1231,7 @@ class ShopperScopedSessionStoresTest extends TestCase
         $counted = [];
         foreach ($files as $relative) {
             $matches = preg_match_all(
-                '/(?:shopperSession|sessionStores)\s*->\s*(?:getData|setData|contactDigest)\s*\(/',
+                '/(?:shopperSession|sessionStores)\s*->\s*(?:getData|setData|contactDigest|shouldVerify)\s*\(/',
                 $this->sourceWithoutComments($root . '/' . $relative)
             );
             if ($matches) {
@@ -1241,7 +1242,7 @@ class ShopperScopedSessionStoresTest extends TestCase
         $this->assertNotSame(
             [],
             $counted,
-            'No call to getData(), setData() or contactDigest() on a shopperSession/sessionStores property was '
+            'No call to getData(), setData(), contactDigest() or shouldVerify() on a shopperSession/sessionStores property was '
             . 'found anywhere in the module. Either the guard is now reached some other way - through a '
             . 'differently named property, a local variable, or an interface - or the accessors were renamed. '
             . 'Point this scan at the new shape rather than letting it report zero: an empty count would let '
@@ -1396,9 +1397,10 @@ class ShopperScopedSessionStoresTest extends TestCase
      * resolveStoreScope() answers Helper\Data::getCurrentStore() when this class was given a
      * Data, and its own marker - a character getCurrentStore() cannot return, since that method
      * answers an int - when it was not. The second case is the whole subject here. The Data
-     * argument is OPTIONAL, precisely so Helper\Controller, Helper\Validator and the plugins
-     * that never compute a digest needed no constructor change in LOQ-17149, so "constructed
-     * without one" is a supported state and not a fault.
+     * argument is OPTIONAL, precisely so Helper\Controller and the plugins that never compute a
+     * digest needed no constructor change in LOQ-17149, so "constructed without one" is a
+     * supported state and not a fault. Helper\Validator passes one since LOQ-19188, because its
+     * validateEmail() computes the email digests Plugin\AbstractPlugin used to.
      *
      * WHY THE MARKER MUST NOT BE A STORE ID. getCurrentStore() already swallows
      * NoSuchEntityException and degrades to 0, so 0 is the id an installation answers when it

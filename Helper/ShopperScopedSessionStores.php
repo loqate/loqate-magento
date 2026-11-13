@@ -160,7 +160,8 @@ class ShopperScopedSessionStores
      * about (LOQ-17149).
      *
      * WHAT IT ACTUALLY GATES, which is more than billing. Written and read only by
-     * Plugin\AbstractPlugin::shouldVerify(), and consulted only when
+     * shouldVerify() in this class (reached only through
+     * Helper\Validator::validateEmail()), and consulted only when
      * loqate_settings/email_settings/prevent_submit is OFF - which is the SHIPPED DEFAULT
      * (etc/config.xml). In that mode the module warns once ("Invalid email address. Submit
      * again to use this email address.") and accepts the value on the next submission, and
@@ -297,7 +298,7 @@ class ShopperScopedSessionStores
      * is the safe direction.
      *
      * WHY IT IS ONE CONSTANT FOR BOTH LISTS: they have the same shape, the same single writer
-     * (Plugin\AbstractPlugin::shouldVerify()) and the same entry size, so two constants would
+     * (shouldVerify() in this class) and the same entry size, so two constants would
      * be two things to keep equal. Each list is bounded to this figure SEPARATELY, so the
      * session holds at most 2 x 25 x 64 characters of digest, about 3 kB.
      */
@@ -405,8 +406,8 @@ class ShopperScopedSessionStores
      *      holder had none to give. OPTIONAL and TRAILING on purpose: making it required
      *      would force an edit to all seven constructors that build this class inline and
      *      break anything extending them. Only contactDigest() reads it, and only
-     *      Plugin\AbstractPlugin computes digests, so the classes that pass nothing lose
-     *      nothing - see resolveStoreScope() for how the null case degrades.
+     *      Plugin\AbstractPlugin and Helper\Validator compute digests - both pass it - so the
+     *      classes that pass nothing lose nothing - see resolveStoreScope() for how the null case degrades.
      */
     private ?Data $helper;
 
@@ -535,7 +536,7 @@ class ShopperScopedSessionStores
      *
      * WHY A DIGEST AT ALL. self::VERIFIED_EMAIL_SESSION_KEY and
      * self::VERIFIED_PHONE_SESSION_KEY are pure COMPARISON stores: their only reader,
-     * Plugin\AbstractPlugin::shouldVerify(), asks "have I seen this value before?" and never
+     * shouldVerify() in this class, asks "have I seen this value before?" and never
      * reads a stored value back out for any other purpose. A store that only has to compare
      * does not need to hold the value, and these values are the customer's email address and
      * phone number, held for the whole life of the session. Hashing is therefore the
@@ -672,7 +673,7 @@ class ShopperScopedSessionStores
     /**
      * Is $value something contactDigest() produced?
      *
-     * Used by Plugin\AbstractPlugin::shouldVerify() to drop anything else from the two
+     * Used by shouldVerify() to drop anything else from the two
      * contact lists before comparing or appending. Two things reach those lists that are not
      * digests, and both should leave: a RAW email address or phone number written by a
      * release before LOQ-17149 into a session that was mid-flight at deploy time, and
@@ -695,6 +696,104 @@ class ShopperScopedSessionStores
             && strlen($value) === self::CONTACT_DIGEST_LENGTH
             && ctype_xdigit($value)
             && strtolower($value) === $value;
+    }
+
+    /**
+     * Has this session already been warned about this email address or phone number - and,
+     * if not, record it so the next submission is accepted.
+     *
+     * WHAT THIS ACTUALLY GATES. It is consulted only when the matching prevent_submit toggle
+     * is OFF, which is the shipped default (etc/config.xml), and in that mode the module warns
+     * once and accepts the value on resubmission. So answering false does not merely SAVE a
+     * billable verifyEmail()/verifyPhoneNumber() - it accepts the value with no check and no
+     * warning at all. That is why the two stores behind it are enrolled in the shopper flush
+     * and not merely bounded: inheriting shopper A's list means B's first submission of that
+     * value sails through unverified and unwarned.
+     *
+     * THREE PROPERTIES LOQ-17149 ADDED, each argued where it is enforced:
+     *  - IDENTITY-SCOPED. Both stores are reached through this class, so they
+     *    are flushed when the logged-in customer changes in either direction;
+     *  - BOUNDED to self::VERIFIED_CONTACT_LIMIT entries, FIFO, oldest
+     *    first, mirroring Helper\Controller::storeCapturedAddress() and
+     *    Validator::storeVerifyResult(). They were unbounded append-only lists for the whole
+     *    session before;
+     *  - HASHED. What is stored is a salted HMAC of the value, not the value; see
+     *    contactDigest() for the full-length/salt/equivalence
+     *    reasoning and for the numeric-string phone collision this deliberately fixes.
+     *
+     * WHY A HIT WRITES NOTHING. A match returns immediately without moving the entry to the
+     * newest position, unlike Controller::storeCapturedAddress()'s de-duplication. Refreshing
+     * it would mean a session write on the hot path for a value that is already remembered,
+     * and the cost of not refreshing is bounded and safe: an entry can age out while the
+     * shopper is still using it, which costs one extra billable verify and one extra warning,
+     * never a bypass. De-duplication on WRITE is unnecessary for the same reason it is
+     * necessary there - a write only ever follows a miss, and a miss means the digest is not
+     * in the list, so appending cannot create a duplicate.
+     *
+     * @param string $field self::VERIFIED_EMAIL_SESSION_KEY or
+     *                      ::VERIFIED_PHONE_SESSION_KEY. Kept as a parameter rather than
+     *                      split into two methods because validateEmail() and validatePhone()
+     *                      differ in nothing else, and the seam asserts the value is a store
+     *                      it flushes.
+     * @param mixed $value The email address or phone number as it arrived from the request.
+     * @return bool True when the caller must perform the billable verify.
+     */
+    public function shouldVerify(string $field, $value): bool
+    {
+        $digest = $this->contactDigest($field, $value);
+        if ($digest === '') {
+            // No comparable digest could be produced - a non-scalar value, or no CSPRNG for
+            // the salt. Verify, and store nothing: the fail-closed direction, at the price of
+            // a billable call. See contactDigest().
+            return true;
+        }
+
+        $storedData = $this->getData($field);
+        if (!is_array($storedData)) {
+            // Covers the empty session, a store just flushed to null by the ownership guard,
+            // and - defensively - an attribute another module or a truncated payload left in
+            // a shape this list cannot be appended to.
+            $storedData = [];
+        }
+
+        // Drop everything that is not one of this class's digests, and re-index so the FIFO
+        // eviction below and the [] append operate on a list. Two things are dropped: a RAW
+        // email address or phone number written by a pre-LOQ-17149 release into a session
+        // that was live at deploy time, and anything foreign. Both are inert - neither can
+        // ever equal a digest - so no verdict changes; what this buys is that the last raw
+        // contact details leave the session at the first write rather than waiting for
+        // eviction or a shopper change. It also means such a session costs one extra billable
+        // verify per value at deploy time, which is recorded in CHANGELOG.md.
+        $storedData = array_values(array_filter(
+            $storedData,
+            fn ($entry): bool => $this->isContactDigest($entry)
+        ));
+
+        // STRICT, and it is worth a sentence because a LOOSE in_array() on this very line is
+        // what LOQ-17149 replaced. Both needle and haystack are now 64-character hex strings,
+        // so the two comparisons differ in only one family of values: a digest of the form '0e'
+        // followed by 62 digits is a numeric string in scientific notation, and two of those
+        // loose-compare EQUAL (both == 0), which would let one stored digest answer for a
+        // different address. That is of the order of one pair in 10^15, and it is therefore NOT
+        // pinned by a test - a real HMAC output cannot be forced into that shape from a test,
+        // so removing the flag leaves the suite green - which is exactly why it is stated here.
+        // The flag costs nothing and the direction it protects is the bypass one.
+        if (in_array($digest, $storedData, true)) {
+            return false;
+        }
+
+        // FIFO eviction, mirroring the address stores. The keys are integers, so array_shift()
+        // renumbers them, which is what a list wants. The $storedData !== [] guard keeps the
+        // loop terminating even if the limit is ever set to 0 or below, where shifting an
+        // already-empty array would otherwise spin forever inside a checkout request.
+        while ($storedData !== [] && count($storedData) >= self::VERIFIED_CONTACT_LIMIT) {
+            array_shift($storedData);
+        }
+
+        $storedData[] = $digest;
+        $this->setData($field, $storedData);
+
+        return true;
     }
 
     /**
@@ -863,7 +962,7 @@ class ShopperScopedSessionStores
             // Flushed by writing null rather than by unsetting: every reader of these
             // stores already degrades a non-array/falsy value to "nothing cached" or "not
             // blocked" (see Validator::getCachedVerifyResult() and its siblings,
-            // Plugin\AbstractPlugin::shouldVerify(), Plugin\Frontend\PlaceOrder), and null
+            // shouldVerify() in this class, Plugin\Frontend\PlaceOrder), and null
             // keeps this class to the two session methods - getData()/setData() - that
             // Magento\Customer\Model\Session forwards to its storage, instead of adding a
             // third that only this path would use.
@@ -954,8 +1053,8 @@ class ShopperScopedSessionStores
      *
      * Returns Helper\Data::getCurrentStore() as a string. That accessor already swallows
      * NoSuchEntityException and answers 0, so the only case left is this class having been
-     * constructed WITHOUT a Data at all - which is the normal state for Helper\Controller,
-     * Helper\Validator and the plugins that never compute a digest, since the argument is
+     * constructed WITHOUT a Data at all - which is the normal state for Helper\Controller
+     * and the plugins that never compute a digest, since the argument is
      * optional precisely so they did not have to change.
      *
      * DEGRADES TO ITS OWN MARKER, not to a store id. '-' cannot be produced by

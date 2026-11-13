@@ -7,6 +7,7 @@ use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Phrase;
 use Magento\Framework\Serialize\SerializerInterface;
 
 /**
@@ -346,7 +347,9 @@ class Validator
         SerializerInterface $serializer
     ) {
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedSessionStores($session);
+        // $helper namespaces validateEmail()'s "already warned" digests by store view, as
+        // Plugin\AbstractPlugin's phone digests are; without it every store view shares one list.
+        $this->shopperSession = new ShopperScopedSessionStores($session, $helper);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
@@ -387,6 +390,44 @@ class Validator
         }
 
         return $response;
+    }
+
+    /**
+     * Validate email address
+     *
+     * @param mixed $email
+     * @param bool $blockOnApiError False lets an API error through (verifyEmail() has logged it).
+     *                              Only Observer\QuoteSubmitBefore passes false: there an error
+     *                              would block the order, as its phone check already avoids.
+     * @return false|Phrase
+     */
+    public function validateEmail($email, bool $blockOnApiError = true)
+    {
+        $errorMessage = __('The provided email address is invalid.');
+        if (!$this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit')) {
+            if (!$this->shopperSession->shouldVerify(ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY, $email)) {
+                return false;
+            }
+            $errorMessage = __('Invalid email address. Submit again to use this email address.');
+        }
+
+        $response = $this->verifyEmail($email);
+
+        if (isset($response['error'])) {
+            return $blockOnApiError
+                ? __('An unexpected error occurred while trying to validate your email address.')
+                : false;
+        }
+
+        if (!$response) {
+            return $errorMessage;
+        }
+
+        if (isset($response['noKeyFound'])) {
+            return false;
+        }
+
+        return false;
     }
 
     /**

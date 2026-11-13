@@ -12,7 +12,8 @@ use Magento\Framework\Event\ObserverInterface;
 use Magento\Framework\Exception\LocalizedException;
 
 /**
- * Validates address and phone on quote submit, covering both Luma REST and Hyvä GraphQL checkout paths.
+ * Validates address and phone on quote submit, covering both Luma REST and Hyvä GraphQL checkout paths,
+ * and the guest email in the frontend area (Hyvä Checkout), where nothing else checks it.
  * The sales_model_service_quote_submit_before event fires regardless of the checkout front-end used.
  */
 class QuoteSubmitBefore implements ObserverInterface
@@ -60,7 +61,9 @@ class QuoteSubmitBefore implements ObserverInterface
         // billing can only be removed by not running here. That also means admin order create
         // is no longer AVC-checked at all and obeys only the *_create_order_admin toggles -
         // see isAdminArea() for what that changes and the one configuration it leaves unverified.
-        if ($this->isAdminArea()) {
+        // Resolved once, so an unresolvable area is logged at most once per submit.
+        $areaCode = $this->areaCode();
+        if ($this->isAdminArea($areaCode)) {
             return;
         }
 
@@ -120,6 +123,28 @@ class QuoteSubmitBefore implements ObserverInterface
                     if ($errorMessage) {
                         $errors[] = $errorMessage;
                     }
+                }
+            }
+        }
+
+        // --- Customer email validation ---
+        // Guests only, as on Luma, and only in 'frontend' (Hyvä Checkout's Magewire place order and
+        // Luma's frontend review-page place orders). webapi_rest is covered by
+        // CheckoutShippingInformation except virtual/downloadable-only carts (see CHANGELOG Known
+        // limitations); graphql, CLI and unresolvable areas often keep no session,
+        // so with Prevent Submit = No the guest would be warned on every submit. See CHANGELOG.md.
+        // shortcut: area allowlist until LOQ-20299 (email verdict cache) and LOQ-20300 (quote-scoped warn-once for GraphQL).
+        // customer_is_guest OR no customer id, because not every checkout sets the flag before this event.
+        if ($areaCode === Area::AREA_FRONTEND
+            && $this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
+            && ($quote->getCustomerIsGuest() || !$quote->getCustomerId())
+        ) {
+            $email = $quote->getCustomerEmail() ?: ($billingAddress ? $billingAddress->getEmail() : null);
+            if ($email) {
+                // false: an email API outage must not block the order, as validatePhone() below.
+                $errorMessage = $this->validator->validateEmail($email, false);
+                if ($errorMessage) {
+                    $errors[] = $errorMessage;
                 }
             }
         }
@@ -187,19 +212,31 @@ class QuoteSubmitBefore implements ObserverInterface
      * preserved instead of traded away: the throwable is logged with its message, identically
      * for every type.
      *
+     * @param string|null $areaCode From areaCode(); null when the area could not be resolved.
      * @return bool
      */
-    private function isAdminArea(): bool
+    private function isAdminArea(?string $areaCode): bool
+    {
+        return $areaCode === Area::AREA_ADMINHTML;
+    }
+
+    /**
+     * The current area code, or null when it cannot be resolved - which every caller treats
+     * as "verify". See isAdminArea() for why that direction, and why any throwable is caught.
+     *
+     * @return string|null
+     */
+    private function areaCode(): ?string
     {
         try {
-            return $this->appState->getAreaCode() === Area::AREA_ADMINHTML;
+            return $this->appState->getAreaCode();
         } catch (\Throwable $exception) {
             $this->logger->info(
                 'Loqate could not resolve the application area on quote submit; '
                 . 'verifying anyway: ' . $exception->getMessage()
             );
 
-            return false;
+            return null;
         }
     }
 

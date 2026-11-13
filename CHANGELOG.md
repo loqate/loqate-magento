@@ -9,6 +9,17 @@ predate it and are described by their git tags and commit history.
 
 ### Changed — behaviour
 
+- **Luma guest orders placed from a review page now have their email checked**
+  (LOQ-19188). The new check runs on every place order in the storefront (frontend)
+  area, so it also covers the review pages that place the order directly and can
+  skip the shipping step, such as PayPal Express, Braintree PayPal and wallet
+  checkouts. With "Prevent Submit" = Yes an invalid email now blocks the order there;
+  with No the shopper is warned once and the next attempt goes through. If the
+  shopper did go through Luma's shipping step first, the email is verified twice
+  for that order — **one extra billable verification, with "Prevent Submit" = Yes
+  only**. With No, the second check is answered from the "already warned" list and
+  is not billed.
+
 - **Admin order create is no longer AVC-checked, and obeys only the
   "Enable on Create Order (Admin)" toggles.** `Observer\QuoteSubmitBefore` now
   returns early in the admin area. Previously an admin-created order was checked
@@ -125,6 +136,21 @@ predate it and are described by their git tags and commit history.
   for.
 
 ### Fixed
+
+- **Email validation now runs on Hyvä Checkout** (LOQ-19188). It used to run only
+  when Luma's checkout saved the shipping step, which Hyvä Checkout never calls, so
+  guest emails were not checked at all there. The guest's email is now checked when
+  a Hyvä Checkout order is placed, with the same "Prevent Submit" behaviour as Luma:
+  with Yes an invalid email blocks the order, and with No the first attempt warns and
+  placing the order again with the same email goes through. If the email service
+  returns an error at that point, the order goes through and the error is logged,
+  as the phone check there already does. Only guest emails are checked, as on Luma.
+  Luma's REST checkout is unchanged: its shipping step already checks the email.
+  GraphQL, other headless checkouts and CLI or programmatic order placement are
+  **not** covered: they often keep no session, so with "Prevent Submit" = No the
+  shopper would be warned on every attempt and could never place the order
+  (tracked in LOQ-20300). See also "Changed — behaviour" and "Known limitations"
+  below.
 
 - **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
   `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
@@ -389,6 +415,11 @@ predate it and are described by their git tags and commit history.
   their stores across the upgrade (LOQ-17149).
 
 ### Known limitations
+
+- **A Luma guest checkout of a virtual or downloadable-only cart does not check the
+  email** (LOQ-19188). It has no shipping step, which is where Luma checks the email,
+  and it places the order through REST, which the new place-order check skips. This
+  is unchanged from earlier releases (tracked in LOQ-20299).
 
 - **Dedupe across import RUNS is not delivered for a file with more than 200 distinct
   addresses** (LOQ-17148 delivers dedupe *within* one run, above). The session cache

@@ -5,7 +5,11 @@ namespace Loqate\ApiIntegration\Test\Unit\Plugin;
 use ArrayObject;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
+use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
+use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Serialize\SerializerInterface;
 use PHPUnit\Framework\MockObject\MockObject;
 
 /**
@@ -155,6 +159,11 @@ trait ShopperSessionHarness
      * configuration a store hit skips the warning as well as the request - so every test here
      * counts these arrays rather than reading a return value.
      *
+     * A PARTIAL double built through the real constructor: only the four billable calls are
+     * stubbed, so validateEmail() and its "already warned" store run for real over $session.
+     *
+     * @param Session $session The session the plugin under test is given.
+     * @param Data $helper The configuration the plugin under test is given.
      * @param ArrayObject $emailRequests Every email address sent for verification, in order.
      * @param ArrayObject $phoneRequests Every phone number sent for verification, in order.
      * @param bool $emailPasses Whether the connector accepts the email addresses it is sent.
@@ -162,12 +171,28 @@ trait ShopperSessionHarness
      * @return Validator&MockObject
      */
     private function createCountingValidator(
+        Session $session,
+        Data $helper,
         ArrayObject $emailRequests,
         ArrayObject $phoneRequests,
         bool $emailPasses = true,
         bool $phonePasses = true
     ) {
-        $validator = $this->createMock(Validator::class);
+        // The constructor reads the module version when an API key is configured.
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
+
+        $validator = $this->getMockBuilder(Validator::class)
+            ->setConstructorArgs([
+                $this->createMock(Logger::class),
+                $session,
+                $this->createMock(RegionFactory::class),
+                $moduleList,
+                $helper,
+                $this->createMock(SerializerInterface::class),
+            ])
+            ->onlyMethods(['verifyEmail', 'verifyPhoneNumber', 'verifyAddress', 'verifyMultipleAddresses'])
+            ->getMock();
         $validator->method('verifyEmail')->willReturnCallback(
             static function ($email) use ($emailRequests, $emailPasses) {
                 $emailRequests[] = $email;
