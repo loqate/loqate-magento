@@ -4,11 +4,18 @@ namespace Loqate\ApiIntegration\Test\Unit\Helper;
 
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
+use ArrayObject;
 use Loqate\ApiIntegration\Logger\Logger;
+use Loqate\ApiIntegration\Plugin\AbstractPlugin;
+use Loqate\ApiIntegration\Test\Unit\Plugin\ShopperSessionHarness;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\Action\Context;
+use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Module\ModuleListInterface;
 use Magento\Framework\Serialize\SerializerInterface;
+use Magento\Framework\UrlInterface;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
@@ -23,6 +30,20 @@ use ReflectionMethod;
  */
 class ValidatorTest extends TestCase
 {
+    // A remembering session, a config helper and store id - for the validateEmail() tests, which
+    // need the "already warned" list to persist between calls.
+    use ShopperSessionHarness;
+
+    /** Config path: reject an invalid email outright (1) or warn once and accept a resubmission (0). */
+    private const EMAIL_PREVENT_SUBMIT = 'loqate_settings/email_settings/prevent_submit';
+
+    /** An email address with nothing special about it. */
+    private const EMAIL = 'guest.shopper@example.com';
+
+    private const SUBMIT_AGAIN_MESSAGE = 'Invalid email address. Submit again to use this email address.';
+    private const INVALID_MESSAGE = 'The provided email address is invalid.';
+    private const UNEXPECTED_ERROR_MESSAGE = 'An unexpected error occurred while trying to validate your email address.';
+
     /** @var Validator */
     private $validator;
 
@@ -237,6 +258,209 @@ class ValidatorTest extends TestCase
         $this->assertFalse(
             $this->invokePrivate('checkForCapturedAddress', [['Address' => ''], $stored])
         );
+    }
+
+    /**
+     * Validator::validateEmail() (LOQ-19188) - what Observer\QuoteSubmitBefore uses on Hyvä
+     * Checkout - returns the same verdict as Plugin\AbstractPlugin::validateEmail() for every
+     * answer verifyEmail() can give. Only the billable verifyEmail() is stubbed; the
+     * prevent_submit branch, the session store and the message choice are all real.
+     *
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     * @param mixed $verifyResponse What verifyEmail() answers.
+     * @param false|string $expected What validateEmail() must return.
+     */
+    #[DataProvider('validateEmailVerdictProvider')]
+    public function testValidateEmailTurnsEachVerifyAnswerIntoTheShopperFacingVerdict(
+        string $preventSubmit,
+        $verifyResponse,
+        $expected
+    ): void {
+        $fixture = $this->emailFixture([self::EMAIL_PREVENT_SUBMIT => $preventSubmit], $verifyResponse);
+
+        $verdict = $fixture['validator']->validateEmail(self::EMAIL);
+
+        $this->assertSame($expected, $verdict);
+        $this->assertSame([self::EMAIL], iterator_to_array($fixture['emailRequests']), 'One billable verify per first submission.');
+    }
+
+    public static function validateEmailVerdictProvider(): array
+    {
+        return [
+            'invalid, prevent submit No: warn once' => ['', false, self::SUBMIT_AGAIN_MESSAGE],
+            'invalid, prevent submit Yes: reject' => ['1', false, self::INVALID_MESSAGE],
+            'API error, prevent submit No' => ['', ['error' => true, 'message' => 'timeout'], self::UNEXPECTED_ERROR_MESSAGE],
+            'API error, prevent submit Yes' => ['1', ['error' => true, 'message' => 'timeout'], self::UNEXPECTED_ERROR_MESSAGE],
+            'no API key: let it through' => ['', ['noKeyFound' => true], false],
+            'valid' => ['1', ['Valid' => true], false],
+        ];
+    }
+
+    /**
+     * Prevent Submit = No (the shipped default): the first submission is billed and warned, and
+     * placing the order again with the SAME email is accepted with no second billable call.
+     * This is the "submit again" contract the CHANGELOG promises for Hyvä Checkout.
+     */
+    public function testValidateEmailWithPreventSubmitOffAcceptsTheResubmissionWithoutBillingAgain(): void
+    {
+        $fixture = $this->emailFixture([], false);
+
+        $first = $fixture['validator']->validateEmail(self::EMAIL);
+        $second = $fixture['validator']->validateEmail(self::EMAIL);
+
+        $this->assertSame(self::SUBMIT_AGAIN_MESSAGE, $first, 'The first submission of an invalid email is warned.');
+        $this->assertFalse($second, 'The resubmission of the same email must be accepted.');
+        $this->assertCount(
+            1,
+            $fixture['emailRequests'],
+            'The resubmission must be answered from the session, not by a second billable verifyEmail().'
+        );
+    }
+
+    /**
+     * Prevent Submit = Yes: the session list is never consulted, so the same invalid email is
+     * verified and rejected every time - otherwise resubmitting would be a way past the block.
+     */
+    public function testValidateEmailWithPreventSubmitOnRejectsEveryResubmission(): void
+    {
+        $fixture = $this->emailFixture([self::EMAIL_PREVENT_SUBMIT => '1'], false);
+
+        $first = $fixture['validator']->validateEmail(self::EMAIL);
+        $second = $fixture['validator']->validateEmail(self::EMAIL);
+
+        $this->assertSame(self::INVALID_MESSAGE, $first);
+        $this->assertSame(self::INVALID_MESSAGE, $second, 'With Prevent Submit = Yes a resubmission must still be rejected.');
+        $this->assertCount(2, $fixture['emailRequests'], 'Each submission is verified.');
+    }
+
+    /**
+     * validateEmail($email, false) - what Observer\QuoteSubmitBefore calls - lets an email API
+     * error through, so an outage cannot block the order, under both Prevent Submit settings.
+     * It must lower ONLY that verdict: an email Loqate genuinely rejected still gets its message.
+     *
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     * @param mixed $verifyResponse What verifyEmail() answers.
+     * @param false|string $expected What validateEmail() must return.
+     */
+    #[DataProvider('validateEmailNotBlockingOnApiErrorProvider')]
+    public function testValidateEmailNotBlockingOnApiErrorPassesOnlyTheApiError(
+        string $preventSubmit,
+        $verifyResponse,
+        $expected
+    ): void {
+        $fixture = $this->emailFixture([self::EMAIL_PREVENT_SUBMIT => $preventSubmit], $verifyResponse);
+
+        $verdict = $fixture['validator']->validateEmail(self::EMAIL, false);
+
+        $this->assertSame($expected, $verdict);
+        $this->assertSame([self::EMAIL], iterator_to_array($fixture['emailRequests']), 'The email is still verified.');
+    }
+
+    public static function validateEmailNotBlockingOnApiErrorProvider(): array
+    {
+        return [
+            'API error, prevent submit No: pass' => ['', ['error' => true, 'message' => 'timeout'], false],
+            'API error, prevent submit Yes: pass' => ['1', ['error' => true, 'message' => 'timeout'], false],
+            'invalid, prevent submit Yes: still rejected' => ['1', false, self::INVALID_MESSAGE],
+            'invalid, prevent submit No: still warned' => ['', false, self::SUBMIT_AGAIN_MESSAGE],
+        ];
+    }
+
+    /**
+     * ...and with Prevent Submit = No the warning is still given ONCE: the resubmission is
+     * accepted without a second billable call, exactly as with the default argument.
+     */
+    public function testValidateEmailNotBlockingOnApiErrorStillWarnsOnceWithPreventSubmitOff(): void
+    {
+        $fixture = $this->emailFixture([], false);
+
+        $first = $fixture['validator']->validateEmail(self::EMAIL, false);
+        $second = $fixture['validator']->validateEmail(self::EMAIL, false);
+
+        $this->assertSame(self::SUBMIT_AGAIN_MESSAGE, $first, 'The first submission of an invalid email is warned.');
+        $this->assertFalse($second, 'The resubmission of the same email must be accepted.');
+        $this->assertCount(1, $fixture['emailRequests'], 'The resubmission must not be billed again.');
+    }
+
+    /**
+     * A shopper warned on Luma's shipping step (Plugin\AbstractPlugin) who then places the order
+     * must not be warned and billed a second time by Validator::validateEmail() on quote submit.
+     *
+     * This is what passing $helper to ShopperScopedSessionStores in Validator's constructor
+     * buys: the digest is namespaced by store view, and a Validator without the helper scopes
+     * it as '-' while the plugin scopes it as the store id, so neither would ever find the
+     * other's entry.
+     */
+    public function testAWarningRecordedThroughThePluginIsHonouredByValidateEmail(): void
+    {
+        $fixture = $this->emailFixture([], false);
+        $plugin = new class (
+            $this->createMock(Context::class),
+            $this->createMock(UrlInterface::class),
+            $fixture['session'],
+            $fixture['validator'],
+            $fixture['helper'],
+            $this->createMock(JsonFactory::class)
+        ) extends AbstractPlugin {
+            /**
+             * @param mixed $email
+             * @return false|string
+             */
+            public function checkEmail($email)
+            {
+                return $this->validateEmail($email);
+            }
+        };
+
+        $pluginVerdict = $plugin->checkEmail(self::EMAIL);
+        $validatorVerdict = $fixture['validator']->validateEmail(self::EMAIL);
+
+        $this->assertSame(self::SUBMIT_AGAIN_MESSAGE, $pluginVerdict, 'The plugin path warns the first submission.');
+        $this->assertFalse(
+            $validatorVerdict,
+            'Validator::validateEmail() must recognise the warning the plugin recorded in the same session.'
+        );
+        $this->assertCount(
+            1,
+            $fixture['emailRequests'],
+            'The same email in the same session and store view must be billed once across both paths.'
+        );
+    }
+
+    /**
+     * A real Validator over a remembering session, with only the billable verifyEmail() stubbed
+     * and counted. No API key is configured, so the constructor builds no live client.
+     *
+     * @param array<string, mixed> $config Configuration paths that are switched on.
+     * @param mixed $verifyResponse What verifyEmail() answers.
+     * @return array{validator: Validator, session: Session, helper: Data, emailRequests: ArrayObject}
+     */
+    private function emailFixture(array $config, $verifyResponse): array
+    {
+        $emailRequests = new ArrayObject();
+        $session = $this->createSessionDouble(new ArrayObject(), new ArrayObject(['customerId' => null]));
+        $helper = $this->createConfigHelper($config);
+
+        $validator = $this->getMockBuilder(Validator::class)
+            ->setConstructorArgs([
+                $this->createMock(Logger::class),
+                $session,
+                $this->createMock(RegionFactory::class),
+                $this->createMock(ModuleListInterface::class),
+                $helper,
+                $this->createMock(SerializerInterface::class),
+            ])
+            ->onlyMethods(['verifyEmail'])
+            ->getMock();
+        $validator->method('verifyEmail')->willReturnCallback(
+            static function ($email) use ($emailRequests, $verifyResponse) {
+                $emailRequests[] = $email;
+
+                return $verifyResponse;
+            }
+        );
+
+        return ['validator' => $validator, 'session' => $session, 'helper' => $helper, 'emailRequests' => $emailRequests];
     }
 
     /**

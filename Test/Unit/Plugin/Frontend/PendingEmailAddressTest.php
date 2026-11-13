@@ -223,6 +223,8 @@ class PendingEmailAddressTest extends TestCase
             'loqate_settings/email_settings/enable_checkout' => 1,
         ]);
         $validator = $this->createCountingValidator(
+            $session,
+            $helper,
             $emailRequests,
             $phoneRequests,
             $options['emailPasses'] ?? true

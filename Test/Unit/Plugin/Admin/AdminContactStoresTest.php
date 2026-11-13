@@ -511,22 +511,27 @@ class AdminContactStoresTest extends TestCase
         $phoneRequests = new ArrayObject();
         $errorMessages = new ArrayObject();
 
+        $sessionMock = $this->createSessionDouble($sessionStore, $identity);
+        $helper = $this->createConfigHelper([
+            'loqate_settings/settings/api_key' => 'TEST-API-KEY-0000',
+            // The three admin toggles the contact stores are reached through. The ADDRESS
+            // toggles are deliberately left off: verifyMultipleAddresses() and
+            // verifyAddress() write different stores with their own tests, and switching
+            // them on here would make these tests pass or fail for a reason that is not
+            // theirs.
+            'loqate_settings/email_settings/enable_create_order_admin' => 1,
+            'loqate_settings/phone_settings/enable_create_order_admin' => 1,
+            'loqate_settings/email_settings/enable_customer_account_admin' => 1,
+            'loqate_settings/phone_settings/enable_customer_account_admin' => 1,
+        ]);
+
         return [
-            'sessionMock' => $this->createSessionDouble($sessionStore, $identity),
+            'sessionMock' => $sessionMock,
             'context' => $this->createAdminContext($errorMessages),
-            'helper' => $this->createConfigHelper([
-                'loqate_settings/settings/api_key' => 'TEST-API-KEY-0000',
-                // The three admin toggles the contact stores are reached through. The ADDRESS
-                // toggles are deliberately left off: verifyMultipleAddresses() and
-                // verifyAddress() write different stores with their own tests, and switching
-                // them on here would make these tests pass or fail for a reason that is not
-                // theirs.
-                'loqate_settings/email_settings/enable_create_order_admin' => 1,
-                'loqate_settings/phone_settings/enable_create_order_admin' => 1,
-                'loqate_settings/email_settings/enable_customer_account_admin' => 1,
-                'loqate_settings/phone_settings/enable_customer_account_admin' => 1,
-            ]),
+            'helper' => $helper,
             'validator' => $this->createCountingValidator(
+                $sessionMock,
+                $helper,
                 $emailRequests,
                 $phoneRequests,
                 $contactChecksPass,

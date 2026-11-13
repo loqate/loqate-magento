@@ -53,6 +53,12 @@ class QuoteSubmitBeforeTest extends TestCase
     /** Config path gating phone verification at checkout. */
     private const PHONE_CHECKOUT = 'loqate_settings/phone_settings/enable_checkout';
 
+    /** Config path gating email verification at checkout. */
+    private const EMAIL_CHECKOUT = 'loqate_settings/email_settings/enable_checkout';
+
+    /** A guest's email address as Quote::getCustomerEmail() delivers it. */
+    private const GUEST_EMAIL = 'guest.shopper@example.com';
+
     /** A shipping address as Quote\Address::getData() delivers it (newline-string street). */
     private const SHIPPING_ADDRESS = [
         'street' => "1 High St\nFlat 2\n",
@@ -62,7 +68,11 @@ class QuoteSubmitBeforeTest extends TestCase
         'telephone' => '02079460000',
     ];
 
-    /** A billing address that is deliberately a DIFFERENT address from the shipping one. */
+    /**
+     * A billing address that is deliberately a DIFFERENT address from the shipping one.
+     * Must have no 'email' key: emailNotCheckedProvider()'s "no email"/"null email" rows rely on
+     * the billing-email fallback finding nothing.
+     */
     private const BILLING_ADDRESS = [
         'street' => "77 Office Park\nUnit 4\n",
         'city' => 'Reading',
@@ -86,6 +96,9 @@ class QuoteSubmitBeforeTest extends TestCase
     /** @var mixed Value the Validator returns from verifyPhoneNumber(). */
     private $phoneResponse = true;
 
+    /** @var false|string Value the Validator returns from validateEmail(): false or the error. */
+    private $emailResponse = false;
+
     protected function setUp(): void
     {
         $this->validatorCalls = new ArrayObject();
@@ -99,6 +112,7 @@ class QuoteSubmitBeforeTest extends TestCase
         ]);
         $this->addressResponse = ['error' => false];
         $this->phoneResponse = true;
+        $this->emailResponse = false;
     }
 
     /**
@@ -492,6 +506,278 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
+     * LOQ-19188: the guest's email is verified on quote submit on the Hyvä Checkout page
+     * ('frontend') only. Every other area, an unresolvable one included, is a NOT-verified
+     * case, see emailNotCheckedProvider().
+     *
+     * Asserted on the spy, in full and in order, so this also pins that the email check is
+     * ADDED after the address and phone checks and replaces none of them, and that it is made
+     * exactly ONCE - each call on the shipped prevent_submit default is a billable verify.
+     *
+     * @param string|\Throwable $area Area code, or what State::getAreaCode() raises instead.
+     */
+    #[DataProvider('emailCheckedAreaProvider')]
+    public function testAGuestEmailIsVerifiedOnceWhereNothingEarlierVerifiedIt($area): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $observer = $this->createObserver($area);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertSame(
+            [
+                ['verifyAddress', self::SHIPPING_ADDRESS],
+                ['verifyPhoneNumber', '02079460000', 'GB'],
+                ['verifyAddress', self::BILLING_ADDRESS],
+                ['verifyPhoneNumber', '01189990000', 'GB'],
+                ['validateEmail', self::GUEST_EMAIL, false],
+            ],
+            $this->recordedCalls(),
+            'A guest email must be verified exactly once on quote submit here: Hyvä Checkout never '
+            . 'reaches Plugin\Frontend\CheckoutShippingInformation, so without this call the email is not '
+            . 'checked at all (LOQ-19188). It is called with $blockOnApiError = false, so an email API '
+            . 'outage cannot block the order, as the phone check already behaves.'
+        );
+    }
+
+    /**
+     * ...and the verdict is not swallowed: Validator::validateEmail()'s message must abort the
+     * order with that exact text, in every area where the email is checked. Addresses and phone
+     * numbers are valid here, so the email message is the whole of the exception.
+     *
+     * @param string|\Throwable $area Area code, or what State::getAreaCode() raises instead.
+     */
+    #[DataProvider('emailCheckedAreaProvider')]
+    public function testARejectedGuestEmailAbortsTheOrderWithItsMessage($area): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $this->emailResponse = 'Invalid email address. Submit again to use this email address.';
+        $observer = $this->createObserver($area);
+
+        $this->expectException(LocalizedException::class);
+        $this->expectExceptionMessage('Invalid email address. Submit again to use this email address.');
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+    }
+
+    /**
+     * An email rejection is reported ALONGSIDE the address rejections, one per line, so the
+     * shopper sees every problem at once - the same contract the address and phone checks keep.
+     */
+    public function testAnEmailRejectionIsJoinedToTheAddressRejections(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $this->addressResponse = ['error' => true, 'message' => 'The provided address is invalid.'];
+        $this->emailResponse = 'The provided email address is invalid.';
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        try {
+            $observer->execute(
+                $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+            );
+            $this->fail('A rejected address and a rejected email must abort the order submission.');
+        } catch (LocalizedException $exception) {
+            $this->assertSame(
+                'The provided address is invalid.' . PHP_EOL
+                . 'The provided address is invalid.' . PHP_EOL
+                . 'The provided email address is invalid.',
+                $exception->getMessage(),
+                'The email rejection must be appended to the address rejections, not replace them.'
+            );
+        }
+    }
+
+    /**
+     * The area is resolved ONCE per submit and shared by the admin guard and the email check, so
+     * an unresolvable area leaves exactly one log line with email checking on - and, like
+     * CLI or programmatic order placement, does not verify the email.
+     */
+    public function testAnUnresolvableAreaIsLoggedOnceWithEmailCheckingOn(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $observer = $this->createObserver(new LocalizedException('Area code is not set'));
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertSame([], $this->emailCalls(), 'An unresolvable area does not verify the email.');
+        $this->assertCount(
+            1,
+            iterator_to_array($this->logRecords),
+            'Looking the area up separately for the admin guard and the email check would log the same '
+            . 'failure twice per submit.'
+        );
+    }
+
+    /**
+     * The email verified is Quote::getCustomerEmail() and, only when that is empty, the billing
+     * address's email - some checkouts set the guest email on the billing address alone before
+     * this event.
+     *
+     * @param mixed $customerEmail What Quote::getCustomerEmail() answers.
+     * @param string $expected The email that must be verified.
+     */
+    #[DataProvider('emailSourceProvider')]
+    public function testTheBillingEmailIsVerifiedOnlyWhenTheQuoteHasNoCustomerEmail($customerEmail, string $expected): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $billing = self::BILLING_ADDRESS + ['email' => 'billing.guest@example.com'];
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $observer->execute($this->quoteEvent(self::SHIPPING_ADDRESS, $billing, false, $customerEmail, 1));
+
+        $this->assertSame([['validateEmail', $expected, false]], $this->emailCalls());
+    }
+
+    public static function emailSourceProvider(): array
+    {
+        return [
+            'empty customer email: billing email' => ['', 'billing.guest@example.com'],
+            'null customer email: billing email' => [null, 'billing.guest@example.com'],
+            'customer email set: it wins over the billing email' => [self::GUEST_EMAIL, self::GUEST_EMAIL],
+        ];
+    }
+
+    /**
+     * A quote counts as a guest's when customer_is_guest is set OR it has no customer id, because
+     * not every checkout sets the flag before sales_model_service_quote_submit_before. So a quote
+     * with the flag unset but no customer behind it is verified...
+     */
+    public function testAQuoteWithoutTheGuestFlagButWithNoCustomerIdIsVerified(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 0, null)
+        );
+
+        $this->assertSame(
+            [['validateEmail', self::GUEST_EMAIL, false]],
+            $this->emailCalls(),
+            'customer_is_guest = 0 with no customer id is a guest whose checkout did not set the flag yet.'
+        );
+    }
+
+    /**
+     * ...while the same quote with a customer id is a logged-in customer's and is not.
+     */
+    public function testAQuoteWithoutTheGuestFlagAndWithACustomerIdIsNotVerified(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 0, 42)
+        );
+
+        $this->assertSame(
+            [],
+            $this->emailCalls(),
+            'customer_is_guest = 0 with a customer id is a logged-in customer; only guest emails are checked.'
+        );
+    }
+
+    /**
+     * Where the guest email is verified. Named from Magento\Framework\App\Area, as above.
+     */
+    public static function emailCheckedAreaProvider(): array
+    {
+        return [
+            'Hyvä Checkout page' => [Area::AREA_FRONTEND],
+        ];
+    }
+
+    /**
+     * Every case in which the email must NOT be verified, asserted on the spy: a skipped check
+     * and a passing one both end without an exception, so only the call log tells them apart.
+     *
+     * Each row breaks exactly one of the four conditions, so deleting any one of them fails
+     * exactly that row.
+     *
+     * @param string|\Throwable $area Area the request is handled in, or what
+     *                                State::getAreaCode() raises instead.
+     * @param mixed $customerIsGuest What Quote::getCustomerIsGuest() answers; a non-guest
+     *                               quote also carries a customer id.
+     * @param mixed $customerEmail What Quote::getCustomerEmail() answers.
+     * @param string $emailSetting loqate_settings/email_settings/enable_checkout.
+     * @param string $why The reason, for the failure message.
+     */
+    #[DataProvider('emailNotCheckedProvider')]
+    public function testTheEmailIsNotVerifiedOutsideTheGuestHyvaPath(
+        $area,
+        $customerIsGuest,
+        $customerEmail,
+        string $emailSetting,
+        string $why
+    ): void {
+        $this->config[self::EMAIL_CHECKOUT] = $emailSetting;
+        $observer = $this->createObserver($area);
+
+        $observer->execute(
+            $this->quoteEvent(
+                self::SHIPPING_ADDRESS,
+                self::BILLING_ADDRESS,
+                false,
+                $customerEmail,
+                $customerIsGuest,
+                $customerIsGuest ? null : 42
+            )
+        );
+
+        $this->assertSame([], $this->emailCalls(), $why);
+    }
+
+    /**
+     * One row per condition of the email block, each with the other three satisfied.
+     */
+    public static function emailNotCheckedProvider(): array
+    {
+        return [
+            'Luma REST checkout' => [
+                Area::AREA_WEBAPI_REST, 1, self::GUEST_EMAIL, '1',
+                'In webapi_rest Luma already verified this email in CheckoutShippingInformation; with '
+                . 'prevent_submit on, a second verify here would bill the same order twice.',
+            ],
+            'unresolvable area (CLI or programmatic order placement)' => [
+                new LocalizedException('Area code is not set'), 1, self::GUEST_EMAIL, '1',
+                'An unresolvable area has the same no-session lockout risk as GraphQL, so the email is not verified.',
+            ],
+            'GraphQL checkout' => [
+                Area::AREA_GRAPHQL, 1, self::GUEST_EMAIL, '1',
+                'GraphQL clients often keep no session, so with prevent_submit off the "warned once" record '
+                . 'would be lost and the guest warned on every submit, never able to place the order.',
+            ],
+            'admin order create' => [
+                Area::AREA_ADMINHTML, 1, self::GUEST_EMAIL, '1',
+                'Admin order create is verified by Plugin\Admin\OrderSave; this observer must verify nothing there.',
+            ],
+            'logged-in customer' => [
+                Area::AREA_FRONTEND, 0, self::GUEST_EMAIL, '1',
+                'Only guest emails are checked at checkout, as on Luma: a customer\'s email was verified at '
+                . 'registration.',
+            ],
+            'email verification switched off' => [
+                Area::AREA_FRONTEND, 1, self::GUEST_EMAIL, '',
+                'With email checkout verification off the guest email must not be verified or billed.',
+            ],
+            'no email on the quote' => [
+                Area::AREA_FRONTEND, 1, '', '1',
+                'An empty email has nothing to verify and must not be sent as a billable request.',
+            ],
+            'null email on the quote' => [
+                Area::AREA_FRONTEND, 1, null, '1',
+                'A quote with no email set has nothing to verify and must not be sent as a billable request.',
+            ],
+        ];
+    }
+
+    /**
      * Build the observer under test, wired to recording doubles.
      *
      * @param string|\Throwable $area Area code State::getAreaCode() answers with, or a
@@ -523,6 +809,13 @@ class QuoteSubmitBeforeTest extends TestCase
                 $calls[] = ['verifyPhoneNumber', $phone, $country];
 
                 return $this->phoneResponse;
+            }
+        );
+        $validator->method('validateEmail')->willReturnCallback(
+            function ($email, $blockOnApiError = true) use ($calls) {
+                $calls[] = ['validateEmail', $email, $blockOnApiError];
+
+                return $this->emailResponse;
             }
         );
 
@@ -558,23 +851,59 @@ class QuoteSubmitBeforeTest extends TestCase
      * @param array|null $shipping Shipping address data, or null for a quote with none.
      * @param array|null $billing Billing address data, or null for a quote with none.
      * @param bool $isVirtual Whether the quote is virtual (nothing to ship).
+     * @param mixed $customerEmail What Quote::getCustomerEmail() answers.
+     * @param mixed $customerIsGuest What Quote::getCustomerIsGuest() answers (Magento stores 0/1).
+     * @param mixed $customerId What Quote::getCustomerId() answers; null for a guest quote.
      * @return Observer
      */
-    private function quoteEvent(?array $shipping, ?array $billing, bool $isVirtual = false): Observer
-    {
+    private function quoteEvent(
+        ?array $shipping,
+        ?array $billing,
+        bool $isVirtual = false,
+        $customerEmail = null,
+        $customerIsGuest = 0,
+        $customerId = null
+    ): Observer {
         $shippingAddress = $shipping === null ? null : self::addressDouble($shipping);
         $billingAddress = $billing === null ? null : self::addressDouble($billing);
 
-        $quote = new class ($shippingAddress, $billingAddress, $isVirtual) {
+        $quote = new class ($shippingAddress, $billingAddress, $isVirtual, $customerEmail, $customerIsGuest, $customerId) {
             private $shippingAddress;
             private $billingAddress;
             private $isVirtual;
+            private $customerEmail;
+            private $customerIsGuest;
+            private $customerId;
 
-            public function __construct($shippingAddress, $billingAddress, bool $isVirtual)
-            {
+            public function __construct(
+                $shippingAddress,
+                $billingAddress,
+                bool $isVirtual,
+                $customerEmail,
+                $customerIsGuest,
+                $customerId
+            ) {
                 $this->shippingAddress = $shippingAddress;
                 $this->billingAddress = $billingAddress;
                 $this->isVirtual = $isVirtual;
+                $this->customerEmail = $customerEmail;
+                $this->customerIsGuest = $customerIsGuest;
+                $this->customerId = $customerId;
+            }
+
+            public function getCustomerId()
+            {
+                return $this->customerId;
+            }
+
+            public function getCustomerEmail()
+            {
+                return $this->customerEmail;
+            }
+
+            public function getCustomerIsGuest()
+            {
+                return $this->customerIsGuest;
             }
 
             public function getShippingAddress()
@@ -642,7 +971,25 @@ class QuoteSubmitBeforeTest extends TestCase
             {
                 return $this->data['country_id'] ?? null;
             }
+
+            public function getEmail()
+            {
+                return $this->data['email'] ?? null;
+            }
         };
+    }
+
+    /**
+     * The validateEmail() calls alone, as ['validateEmail', email, blockOnApiError].
+     *
+     * @return array<int, array>
+     */
+    private function emailCalls(): array
+    {
+        return array_values(array_filter(
+            $this->recordedCalls(),
+            static fn (array $call): bool => $call[0] === 'validateEmail'
+        ));
     }
 
     /**
