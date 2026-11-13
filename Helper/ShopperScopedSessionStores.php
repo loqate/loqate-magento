@@ -8,7 +8,7 @@ use Magento\Customer\Model\Session;
  * The single gateway to every store this module keeps in the customer session, and the one
  * place that enforces those stores belong to ONE shopper (LOQ-16978, LOQ-17149).
  *
- * WHY THIS EXISTS AT ALL. Seven session attributes decide whether a shopper's submission is
+ * WHY THIS EXISTS AT ALL. Eight session attributes decide whether a shopper's submission is
  * checked against Loqate at all, and every one of them is therefore a licence to SKIP a
  * verification:
  *  - self::CAPTURED_ADDRESSES_SESSION_KEY (the Capture bypass),
@@ -16,6 +16,7 @@ use Magento\Customer\Model\Session;
  *    LOQ-16969/LOQ-16976 address verdict caches);
  *  - self::VERIFIED_EMAIL_SESSION_KEY and self::VERIFIED_PHONE_SESSION_KEY (the
  *    email/phone bypass lists, LOQ-17149);
+ *  - self::PASSED_EMAIL_SESSION_KEY (the email pass cache, LOQ-20299);
  *  - self::PENDING_EMAIL_SESSION_KEY (one email address awaiting a billable verify);
  *  - self::BILLING_ERRORS_SESSION_KEY (the gate that refuses to place an order).
  * A PHP session outlives a login: Magento calls session_regenerate_id() on login and on
@@ -42,8 +43,8 @@ use Magento\Customer\Model\Session;
  * any of them, and therefore a way around every guard in this file.
  *
  * WHY A COLLABORATOR RATHER THAN A COPY IN EACH CLASS, and why ONE collaborator rather than
- * one per family of stores. The flush has to be identical in all seven stores or it is
- * worthless - flushing six of them still leaves the seventh granting B a bypass earned by A
+ * one per family of stores. The flush has to be identical in all eight stores or it is
+ * worthless - flushing seven of them still leaves the eighth granting B a bypass earned by A
  * - and it is the kind of rule that rots when duplicated. That argument is also why
  * LOQ-17149 extended this class instead of adding a sibling seam for the contact stores:
  * two seams over one session would need either duplicated ownership logic or two owner
@@ -109,12 +110,12 @@ use Magento\Customer\Model\Session;
  *    requests straddling a login can both observe the old marker; the loser re-verifies,
  *    which costs a billable call and grants nothing.
  *
- * ADDING AN EIGHTH STORE: list it in self::SHOPPER_SCOPED_SESSION_KEYS. Reading or writing
+ * ADDING A NINTH STORE: list it in self::SHOPPER_SCOPED_SESSION_KEYS. Reading or writing
  * an attribute through this class does NOT enrol it in the flush; only that list does, and
  * getData()/setData() REJECT any key missing from it so that an un-enrolled attribute
- * cannot quietly acquire the guard's appearance without its protection. Decide the eighth
+ * cannot quietly acquire the guard's appearance without its protection. Decide the ninth
  * store on its own merits before adding it - LOQ-17149 assessed its four one at a time and
- * they did not all get the same answer: the two LISTS are additionally BOUNDED
+ * they did not all get the same answer: the contact LISTS are additionally BOUNDED
  * (self::VERIFIED_CONTACT_LIMIT) and HASHED (contactDigest()), while for the single scalar
  * and the single boolean bounding is meaningless and only the flush was needed.
  *
@@ -190,6 +191,18 @@ class ShopperScopedSessionStores
      * "simplifying" the two attributes into one.)
      */
     public const VERIFIED_PHONE_SESSION_KEY = 'loqate_phone';
+
+    /**
+     * Session attribute holding the email addresses that PASSED verification in this session
+     * (LOQ-20299), so a later checkout check of the same address makes no billable call.
+     *
+     * Read and written only by Helper\Validator::validateEmail(), and only for the checkout
+     * callers that opt in. Only passes are written - never an invalid verdict, an API error or
+     * a noKeyFound - so an outage can never mark an address valid. Digests, bounded and
+     * flushed exactly like self::VERIFIED_EMAIL_SESSION_KEY; unlike that list it applies under
+     * both prevent_submit settings.
+     */
+    public const PASSED_EMAIL_SESSION_KEY = 'loqate_email_passed';
 
     /**
      * Session attribute holding ONE email address awaiting a billable verify (LOQ-17149).
@@ -272,8 +285,8 @@ class ShopperScopedSessionStores
     public const IP_COUNTRY_SESSION_KEY = 'loqate_ipcountry';
 
     /**
-     * Maximum number of contact digests kept per session in EACH of the two lists, oldest
-     * evicted first (LOQ-17149).
+     * Maximum number of contact digests kept per session in EACH of the three lists, oldest
+     * evicted first (LOQ-17149; the email pass list joined in LOQ-20299).
      *
      * SMALLER THAN ITS SIBLINGS ON PURPOSE. Helper\Controller::CAPTURED_ADDRESSES_LIMIT and
      * Validator::VERIFY_CACHE_LIMIT are 50 and Validator::BATCH_VERIFY_CACHE_LIMIT is 200;
@@ -297,10 +310,10 @@ class ShopperScopedSessionStores
      * consequence is one extra billable verify and one extra warning, never a bypass, which
      * is the safe direction.
      *
-     * WHY IT IS ONE CONSTANT FOR BOTH LISTS: they have the same shape, the same single writer
-     * (shouldVerify() in this class) and the same entry size, so two constants would
-     * be two things to keep equal. Each list is bounded to this figure SEPARATELY, so the
-     * session holds at most 2 x 25 x 64 characters of digest, about 3 kB.
+     * WHY IT IS ONE CONSTANT FOR ALL THREE LISTS: they have the same shape, the same single
+     * writer (rememberContactDigest() in this class) and the same entry size, so separate
+     * constants would be things to keep equal. Each list is bounded to this figure SEPARATELY,
+     * so the session holds at most 3 x 25 x 64 characters of digest, about 5 kB.
      */
     public const VERIFIED_CONTACT_LIMIT = 25;
 
@@ -309,7 +322,7 @@ class ShopperScopedSessionStores
      *
      * A SIBLING attribute rather than a member inside each store: the stores have several
      * different shapes (a list of serialised addresses, two key => serialised-verdict maps,
-     * two lists of digests, a string, a boolean), every reader of them is defensive about
+     * three lists of digests, a string, a boolean), every reader of them is defensive about
      * that shape, and wrapping them would mean changing all of those readers to unwrap an
      * owner they must never trust anyway. One attribute also means one place to compare and
      * one place to write.
@@ -377,7 +390,7 @@ class ShopperScopedSessionStores
     /**
      * Every session attribute owned by one shopper, flushed together on an identity change.
      *
-     * All seven are verify BYPASSES or gates on one shopper's submission, which is why they
+     * All eight are verify BYPASSES or gates on one shopper's submission, which is why they
      * share a lifetime: a stale entry in any one of them lets data through without the
      * billable Loqate call that would have judged it for THIS shopper, or - in
      * self::BILLING_ERRORS_SESSION_KEY's case - refuses this shopper an order because of a
@@ -394,6 +407,7 @@ class ShopperScopedSessionStores
         self::BATCH_VERIFY_CACHE_SESSION_KEY,
         self::VERIFIED_EMAIL_SESSION_KEY,
         self::VERIFIED_PHONE_SESSION_KEY,
+        self::PASSED_EMAIL_SESSION_KEY,
         self::PENDING_EMAIL_SESSION_KEY,
         self::BILLING_ERRORS_SESSION_KEY,
     ];
@@ -532,11 +546,11 @@ class ShopperScopedSessionStores
 
     /**
      * The one-way digest under which an email address or phone number is remembered as
-     * "already warned about" (LOQ-17149).
+     * "already warned about" (LOQ-17149), or as "passed" (LOQ-20299).
      *
-     * WHY A DIGEST AT ALL. self::VERIFIED_EMAIL_SESSION_KEY and
-     * self::VERIFIED_PHONE_SESSION_KEY are pure COMPARISON stores: their only reader,
-     * shouldVerify() in this class, asks "have I seen this value before?" and never
+     * WHY A DIGEST AT ALL. self::VERIFIED_EMAIL_SESSION_KEY,
+     * self::VERIFIED_PHONE_SESSION_KEY and self::PASSED_EMAIL_SESSION_KEY are pure COMPARISON
+     * stores: their only reader, hasContactDigest() in this class, asks "have I seen this value before?" and never
      * reads a stored value back out for any other purpose. A store that only has to compare
      * does not need to hold the value, and these values are the customer's email address and
      * phone number, held for the whole life of the session. Hashing is therefore the
@@ -612,13 +626,16 @@ class ShopperScopedSessionStores
      * store can be resolved.
      *
      * @param string $field One of self::SHOPPER_SCOPED_SESSION_KEYS - in practice
-     *                      self::VERIFIED_EMAIL_SESSION_KEY or
-     *                      self::VERIFIED_PHONE_SESSION_KEY. Asserted as ENROLLED rather
-     *                      than against those two specifically, because the property that
+     *                      self::VERIFIED_EMAIL_SESSION_KEY,
+     *                      self::VERIFIED_PHONE_SESSION_KEY or
+     *                      self::PASSED_EMAIL_SESSION_KEY. Asserted as ENROLLED rather
+     *                      than against those three specifically, because the property that
      *                      matters is the one assertEnrolled() checks: the digest is only
      *                      ever stored under $field, so $field must be a store this class
      *                      flushes.
      * @param mixed $value The email address or phone number as it arrived from the request.
+     *                     For PASSED_EMAIL_SESSION_KEY it is "<catch-all 0|1>|<email>" -
+     *                     see Validator::validateEmail(); a bare email never matches there.
      * @return string 64 lowercase hex characters, or '' when no digest can be produced -
      *                either because $value is not a scalar or because no salt could be
      *                generated. '' is the "do not cache this" sentinel, mirroring
@@ -634,7 +651,7 @@ class ShopperScopedSessionStores
         // Runs the flush and any salt rotation BEFORE the salt is read, so the digest can
         // never be computed under a salt that this same request is about to discard. That
         // makes this method and getData() safe to call in either order, which matters
-        // because shouldVerify() needs both and neither ordering is obviously correct.
+        // because hasContactDigest() needs both and neither ordering is obviously correct.
         $this->enforceOwnership();
 
         if ($value !== null && !is_scalar($value)) {
@@ -673,7 +690,7 @@ class ShopperScopedSessionStores
     /**
      * Is $value something contactDigest() produced?
      *
-     * Used by shouldVerify() to drop anything else from the two
+     * Used by storedContactDigests() to drop anything else from the three
      * contact lists before comparing or appending. Two things reach those lists that are not
      * digests, and both should leave: a RAW email address or phone number written by a
      * release before LOQ-17149 into a session that was mid-flight at deploy time, and
@@ -740,34 +757,27 @@ class ShopperScopedSessionStores
      */
     public function shouldVerify(string $field, $value): bool
     {
+        if ($this->hasContactDigest($field, $value)) {
+            return false;
+        }
+
+        $this->rememberContactDigest($field, $value);
+
+        return true;
+    }
+
+    /**
+     * Is this value in the $field digest list? Writes nothing - see shouldVerify() for why a hit
+     * does not refresh the entry.
+     *
+     * @param string $field self::VERIFIED_EMAIL_SESSION_KEY, ::VERIFIED_PHONE_SESSION_KEY or
+     *                      ::PASSED_EMAIL_SESSION_KEY.
+     * @param mixed $value The email address or phone number as it arrived from the request.
+     * @return bool False also when no digest can be produced, so the caller verifies.
+     */
+    public function hasContactDigest(string $field, $value): bool
+    {
         $digest = $this->contactDigest($field, $value);
-        if ($digest === '') {
-            // No comparable digest could be produced - a non-scalar value, or no CSPRNG for
-            // the salt. Verify, and store nothing: the fail-closed direction, at the price of
-            // a billable call. See contactDigest().
-            return true;
-        }
-
-        $storedData = $this->getData($field);
-        if (!is_array($storedData)) {
-            // Covers the empty session, a store just flushed to null by the ownership guard,
-            // and - defensively - an attribute another module or a truncated payload left in
-            // a shape this list cannot be appended to.
-            $storedData = [];
-        }
-
-        // Drop everything that is not one of this class's digests, and re-index so the FIFO
-        // eviction below and the [] append operate on a list. Two things are dropped: a RAW
-        // email address or phone number written by a pre-LOQ-17149 release into a session
-        // that was live at deploy time, and anything foreign. Both are inert - neither can
-        // ever equal a digest - so no verdict changes; what this buys is that the last raw
-        // contact details leave the session at the first write rather than waiting for
-        // eviction or a shopper change. It also means such a session costs one extra billable
-        // verify per value at deploy time, which is recorded in CHANGELOG.md.
-        $storedData = array_values(array_filter(
-            $storedData,
-            fn ($entry): bool => $this->isContactDigest($entry)
-        ));
 
         // STRICT, and it is worth a sentence because a LOOSE in_array() on this very line is
         // what LOQ-17149 replaced. Both needle and haystack are now 64-character hex strings,
@@ -778,9 +788,28 @@ class ShopperScopedSessionStores
         // pinned by a test - a real HMAC output cannot be forced into that shape from a test,
         // so removing the flag leaves the suite green - which is exactly why it is stated here.
         // The flag costs nothing and the direction it protects is the bypass one.
-        if (in_array($digest, $storedData, true)) {
-            return false;
+        return $digest !== '' && in_array($digest, $this->storedContactDigests($field), true);
+    }
+
+    /**
+     * Append this value's digest to the $field list, oldest evicted first. Call it only after a
+     * hasContactDigest() miss, which is what keeps the list free of duplicates.
+     *
+     * @param string $field As hasContactDigest().
+     * @param mixed $value The email address or phone number as it arrived from the request.
+     * @return void
+     */
+    public function rememberContactDigest(string $field, $value): void
+    {
+        $digest = $this->contactDigest($field, $value);
+        if ($digest === '') {
+            // No comparable digest could be produced - a non-scalar value, or no CSPRNG for
+            // the salt. Store nothing, so the value is verified every time: the fail-closed
+            // direction, at the price of a billable call. See contactDigest().
+            return;
         }
+
+        $storedData = $this->storedContactDigests($field);
 
         // FIFO eviction, mirroring the address stores. The keys are integers, so array_shift()
         // renumbers them, which is what a list wants. The $storedData !== [] guard keeps the
@@ -792,8 +821,36 @@ class ShopperScopedSessionStores
 
         $storedData[] = $digest;
         $this->setData($field, $storedData);
+    }
 
-        return true;
+    /**
+     * The $field digest list as a clean list.
+     *
+     * @param string $field As hasContactDigest().
+     * @return string[]
+     */
+    private function storedContactDigests(string $field): array
+    {
+        $storedData = $this->getData($field);
+        if (!is_array($storedData)) {
+            // Covers the empty session, a store just flushed to null by the ownership guard,
+            // and - defensively - an attribute another module or a truncated payload left in
+            // a shape this list cannot be appended to.
+            return [];
+        }
+
+        // Drop everything that is not one of this class's digests, and re-index so the FIFO
+        // eviction and the [] append operate on a list. Two things are dropped: a RAW
+        // email address or phone number written by a pre-LOQ-17149 release into a session
+        // that was live at deploy time, and anything foreign. Both are inert - neither can
+        // ever equal a digest - so no verdict changes; what this buys is that the last raw
+        // contact details leave the session at the first write rather than waiting for
+        // eviction or a shopper change. It also means such a session costs one extra billable
+        // verify per value at deploy time, which is recorded in CHANGELOG.md.
+        return array_values(array_filter(
+            $storedData,
+            fn ($entry): bool => $this->isContactDigest($entry)
+        ));
     }
 
     /**
@@ -931,7 +988,7 @@ class ShopperScopedSessionStores
      * means for the session stores themselves.
      *
      * NOTE THAT THIS WRITES ON A READ PATH: getData() and contactDigest() reach here, and a
-     * first access or an identity change makes it store the owner marker (and possibly seven
+     * first access or an identity change makes it store the owner marker (and possibly eight
      * nulls). That is harmless today because these helpers and plugins are only reached from
      * POST and AJAX endpoints - checkout saves, the Capture retrieve controller, admin order
      * save and customer import - never from a cacheable GET rendered into full-page cache.

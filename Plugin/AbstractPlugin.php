@@ -78,7 +78,7 @@ abstract class AbstractPlugin
     /**
      * @var ShopperScopedSessionStores The three session stores this class family owns, behind
      *      the shopper-ownership guard. Private for the same reason $session is: a protected
-     *      seam would let any of the ten subclasses reach any of the seven enrolled stores,
+     *      seam would let any of the ten subclasses reach any of the eight enrolled stores,
      *      which is wider than any of them needs and wider than the named accessors below.
      */
     private ShopperScopedSessionStores $sessionStores;

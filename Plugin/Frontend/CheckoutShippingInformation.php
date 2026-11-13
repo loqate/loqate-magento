@@ -51,7 +51,8 @@ class CheckoutShippingInformation extends AbstractPlugin
             // successful verify, which is why the flush is what covers the abandoned case.
             if ($this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
             && ($email = $this->pendingEmailAddress())) {
-                $errorMessage = $this->validateEmail($email);
+                // usePassCache: a pass here spares Observer\QuoteSubmitBefore a second billable check.
+                $errorMessage = $this->validator->validateEmail($email, usePassCache: true);
                 if ($errorMessage) {
                     $errors[] = $errorMessage;
                 } else {
