@@ -13,12 +13,14 @@ use Magento\Checkout\Model\ShippingInformationManagement;
 use Magento\Customer\Model\AccountManagement as CoreAccountManagement;
 use Magento\Framework\App\Action\Context;
 use Magento\Framework\App\Area;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\App\State;
 use Magento\Framework\Event\Observer;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Serialize\SerializerInterface;
 use Magento\Framework\UrlInterface;
 use Magento\Framework\Session\Config\ConfigInterface as SessionConfig;
@@ -614,30 +616,88 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * An email rejection is reported ALONGSIDE the address rejections, one per line, so the
-     * shopper sees every problem at once - the same contract the address and phone checks keep.
+     * SA-1: once an address or phone check has already rejected the order, the guest email is
+     * NOT verified - the order is refused anyway, so the email call would only be a billable
+     * request (and, with Prevent Submit = No, a spent "warned once") for nothing. The rejection
+     * carries the address/phone message(s) alone. This holds on every path the email is checked
+     * on, session-bearing or not.
+     *
+     * The email double is primed to REJECT, so an observer that still made the call fails twice:
+     * the spy records it and the email message lands in the exception.
+     *
+     * @param string $area Area the request is handled in.
+     * @param string|null $sessionCookie The storefront session cookie, or null when absent.
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     * @param string $failingCheck 'address' or 'phone': the check that rejects the order.
+     * @param string $expectedMessage The whole exception message.
      */
-    public function testAnEmailRejectionIsJoinedToTheAddressRejections(): void
-    {
+    #[DataProvider('addressOrPhoneRejectedProvider')]
+    public function testAnAddressOrPhoneRejectionSkipsTheEmailCheckOnEveryPath(
+        string $area,
+        ?string $sessionCookie,
+        string $preventSubmit,
+        string $failingCheck,
+        string $expectedMessage
+    ): void {
         $this->config[self::EMAIL_CHECKOUT] = '1';
-        $this->addressResponse = ['error' => true, 'message' => 'The provided address is invalid.'];
-        $this->emailResponse = 'The provided email address is invalid.';
-        $observer = $this->createObserver(Area::AREA_FRONTEND);
-
-        try {
-            $observer->execute(
-                $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
-            );
-            $this->fail('A rejected address and a rejected email must abort the order submission.');
-        } catch (LocalizedException $exception) {
-            $this->assertSame(
-                'The provided address is invalid.' . PHP_EOL
-                . 'The provided address is invalid.' . PHP_EOL
-                . 'The provided email address is invalid.',
-                $exception->getMessage(),
-                'The email rejection must be appended to the address rejections, not replace them.'
-            );
+        $this->config[self::EMAIL_PREVENT_SUBMIT] = $preventSubmit;
+        $this->sessionCookie = $sessionCookie;
+        if ($failingCheck === 'address') {
+            $this->addressResponse = ['error' => true, 'message' => 'The provided address is invalid.'];
+        } else {
+            $this->phoneResponse = false;
         }
+        $this->emailResponse = 'The provided email address is invalid.';
+        $observer = $this->createObserver($area);
+
+        $rejection = $this->placeOrder(
+            $observer,
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertSame(
+            [],
+            $this->emailCalls(),
+            'An order already rejected by the ' . $failingCheck . ' check must not have its email verified: '
+            . 'that is a billable call whose verdict cannot change the outcome.'
+        );
+        $this->assertNotNull($rejection, 'The ' . $failingCheck . ' rejection must still abort the order.');
+        $this->assertSame(
+            $expectedMessage,
+            $rejection->getMessage(),
+            'The rejection must carry the ' . $failingCheck . ' message(s) only.'
+        );
+    }
+
+    /**
+     * One row per email-checked path family; addresses fail on both shipping and billing, and so
+     * do phone numbers, so each message appears twice, one per line, as before.
+     */
+    public static function addressOrPhoneRejectedProvider(): array
+    {
+        $addressMessage = 'The provided address is invalid.' . PHP_EOL . 'The provided address is invalid.';
+        $phoneMessage = 'The provided phone number is invalid.' . PHP_EOL . 'The provided phone number is invalid.';
+
+        return [
+            '(a) frontend session path, guest, address rejected' => [
+                Area::AREA_FRONTEND, self::SESSION_ID, '0', 'address', $addressMessage,
+            ],
+            '(b) GraphQL session-less, prevent_submit on, phone rejected' => [
+                Area::AREA_GRAPHQL, null, '1', 'phone', $phoneMessage,
+            ],
+            'frontend session path, guest, phone rejected' => [
+                Area::AREA_FRONTEND, self::SESSION_ID, '0', 'phone', $phoneMessage,
+            ],
+            'GraphQL session-less, prevent_submit on, address rejected' => [
+                Area::AREA_GRAPHQL, null, '1', 'address', $addressMessage,
+            ],
+            'Luma REST with the session cookie, phone rejected' => [
+                Area::AREA_WEBAPI_REST, self::SESSION_ID, '0', 'phone', $phoneMessage,
+            ],
+            'REST without the session cookie, prevent_submit on, address rejected' => [
+                Area::AREA_WEBAPI_REST, null, '1', 'address', $addressMessage,
+            ],
+        ];
     }
 
     /**
@@ -1009,6 +1069,42 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->assertCount(1, $journey['emailRequests'], 'Fixture guard: the email really was sent for verification.');
     }
 
+    /**
+     * SA-1 journey (frontend, with a session, Prevent Submit = No): a bad address AND a bad email
+     * are rejected for the address alone, with no email call; once the address is fixed the email
+     * is billed once and warned, and the resubmission is accepted without a second call.
+     */
+    public function testAnAddressRejectionDefersTheEmailWarningToTheNextAttempt(): void
+    {
+        $journey = $this->createJourney('', false, Area::AREA_FRONTEND, self::SESSION_ID, null, true);
+        $event = $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1);
+
+        $this->addressResponse = ['error' => true, 'message' => 'The provided address is invalid.'];
+        $first = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        $firstRequests = count($journey['emailRequests']);
+
+        $this->addressResponse = ['error' => false];
+        $second = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        $secondRequests = count($journey['emailRequests']);
+
+        $third = $this->placeOrder($journey['observer'], $event)?->getMessage();
+
+        $this->assertSame(
+            'The provided address is invalid.' . PHP_EOL . 'The provided address is invalid.',
+            $first,
+            'Attempt 1 is refused for the address alone.'
+        );
+        $this->assertSame(0, $firstRequests, 'Attempt 1 must not bill the email: the order is refused anyway.');
+        $this->assertSame(
+            'Invalid email address. Submit again to use this email address.',
+            $second,
+            'Attempt 2, with the address fixed, warns about the email.'
+        );
+        $this->assertSame(1, $secondRequests, 'Attempt 2 bills the email once.');
+        $this->assertNull($third, 'Attempt 3 resubmits the warned email and is accepted.');
+        $this->assertCount(1, $journey['emailRequests'], 'Attempt 3 costs no further email call.');
+    }
+
     public static function sessionlessAreaProvider(): array
     {
         return [
@@ -1036,6 +1132,8 @@ class QuoteSubmitBeforeTest extends TestCase
      * @param string|null $sessionCookie The storefront session cookie, or null when absent.
      * @param ArrayObject|null $emailRequests Shared billable-call log, so several journeys - one
      *                                        per session-less request - can be counted together.
+     * @param bool $checkAddress Also switch the address check on; verifyAddress() answers the
+     *                           live $this->addressResponse, so a test can fix the address between attempts.
      * @return array{accountManagement: AccountManagement, shipping: CheckoutShippingInformation,
      *     observer: QuoteSubmitBefore, emailRequests: ArrayObject}
      */
@@ -1044,7 +1142,8 @@ class QuoteSubmitBeforeTest extends TestCase
         $verifyResponse,
         string $area = Area::AREA_WEBAPI_REST,
         ?string $sessionCookie = self::SESSION_ID,
-        ?ArrayObject $emailRequests = null
+        ?ArrayObject $emailRequests = null,
+        bool $checkAddress = false
     ): array {
         $emailRequests = $emailRequests ?? new ArrayObject();
         $session = $this->createSessionDouble(new ArrayObject(), new ArrayObject(['customerId' => null]));
@@ -1052,8 +1151,9 @@ class QuoteSubmitBeforeTest extends TestCase
             'loqate_settings/settings/api_key' => 'TEST-API-KEY-0000',
             self::EMAIL_CHECKOUT => '1',
             self::EMAIL_PREVENT_SUBMIT => $preventSubmit,
+            self::ADDRESS_CHECKOUT => $checkAddress ? '1' : '',
         ]);
-        // A real Validator with only the billable verifyEmail() stubbed and counted.
+        // A real Validator with only the billable verifyEmail() and verifyAddress() stubbed.
         $moduleList = $this->createMock(ModuleListInterface::class);
         $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
         $validator = $this->getMockBuilder(Validator::class)
@@ -1064,8 +1164,10 @@ class QuoteSubmitBeforeTest extends TestCase
                 $moduleList,
                 $helper,
                 $this->createMock(SerializerInterface::class),
+                $this->createMock(NotifierInterface::class),
+                $this->createMock(CacheInterface::class),
             ])
-            ->onlyMethods(['verifyEmail'])
+            ->onlyMethods(['verifyEmail', 'verifyAddress'])
             ->getMock();
         $validator->method('verifyEmail')->willReturnCallback(
             static function ($email) use ($emailRequests, $verifyResponse) {
@@ -1074,6 +1176,7 @@ class QuoteSubmitBeforeTest extends TestCase
                 return $verifyResponse;
             }
         );
+        $validator->method('verifyAddress')->willReturnCallback(fn () => $this->addressResponse);
         $pluginArguments = [
             $this->createMock(Context::class),
             $this->createMock(UrlInterface::class),

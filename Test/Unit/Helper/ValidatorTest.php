@@ -10,8 +10,11 @@ use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Plugin\AbstractPlugin;
 use Loqate\ApiIntegration\Test\Unit\Plugin\ShopperSessionHarness;
 use Magento\Customer\Model\Session;
+use Loqate\ApiConnector\Client\Verify;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\App\Action\Context;
+use Magento\Framework\App\CacheInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Module\ModuleListInterface;
 use Magento\Framework\Serialize\SerializerInterface;
@@ -20,6 +23,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
+use ReflectionProperty;
 
 /**
  * Unit tests for the captured-address (Loqate lookup) bypass logic in Validator.
@@ -80,7 +84,9 @@ class ValidatorTest extends TestCase
             $regionFactory,
             $moduleList,
             $this->helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
     }
 
@@ -675,6 +681,297 @@ class ValidatorTest extends TestCase
     }
 
     /**
+     * SA-2: an email API error is a fault the merchant has to act on (bad key, no credit, outage),
+     * and the quote-submit path now lets such orders through unchecked. So it is logged as a
+     * WARNING: the level is what log shippers and alerting filter on.
+     */
+    public function testAnEmailApiErrorIsLoggedAsAWarningNotAsInfo(): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'Loqate email API timed out']);
+
+        $fixture['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertSame(
+            [],
+            $this->logMessages($fixture, 'info'),
+            'The email API error must no longer be logged at info level.'
+        );
+        $warnings = $this->logMessages($fixture, 'warning');
+        $this->assertCount(1, $warnings, 'The email API error must be logged exactly once, as a warning.');
+        $this->assertStringContainsString(
+            'Loqate email API timed out',
+            $warnings[0],
+            'The warning must carry the SDK\'s error message, or the merchant cannot diagnose the fault.'
+        );
+    }
+
+    /**
+     * SA-2: the first email API error raises ONE major admin inbox notice and opens a one-hour
+     * throttle window in the cache, so the merchant sees the fault without having to read logs.
+     *
+     * @param false|string $absent What CacheInterface::load() answers for a key it does not hold.
+     */
+    #[DataProvider('absentCacheValueProvider')]
+    public function testTheFirstEmailApiErrorRaisesOneMajorAdminNoticeAndOpensAnHourLongThrottle($absent): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout'], $absent);
+
+        $fixture['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertCount(1, $fixture['notices'], 'The first email API error must raise exactly one admin notice.');
+        $this->assertCount(1, $fixture['cacheSaves'], 'The throttle must be recorded in the cache, once.');
+        $save = $fixture['cacheSaves'][0];
+        $this->assertSame(3600, (int)$save['lifetime'], 'The throttle window is one hour.');
+        $this->assertNotFalse($save['data'], 'The throttle entry must hold something load() reports as present.');
+        $this->assertNotSame('', (string)$save['data'], 'An empty entry would read back as absent.');
+        $this->assertContains(
+            $save['key'],
+            iterator_to_array($fixture['cacheLoads']),
+            'The throttle key saved must be the one checked before raising the notice.'
+        );
+    }
+
+    public static function absentCacheValueProvider(): array
+    {
+        return [
+            'load() answers false when absent' => [false],
+            'load() answers an empty string when absent' => [''],
+        ];
+    }
+
+    /**
+     * SA-2: while the throttle entry is present, a further email API error raises NO notice - the
+     * inbox must not get one entry per failed checkout during an outage.
+     */
+    public function testAnEmailApiErrorWhileTheThrottleIsActiveRaisesNoNotice(): void
+    {
+        // A cache that holds every key: whatever throttle key the Validator uses is present.
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout'], false, '1');
+
+        $fixture['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertCount(0, $fixture['notices'], 'No notice may be raised while the throttle is active.');
+        $this->assertNotEmpty($fixture['cacheLoads'], 'Fixture guard: the throttle must actually be consulted.');
+        $this->assertCount(1, $this->logMessages($fixture, 'warning'), 'The error is still logged as a warning.');
+    }
+
+    /**
+     * SA-2: the throttle is install-wide and lives in the CACHE, not in the Validator instance or
+     * per email: repeated errors, a later request (new Validator) and a DIFFERENT email within the
+     * hour raise no further notice; once the entry expires, the next error raises one again.
+     */
+    public function testTheNoticeIsThrottledAcrossCallsRequestsAndEmailsUntilTheCacheEntryExpires(): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+
+        $fixture['validator']->verifyEmail(self::EMAIL);
+        $fixture['validator']->verifyEmail(self::EMAIL);
+        $fixture['validator']->verifyEmail('another.shopper@example.com');
+        $nextRequest = $this->emailApiFixture(
+            ['error' => true, 'message' => 'timeout'],
+            false,
+            null,
+            $fixture['cacheStore'],
+            $fixture['notices']
+        );
+        $nextRequest['validator']->verifyEmail('third.shopper@example.com');
+
+        $this->assertCount(1, $fixture['notices'], 'Within the hour only the first error may raise a notice.');
+
+        // The hour passes: the cache entry is gone.
+        $fixture['cacheStore']->exchangeArray([]);
+        $nextRequest['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertCount(2, $fixture['notices'], 'Once the throttle entry expires the next error raises a notice again.');
+    }
+
+    /**
+     * SA-2: an admin notice is visible to every admin user and stored in the inbox table, so it
+     * must not carry the shopper's email address.
+     */
+    public function testTheAdminNoticeDoesNotContainTheEmailAddress(): void
+    {
+        $email = 'private.person+tag@shopper-domain.example';
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+
+        $fixture['validator']->verifyEmail($email);
+
+        $this->assertCount(1, $fixture['notices'], 'Fixture guard: a notice must have been raised.');
+        $notice = $fixture['notices'][0];
+        $this->assertNotSame('', trim((string)$notice['title']), 'The notice needs a title.');
+        foreach ($notice['args'] as $index => $argument) {
+            $this->assertStringNotContainsString(
+                $email,
+                is_array($argument) ? implode(' ', $argument) : (string)$argument,
+                'addMajor() argument #' . $index . ' must not name the shopper\'s email.'
+            );
+        }
+    }
+
+    /**
+     * SA-2: the notice is best-effort. On the quote-submit path an API error lets the order
+     * through, so an inbox (or cache) fault while raising the notice must not abort it: the SDK's
+     * error array is still returned and the fault is logged as a second warning.
+     */
+    public function testANoticeFailureStillReturnsTheErrorAndLogsBothWarnings(): void
+    {
+        $sdkResponse = ['error' => true, 'message' => 'timeout'];
+        $fixture = $this->emailApiFixture($sdkResponse, addMajorThrows: new \RuntimeException('inbox table is locked'));
+
+        $response = $fixture['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertSame($sdkResponse, $response, 'The SDK error array must still be returned.');
+        $this->assertCount(1, $fixture['notices'], 'Fixture guard: addMajor() was reached and threw.');
+        $this->assertSame(
+            ['timeout', 'Loqate could not raise the email API error notice: inbox table is locked'],
+            $this->logMessages($fixture, 'warning'),
+            'Both the API error and the notice failure must be logged as warnings.'
+        );
+    }
+
+    /**
+     * SA-2: only an API ERROR is a fault. A pass (true) or an invalid email (false) is normal
+     * operation: no notice, no warning, and the throttle is not touched.
+     *
+     * @param bool $sdkResponse What the SDK's verifyEmail() answers.
+     */
+    #[DataProvider('emailVerdictProvider')]
+    public function testAPassOrAnInvalidEmailRaisesNoNoticeAndNoWarning(bool $sdkResponse): void
+    {
+        $fixture = $this->emailApiFixture($sdkResponse);
+
+        $response = $fixture['validator']->verifyEmail(self::EMAIL);
+
+        $this->assertSame($sdkResponse, $response, 'Fixture guard: the SDK verdict is returned unchanged.');
+        $this->assertCount(0, $fixture['notices'], 'A verdict is not a fault: no admin notice.');
+        $this->assertSame([], $this->logMessages($fixture, 'warning'), 'A verdict is not a fault: no warning.');
+        $this->assertCount(0, $fixture['cacheSaves'], 'A verdict must not open the throttle window.');
+    }
+
+    public static function emailVerdictProvider(): array
+    {
+        return [
+            'valid email' => [true],
+            'invalid email' => [false],
+        ];
+    }
+
+    /**
+     * A real Validator with an API key, whose SDK client is swapped for a double answering
+     * $sdkResponse, so verifyEmail() itself runs. The logger, notifier and cache are recording
+     * doubles; the cache is an in-memory map.
+     *
+     * Passes the notifier and cache as the 7th and 8th constructor arguments (SA-2).
+     *
+     * @param mixed $sdkResponse What Verify::verifyEmail() answers.
+     * @param false|string $absent What load() answers for a key the cache does not hold.
+     * @param string|null $everyKey When set, load() answers this for EVERY key.
+     * @param ArrayObject|null $cacheStore Shared cache contents, key => data.
+     * @param ArrayObject|null $notices Shared addMajor() log.
+     * @param \Throwable|null $addMajorThrows When set, addMajor() records the call and then throws it.
+     * @return array{validator: Validator, logs: ArrayObject, notices: ArrayObject, cacheStore: ArrayObject,
+     *     cacheSaves: ArrayObject, cacheLoads: ArrayObject}
+     */
+    private function emailApiFixture(
+        $sdkResponse,
+        $absent = false,
+        ?string $everyKey = null,
+        ?ArrayObject $cacheStore = null,
+        ?ArrayObject $notices = null,
+        ?\Throwable $addMajorThrows = null
+    ): array {
+        $logs = new ArrayObject();
+        $notices = $notices ?? new ArrayObject();
+        $cacheStore = $cacheStore ?? new ArrayObject();
+        $cacheSaves = new ArrayObject();
+        $cacheLoads = new ArrayObject();
+
+        $logger = $this->createMock(Logger::class);
+        foreach (['debug', 'info', 'notice', 'warning', 'error', 'critical'] as $level) {
+            $logger->method($level)->willReturnCallback(
+                static function ($message, array $context = []) use ($logs, $level): void {
+                    $logs[] = ['level' => $level, 'message' => (string)$message];
+                }
+            );
+        }
+
+        $notifier = $this->createMock(NotifierInterface::class);
+        $notifier->method('addMajor')->willReturnCallback(
+            static function ($title, $description, $url = '', $isInternal = true) use ($notices, $notifier, $addMajorThrows) {
+                $notices[] = ['title' => $title, 'description' => $description, 'args' => func_get_args()];
+                if ($addMajorThrows) {
+                    throw $addMajorThrows;
+                }
+
+                return $notifier;
+            }
+        );
+
+        $cache = $this->createMock(CacheInterface::class);
+        $cache->method('load')->willReturnCallback(
+            static function ($key) use ($cacheStore, $cacheLoads, $absent, $everyKey) {
+                $cacheLoads[] = $key;
+                if ($everyKey !== null) {
+                    return $everyKey;
+                }
+
+                return $cacheStore[$key] ?? $absent;
+            }
+        );
+        $cache->method('save')->willReturnCallback(
+            static function ($data, $key, $tags = [], $lifetime = null) use ($cacheStore, $cacheSaves): bool {
+                $cacheSaves[] = ['data' => $data, 'key' => $key, 'tags' => $tags, 'lifetime' => $lifetime];
+                $cacheStore[$key] = $data;
+
+                return true;
+            }
+        );
+
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
+
+        $validator = new Validator(
+            $logger,
+            $this->createMock(Session::class),
+            $this->createMock(RegionFactory::class),
+            $moduleList,
+            $this->createConfigHelper(['loqate_settings/settings/api_key' => 'TEST-API-KEY-0000']),
+            $this->createMock(SerializerInterface::class),
+            $notifier,
+            $cache
+        );
+
+        // The SDK client is built in the constructor (new Verify($apiKey)); swap it for a double.
+        $connector = $this->createMock(Verify::class);
+        $connector->method('verifyEmail')->willReturn($sdkResponse);
+        $property = new ReflectionProperty(Validator::class, 'apiConnector');
+        $property->setValue($validator, $connector);
+
+        return [
+            'validator' => $validator,
+            'logs' => $logs,
+            'notices' => $notices,
+            'cacheStore' => $cacheStore,
+            'cacheSaves' => $cacheSaves,
+            'cacheLoads' => $cacheLoads,
+        ];
+    }
+
+    /**
+     * The messages logged at one level, in order.
+     *
+     * @param array $fixture From emailApiFixture().
+     * @return string[]
+     */
+    private function logMessages(array $fixture, string $level): array
+    {
+        return array_values(array_map(
+            static fn (array $record): string => $record['message'],
+            array_filter(iterator_to_array($fixture['logs']), static fn (array $record): bool => $record['level'] === $level)
+        ));
+    }
+
+    /**
      * A real Validator over a remembering session, with only the billable verifyEmail() stubbed
      * and counted. No API key is configured, so the constructor builds no live client.
      *
@@ -707,6 +1004,8 @@ class ValidatorTest extends TestCase
                 $this->createMock(ModuleListInterface::class),
                 $helper,
                 $this->createMock(SerializerInterface::class),
+                $this->createMock(NotifierInterface::class),
+                $this->createMock(CacheInterface::class),
             ])
             ->onlyMethods(['verifyEmail'])
             ->getMock();

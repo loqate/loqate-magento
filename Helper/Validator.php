@@ -6,7 +6,9 @@ use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Phrase;
 use Magento\Framework\Serialize\SerializerInterface;
 
@@ -52,6 +54,9 @@ class Validator
      * appends it last, in a segment of its own - see verifyCacheSignatureFields().
      */
     private const COUNTY_FIELD = 'Address4';
+
+    /** Cache key of the once-an-hour throttle on the email API error admin notice. */
+    private const EMAIL_API_ERROR_NOTICE_CACHE_KEY = 'loqate_email_api_error_notice';
 
     /**
      * Every value address_quality_index is allowed to hold, BEST ('A') to WORST ('E') - the
@@ -325,6 +330,9 @@ class Validator
 
     protected $helper;
     private SerializerInterface $serializer;
+    private NotifierInterface $notifier;
+    // Holds only the store-wide email-API-error notice throttle flag, never a per-shopper verdict.
+    private CacheInterface $cache;
 
     /**
      * Validator construct
@@ -337,6 +345,8 @@ class Validator
      * @param ModuleListInterface $moduleList
      * @param Data $helper
      * @param SerializerInterface $serializer
+     * @param NotifierInterface $notifier Raises the admin notice on an email API error.
+     * @param CacheInterface $cache Throttles that notice to once an hour.
      */
     public function __construct(
         Logger $logger,
@@ -344,7 +354,9 @@ class Validator
         RegionFactory $regionFactory,
         ModuleListInterface $moduleList,
         Data $helper,
-        SerializerInterface $serializer
+        SerializerInterface $serializer,
+        NotifierInterface $notifier,
+        CacheInterface $cache
     ) {
         $this->logger = $logger;
         // $helper namespaces validateEmail()'s "already warned" and pass digests by store view, as
@@ -353,6 +365,8 @@ class Validator
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
+        $this->notifier = $notifier;
+        $this->cache = $cache;
 
         if ($apiKey = $this->helper->getConfigValue('loqate_settings/settings/api_key')) {
             $this->apiConnector = new Verify($apiKey);
@@ -366,6 +380,10 @@ class Validator
 
     /**
      * Verify email address
+     *
+     * On an API error, logs a warning and raises a major admin notice, throttled to once an hour
+     * install-wide. The notice is best-effort: if it fails, a second warning is logged and the
+     * SDK's error array is still returned.
      *
      * @param $emailAddress
      * @return array
@@ -386,7 +404,25 @@ class Validator
         $response = $this->apiConnector->verifyEmail($data);
 
         if (isset($response['error'])) {
-            $this->logger->info($response['message']);
+            $this->logger->warning($response['message']);
+            // Best-effort: a cache or inbox fault must not abort the order this error lets through.
+            try {
+                if (!$this->cache->load(self::EMAIL_API_ERROR_NOTICE_CACHE_KEY)) {
+                    $this->notifier->addMajor(
+                        __('Loqate email validation API returned errors'),
+                        __(
+                            'The Loqate email validation API returned errors; see var/log/loqate_log_file.log '
+                            . 'for the cause (for example the API key, its credit or limits). While this '
+                            . 'persists, guest orders placed at checkout go through without an email check, '
+                            . 'and account registration and edit, the Luma shipping step and admin customer '
+                            . 'and order forms show an error.'
+                        )
+                    );
+                    $this->cache->save('1', self::EMAIL_API_ERROR_NOTICE_CACHE_KEY, [], 3600);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->warning('Loqate could not raise the email API error notice: ' . $e->getMessage());
+            }
         }
 
         return $response;

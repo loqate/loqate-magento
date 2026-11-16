@@ -11,7 +11,9 @@ use Loqate\ApiIntegration\Plugin\Admin\ValidateImportAddress;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -1491,7 +1493,16 @@ class ValidatorImportRunDedupeTest extends TestCase
         // Fails the way the PRODUCTION serializer fails - see the trait for why that matters.
         $serializer = $this->createSerializerDouble();
 
-        $validator = new Validator($logger, $sessionMock, $regionFactory, $moduleList, $helper, $serializer);
+        $validator = new Validator(
+            $logger,
+            $sessionMock,
+            $regionFactory,
+            $moduleList,
+            $helper,
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
+        );
 
         // The connector is built inside the constructor (new Verify($apiKey)), so the only way
         // to intercept the billable call is to swap the private property afterwards.

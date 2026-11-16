@@ -8,7 +8,9 @@ use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -419,7 +421,9 @@ class ValidatorVerifyCacheTest extends TestCase
             $regionFactory,
             $moduleList,
             $helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
 
         // The connector is built inside the constructor (new Verify($apiKey)),
