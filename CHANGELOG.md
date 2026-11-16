@@ -211,6 +211,24 @@ predate it and are described by their git tags and commit history.
   not keep (tracked in LOQ-20301). CLI and cron order placement are still not
   checked.
 
+- **Address lookup keeps responding after a slow or failed search, and keeps refining
+  as the shopper types** (LOQ-20320). After a lookup request failed with an HTTP error
+  other than a network error — for example a gateway 504 because the module's Find proxy
+  answered slowly — or simply never came back, address lookups stopped responding: the
+  browser script never released the request, so every later keystroke was queued and
+  never sent, and any loading indicator on the page never cleared. Failed requests are
+  now reported as errors, lookup and address-retrieve requests time out after 10
+  seconds, and in both cases the most recent search typed in the meantime is sent.
+
+  Known limitation: the bundled `lqt/api-connector` SDK sets no cURL timeout. While the
+  Loqate API is slow, each abandoned lookup keeps its PHP-FPM worker blocked in cURL
+  until cURL returns or the pool's `request_terminate_timeout` kills it; the web
+  server's gateway timeout does not free it, and `max_execution_time` does not count I/O
+  wait on Linux. Because the browser now gives up after 10 seconds and sends the
+  shopper's next search, a shopper who keeps typing can start up to one more request
+  every 10 seconds. Until that is fixed, set `request_terminate_timeout` on the PHP-FPM
+  pool. A fix to the SDK is tracked in LOQ-XXXXX.
+
 - **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
   `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
   Edit/New page and the Hyvä checkout "Add new address" modal now get Capture; before,
