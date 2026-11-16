@@ -300,6 +300,8 @@ class BillingErrorGateTest extends TestCase
             'loqate_settings/phone_settings/enable_checkout' => 1,
         ]);
         $validator = $this->createCountingValidator(
+            $session,
+            $helper,
             $emailRequests,
             $phoneRequests,
             true,

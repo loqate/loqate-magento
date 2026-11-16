@@ -14,9 +14,11 @@ use Loqate\ApiIntegration\Test\Support\Csprng;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\App\RequestInterface;
 use Magento\Framework\Controller\ResultFactory;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -163,6 +165,9 @@ class ShopperScopedSessionStoresTest extends TestCase
     /** Session attribute the phone bypass list lives under (LOQ-17149). */
     private const VERIFIED_PHONE_SESSION_KEY = 'loqate_phone';
 
+    /** Session attribute the email pass list lives under (LOQ-20299). */
+    private const PASSED_EMAIL_SESSION_KEY = 'loqate_email_passed';
+
     /** Session attribute the single pending email address lives under (LOQ-17149). */
     private const PENDING_EMAIL_SESSION_KEY = 'loqate_email_to_validate';
 
@@ -180,7 +185,7 @@ class ShopperScopedSessionStoresTest extends TestCase
     private const IP_COUNTRY_SESSION_KEY = 'loqate_ipcountry';
 
     /**
-     * Every production file that reaches ShopperScopedSessionStores' three key-taking
+     * Every production file that reaches ShopperScopedSessionStores' six key-taking
      * accessors, and how many statements in it do.
      *
      * Kept as a per-file breakdown rather than a single total because a total alone cannot say
@@ -190,8 +195,9 @@ class ShopperScopedSessionStoresTest extends TestCase
      */
     private const GUARDED_ACCESSOR_CALL_SITES = [
         'Helper/Controller.php' => 2,
-        'Helper/Validator.php' => 8,
-        'Plugin/AbstractPlugin.php' => 7,
+        // 9 before LOQ-20299, which added validateEmail()'s hasContactDigest() and rememberContactDigest().
+        'Helper/Validator.php' => 11,
+        'Plugin/AbstractPlugin.php' => 5,
         'Plugin/Frontend/PlaceOrder.php' => 1,
         'Plugin/Frontend/PlaceOrderGuest.php' => 1,
     ];
@@ -200,7 +206,7 @@ class ShopperScopedSessionStoresTest extends TestCase
      * The size of the set above, held SEPARATELY and asserted against its own sum, so that a
      * breakdown which no longer reconciles with its total cannot pass as it did once before.
      */
-    private const GUARDED_ACCESSOR_CALL_SITE_TOTAL = 19;
+    private const GUARDED_ACCESSOR_CALL_SITE_TOTAL = 20;
 
     /**
      * The second identity source ShopperScopedSessionStores deliberately does NOT read.
@@ -483,12 +489,13 @@ class ShopperScopedSessionStoresTest extends TestCase
                 Validator::BATCH_VERIFY_CACHE_SESSION_KEY,
                 ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::VERIFIED_PHONE_SESSION_KEY,
+                ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::PENDING_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::BILLING_ERRORS_SESSION_KEY,
             ],
             $managed,
             'Every session attribute that gates one shopper\'s submission must be in the flush list: the '
-            . 'Capture bypass, BOTH address verdict caches, BOTH contact bypass lists, the pending email '
+            . 'Capture bypass, BOTH address verdict caches, BOTH contact bypass lists, the email pass list, the pending email '
             . 'address and the billing-error gate. One left out is either a bypass the next shopper inherits '
             . 'or - for the gate - an order they can never place.'
         );
@@ -499,6 +506,7 @@ class ShopperScopedSessionStoresTest extends TestCase
                 self::BATCH_VERIFY_CACHE_SESSION_KEY,
                 self::VERIFIED_EMAIL_SESSION_KEY,
                 self::VERIFIED_PHONE_SESSION_KEY,
+                self::PASSED_EMAIL_SESSION_KEY,
                 self::PENDING_EMAIL_SESSION_KEY,
                 self::BILLING_ERRORS_SESSION_KEY,
             ],
@@ -508,10 +516,11 @@ class ShopperScopedSessionStoresTest extends TestCase
                 Validator::BATCH_VERIFY_CACHE_SESSION_KEY,
                 ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::VERIFIED_PHONE_SESSION_KEY,
+                ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::PENDING_EMAIL_SESSION_KEY,
                 ShopperScopedSessionStores::BILLING_ERRORS_SESSION_KEY,
             ],
-            'The seven attribute NAMES are unchanged by the constants moving onto '
+            'The eight attribute NAMES are unchanged by the constants moving onto '
             . 'ShopperScopedSessionStores and by the LOQ-17149 rename of that class. They are the keys of '
             . 'live customer sessions: renaming one silently empties that store for every shopper '
             . 'mid-checkout at deploy time, which re-bills every address they have already had verified '
@@ -1112,7 +1121,8 @@ class ShopperScopedSessionStoresTest extends TestCase
      *
      * assertEnrolled() throws, and a throw inside checkout is only acceptable because the set of
      * statements that can reach it is small, known, and reviewed. That set is the calls to the
-     * three key-taking accessors - getData(), setData() and contactDigest(); isContactDigest()
+     * six key-taking accessors - getData(), setData(), contactDigest(), and shouldVerify(),
+     * hasContactDigest() and rememberContactDigest() (LOQ-20299), which call contactDigest(); isContactDigest()
      * and the getIpCountry()/setIpCountry() pair do not reach it - and its size is what a
      * reviewer checks before accepting "unreachable for correct code".
      *
@@ -1187,7 +1197,7 @@ class ShopperScopedSessionStoresTest extends TestCase
     }
 
     /**
-     * Every production statement that reaches one of ShopperScopedSessionStores' three
+     * Every production statement that reaches one of ShopperScopedSessionStores' six
      * key-taking accessors, counted per file.
      *
      * FAILS RATHER THAN RETURNS AN EMPTY OR SHORT ANSWER at each point where it could be
@@ -1230,7 +1240,8 @@ class ShopperScopedSessionStoresTest extends TestCase
         $counted = [];
         foreach ($files as $relative) {
             $matches = preg_match_all(
-                '/(?:shopperSession|sessionStores)\s*->\s*(?:getData|setData|contactDigest)\s*\(/',
+                '/(?:shopperSession|sessionStores)\s*->\s*'
+                . '(?:getData|setData|contactDigest|shouldVerify|hasContactDigest|rememberContactDigest)\s*\(/',
                 $this->sourceWithoutComments($root . '/' . $relative)
             );
             if ($matches) {
@@ -1241,7 +1252,7 @@ class ShopperScopedSessionStoresTest extends TestCase
         $this->assertNotSame(
             [],
             $counted,
-            'No call to getData(), setData() or contactDigest() on a shopperSession/sessionStores property was '
+            'No call to one of the six key-taking accessors on a shopperSession/sessionStores property was '
             . 'found anywhere in the module. Either the guard is now reached some other way - through a '
             . 'differently named property, a local variable, or an interface - or the accessors were renamed. '
             . 'Point this scan at the new shape rather than letting it report zero: an empty count would let '
@@ -1396,9 +1407,10 @@ class ShopperScopedSessionStoresTest extends TestCase
      * resolveStoreScope() answers Helper\Data::getCurrentStore() when this class was given a
      * Data, and its own marker - a character getCurrentStore() cannot return, since that method
      * answers an int - when it was not. The second case is the whole subject here. The Data
-     * argument is OPTIONAL, precisely so Helper\Controller, Helper\Validator and the plugins
-     * that never compute a digest needed no constructor change in LOQ-17149, so "constructed
-     * without one" is a supported state and not a fault.
+     * argument is OPTIONAL, precisely so Helper\Controller and the plugins that never compute a
+     * digest needed no constructor change in LOQ-17149, so "constructed without one" is a
+     * supported state and not a fault. Helper\Validator passes one since LOQ-19188, because its
+     * validateEmail() computes the email digests Plugin\AbstractPlugin used to.
      *
      * WHY THE MARKER MUST NOT BE A STORE ID. getCurrentStore() already swallows
      * NoSuchEntityException and degrades to 0, so 0 is the id an installation answers when it
@@ -1702,6 +1714,150 @@ class ShopperScopedSessionStoresTest extends TestCase
             'null and \'\' must digest identically, because the loose in_array() this replaces already treated '
             . 'them as the same value. (string)null === \'\' is what carries that across.'
         );
+    }
+
+    /**
+     * LOQ-20299 split shouldVerify() into hasContactDigest() + rememberContactDigest(). The read
+     * half must be a pure read - a miss AND a hit write nothing - and the write half is what
+     * turns the next lookup into a hit.
+     */
+    public function testHasContactDigestIsAPureReadAndRememberContactDigestMakesItHit(): void
+    {
+        $field = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $harness = $this->createGuard([], 7, 1);
+        // Prime the owner marker and the salt, which a first access writes legitimately.
+        $harness['guard']->contactDigest($field, 'primer@example.com');
+        $harness['writes']->exchangeArray([]);
+
+        $missed = $harness['guard']->hasContactDigest($field, 'shopper.a@example.com');
+
+        $this->assertFalse($missed, 'An address never remembered must miss.');
+        $this->assertSame([], $harness['writes']->getArrayCopy(), 'A miss must write nothing.');
+
+        $harness['guard']->rememberContactDigest($field, 'shopper.a@example.com');
+        $harness['writes']->exchangeArray([]);
+        $hit = $harness['guard']->hasContactDigest($field, 'shopper.a@example.com');
+
+        $this->assertTrue($hit, 'A remembered address must hit.');
+        $this->assertSame([], $harness['writes']->getArrayCopy(), 'A hit must write nothing either.');
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $harness['session'][$field][0] ?? '',
+            'What is remembered is the digest, not the address.'
+        );
+    }
+
+    /**
+     * A value that cannot be digested (a crafted `email[]=` array) is never remembered and never
+     * hits, so it is verified every time - the fail-closed direction - through either half.
+     */
+    public function testAValueThatCannotBeDigestedIsNeverRememberedNorMatched(): void
+    {
+        $field = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $harness = $this->createGuard([], 7, 1);
+
+        $harness['guard']->rememberContactDigest($field, ['shopper.a@example.com']);
+
+        $this->assertNull($harness['session'][$field] ?? null, 'Nothing may be stored for an array value.');
+        $this->assertFalse($harness['guard']->hasContactDigest($field, ['shopper.a@example.com']));
+    }
+
+    /**
+     * shouldVerify() keeps its pre-split semantics: true (verify) and remember on a miss, false on
+     * a hit - and a hit does NOT refresh the entry, so eviction stays first-in-first-out.
+     */
+    public function testShouldVerifyStillRemembersOnAMissAndDoesNotRefreshOnAHit(): void
+    {
+        $field = ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY;
+        $limit = ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT;
+        $harness = $this->createGuard([], 7, 1);
+
+        $this->assertTrue($harness['guard']->shouldVerify($field, 'shopper0@example.com'), 'A miss verifies.');
+        $this->assertFalse($harness['guard']->shouldVerify($field, 'shopper0@example.com'), 'A hit does not.');
+
+        for ($i = 1; $i < $limit; $i++) {
+            $harness['guard']->shouldVerify($field, "shopper{$i}@example.com");
+        }
+        // A hit on the oldest entry; if it refreshed, the next append would evict shopper1 instead.
+        $harness['guard']->shouldVerify($field, 'shopper0@example.com');
+        $harness['guard']->shouldVerify($field, "shopper{$limit}@example.com");
+
+        $this->assertFalse(
+            $harness['guard']->hasContactDigest($field, 'shopper0@example.com'),
+            'The oldest entry is evicted even though it was hit last: a hit must not move it to the newest slot.'
+        );
+        $this->assertTrue($harness['guard']->hasContactDigest($field, 'shopper1@example.com'));
+    }
+
+    /**
+     * The pass list is bounded like the other two contact lists: VERIFIED_CONTACT_LIMIT digests,
+     * oldest evicted first. An evicted pass costs one re-verify, never a bypass.
+     */
+    public function testThePassListIsBoundedAndEvictsTheOldestFirst(): void
+    {
+        $field = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $limit = ShopperScopedSessionStores::VERIFIED_CONTACT_LIMIT;
+        $harness = $this->createGuard([], 7, 1);
+
+        for ($i = 0; $i <= $limit; $i++) {
+            $harness['guard']->rememberContactDigest($field, "shopper{$i}@example.com");
+        }
+
+        $this->assertCount($limit, $harness['session'][$field], 'The pass list must never exceed the limit.');
+        $this->assertFalse(
+            $harness['guard']->hasContactDigest($field, 'shopper0@example.com'),
+            'The oldest pass is the one evicted.'
+        );
+        $this->assertTrue($harness['guard']->hasContactDigest($field, 'shopper1@example.com'));
+        $this->assertTrue($harness['guard']->hasContactDigest($field, "shopper{$limit}@example.com"));
+    }
+
+    /**
+     * The pass list and the "already warned" list must not answer each other's lookups. The
+     * dangerous direction: under Prevent Submit = No an INVALID email is put on the warned list,
+     * and if that digest satisfied the pass lookup, switching to Yes would let the invalid
+     * address through unverified.
+     */
+    public function testThePassListAndTheWarnedListCannotAnswerEachOthersLookups(): void
+    {
+        $passed = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $warned = ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY;
+        $harness = $this->createGuard([], 7, 1);
+
+        $harness['guard']->rememberContactDigest($warned, 'warned@example.com');
+        $harness['guard']->rememberContactDigest($passed, 'passed@example.com');
+
+        $this->assertFalse($harness['guard']->hasContactDigest($passed, 'warned@example.com'));
+        $this->assertFalse($harness['guard']->hasContactDigest($warned, 'passed@example.com'));
+        $this->assertNotSame(
+            $harness['guard']->contactDigest($passed, 'same@example.com'),
+            $harness['guard']->contactDigest($warned, 'same@example.com'),
+            'The field is in the HMAC message, so the two lists stay apart even if ever merged into one attribute.'
+        );
+    }
+
+    /**
+     * Both new accessors take a key and so reach assertEnrolled(): an un-enrolled attribute is
+     * refused rather than quietly given the look of a flushed store.
+     *
+     * @param string $method hasContactDigest or rememberContactDigest.
+     */
+    #[DataProvider('contactDigestAccessorProvider')]
+    public function testTheContactDigestAccessorsRefuseAnUnenrolledKey(string $method): void
+    {
+        $harness = $this->createGuard([], 7, 1);
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        $harness['guard']->{$method}(self::IP_COUNTRY_SESSION_KEY, 'shopper.a@example.com');
+    }
+
+    public static function contactDigestAccessorProvider(): array
+    {
+        return [
+            'hasContactDigest' => ['hasContactDigest'],
+            'rememberContactDigest' => ['rememberContactDigest'],
+        ];
     }
 
     /**
@@ -2419,7 +2575,9 @@ class ShopperScopedSessionStoresTest extends TestCase
                 $this->createMock(RegionFactory::class),
                 $moduleList,
                 $helper,
-                $serializer
+                $serializer,
+                $this->createMock(NotifierInterface::class),
+                $this->createMock(CacheInterface::class)
             ),
             // The two readers of the billing-error gate. Neither extends AbstractPlugin, so
             // each builds its own seam inline from the Session it is given (LOQ-17149).
@@ -2483,7 +2641,9 @@ class ShopperScopedSessionStoresTest extends TestCase
             $this->createMock(RegionFactory::class),
             $moduleList,
             $helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
 
         // The connector is built inside the constructor (new Verify($apiKey)), so the only
@@ -2538,6 +2698,8 @@ class ShopperScopedSessionStoresTest extends TestCase
             // "the previous shopper's email digest" is worth more than a real SHA-256.
             self::VERIFIED_EMAIL_SESSION_KEY => ['the previous shopper\'s email digest'],
             self::VERIFIED_PHONE_SESSION_KEY => ['the previous shopper\'s phone digest'],
+            // LOQ-20299: a pass is the strongest bypass of all - it applies under Prevent Submit = Yes.
+            self::PASSED_EMAIL_SESSION_KEY => ['the previous shopper\'s email pass digest'],
             self::PENDING_EMAIL_SESSION_KEY => 'previous.shopper@example.com',
             // TRUE specifically. A stale false grants nothing, so seeding false would let the
             // flush pass this store by unnoticed; true is the value that denies the next

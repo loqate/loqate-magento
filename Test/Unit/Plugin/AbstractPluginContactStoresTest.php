@@ -90,7 +90,7 @@ class AbstractPluginContactStoresTest extends TestCase
      *
      * WHAT THAT TEST ACTUALLY DEMONSTRATES IS A FLOOR OF 2, NOT OF 3, and this figure is stated
      * as a MARGIN OF ONE over it rather than as a scenario. Eviction is evict-then-append
-     * (AbstractPlugin::shouldVerify()), so the values of the submission being written are
+     * (ShopperScopedSessionStores::shouldVerify()), so the values of the submission being written are
      * always the newest entries and a two-value submission survives at a limit of exactly 2; that
      * test therefore goes red at 1. 3 buys one slot beyond the largest single submission, which
      * is what covers a value still alive in the session from an earlier pass (a corrected number,
@@ -814,12 +814,13 @@ class AbstractPluginContactStoresTest extends TestCase
         // reason: the store would never be read.
         $helper = $this->createConfigHelper([], $storeId);
         // Both connectors ACCEPT what they are sent: these tests count CALLS, not verdicts.
-        $validator = $this->createCountingValidator($emailRequests, $phoneRequests);
+        $session = $this->createSessionDouble($sessionStore, $identity);
+        $validator = $this->createCountingValidator($session, $helper, $emailRequests, $phoneRequests);
 
         $plugin = new class (
             $this->createMock(Context::class),
             $this->createMock(UrlInterface::class),
-            $this->createSessionDouble($sessionStore, $identity),
+            $session,
             $validator,
             $helper,
             $this->createMock(JsonFactory::class)

@@ -6,7 +6,10 @@ use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
+use Magento\Framework\Phrase;
 use Magento\Framework\Serialize\SerializerInterface;
 
 /**
@@ -51,6 +54,9 @@ class Validator
      * appends it last, in a segment of its own - see verifyCacheSignatureFields().
      */
     private const COUNTY_FIELD = 'Address4';
+
+    /** Cache key of the once-an-hour throttle on the email API error admin notice. */
+    private const EMAIL_API_ERROR_NOTICE_CACHE_KEY = 'loqate_email_api_error_notice';
 
     /**
      * Every value address_quality_index is allowed to hold, BEST ('A') to WORST ('E') - the
@@ -324,6 +330,9 @@ class Validator
 
     protected $helper;
     private SerializerInterface $serializer;
+    private NotifierInterface $notifier;
+    // Holds only the store-wide email-API-error notice throttle flag, never a per-shopper verdict.
+    private CacheInterface $cache;
 
     /**
      * Validator construct
@@ -336,6 +345,8 @@ class Validator
      * @param ModuleListInterface $moduleList
      * @param Data $helper
      * @param SerializerInterface $serializer
+     * @param NotifierInterface $notifier Raises the admin notice on an email API error.
+     * @param CacheInterface $cache Throttles that notice to once an hour.
      */
     public function __construct(
         Logger $logger,
@@ -343,13 +354,19 @@ class Validator
         RegionFactory $regionFactory,
         ModuleListInterface $moduleList,
         Data $helper,
-        SerializerInterface $serializer
+        SerializerInterface $serializer,
+        NotifierInterface $notifier,
+        CacheInterface $cache
     ) {
         $this->logger = $logger;
-        $this->shopperSession = new ShopperScopedSessionStores($session);
+        // $helper namespaces validateEmail()'s "already warned" and pass digests by store view, as
+        // Plugin\AbstractPlugin's phone digests are; without it every store view shares one list.
+        $this->shopperSession = new ShopperScopedSessionStores($session, $helper);
         $this->regionFactory = $regionFactory;
         $this->helper = $helper;
         $this->serializer = $serializer;
+        $this->notifier = $notifier;
+        $this->cache = $cache;
 
         if ($apiKey = $this->helper->getConfigValue('loqate_settings/settings/api_key')) {
             $this->apiConnector = new Verify($apiKey);
@@ -363,6 +380,10 @@ class Validator
 
     /**
      * Verify email address
+     *
+     * On an API error, logs a warning and raises a major admin notice, throttled to once an hour
+     * install-wide. The notice is best-effort: if it fails, a second warning is logged and the
+     * SDK's error array is still returned.
      *
      * @param $emailAddress
      * @return array
@@ -383,10 +404,90 @@ class Validator
         $response = $this->apiConnector->verifyEmail($data);
 
         if (isset($response['error'])) {
-            $this->logger->info($response['message']);
+            $this->logger->warning($response['message']);
+            // Best-effort: a cache or inbox fault must not abort the order this error lets through.
+            try {
+                if (!$this->cache->load(self::EMAIL_API_ERROR_NOTICE_CACHE_KEY)) {
+                    $this->notifier->addMajor(
+                        __('Loqate email validation API returned errors'),
+                        __(
+                            'The Loqate email validation API returned errors; see var/log/loqate_log_file.log '
+                            . 'for the cause (for example the API key, its credit or limits). While this '
+                            . 'persists, guest orders placed at checkout go through without an email check, '
+                            . 'and account registration and edit, the Luma shipping step and admin customer '
+                            . 'and order forms show an error.'
+                        )
+                    );
+                    $this->cache->save('1', self::EMAIL_API_ERROR_NOTICE_CACHE_KEY, [], 3600);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->warning('Loqate could not raise the email API error notice: ' . $e->getMessage());
+            }
         }
 
         return $response;
+    }
+
+    /**
+     * Validate email address
+     *
+     * @param mixed $email
+     * @param bool $blockOnApiError False lets an API error through (verifyEmail() has logged it).
+     *                              Only Observer\QuoteSubmitBefore passes false: there an error
+     *                              would block the order, as its phone check already avoids.
+     * @param bool $usePassCache True reuses, and records, this session's passes for the email
+     *                           (LOQ-20299). Only the guest checkout callers pass true; admin
+     *                           and account forms verify on every save.
+     *                           If a third caller context or flag ever appears, split this into
+     *                           named entry points rather than adding a third bool.
+     * @return false|Phrase
+     */
+    public function validateEmail($email, bool $blockOnApiError = true, bool $usePassCache = false)
+    {
+        $passedKey = ShopperScopedSessionStores::PASSED_EMAIL_SESSION_KEY;
+        $passedValue = null;
+        if ($usePassCache) {
+            // Whether an email passes depends on the catch-all setting, so a pass is keyed by it and
+            // flipping the setting re-verifies. Non-scalars stay as-is so contactDigest() refuses them.
+            $catchAll = (int)(bool)$this->helper->getConfigValue(
+                'loqate_settings/email_settings/enable_accept_valid_catch_all'
+            );
+            $passedValue = ($email === null || is_scalar($email)) ? $catchAll . '|' . $email : $email;
+            if ($this->shopperSession->hasContactDigest($passedKey, $passedValue)) {
+                return false;
+            }
+        }
+
+        $errorMessage = __('The provided email address is invalid.');
+        if (!$this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit')) {
+            if (!$this->shopperSession->shouldVerify(ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY, $email)) {
+                return false;
+            }
+            $errorMessage = __('Invalid email address. Submit again to use this email address.');
+        }
+
+        $response = $this->verifyEmail($email);
+
+        if (isset($response['error'])) {
+            return $blockOnApiError
+                ? __('An unexpected error occurred while trying to validate your email address.')
+                : false;
+        }
+
+        if (!$response) {
+            return $errorMessage;
+        }
+
+        if (isset($response['noKeyFound'])) {
+            return false;
+        }
+
+        // Only a real pass is remembered, so an error or a missing key never marks it valid.
+        if ($usePassCache) {
+            $this->shopperSession->rememberContactDigest($passedKey, $passedValue);
+        }
+
+        return false;
     }
 
     /**
@@ -1945,7 +2046,7 @@ class Validator
      * The map is verdict data, so it has the OWNERSHIP lifetime of the session verdict stores
      * and not merely the request's: one Validator can outlive a mid-request identity change,
      * and a plain request-scoped map would then answer the new shopper out of the previous
-     * shopper's verdicts while the guard had just flushed the seven stores beside it - reopening
+     * shopper's verdicts while the guard had just flushed the eight stores beside it - reopening
      * exactly the leak ShopperScopedSessionStores exists to close, through a store that class
      * cannot see. Pinned by
      * ShopperScopedSessionStoresTest::testABatchVerdictDoesNotSurviveALogin().
