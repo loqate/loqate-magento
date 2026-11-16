@@ -9,6 +9,28 @@ predate it and are described by their git tags and commit history.
 
 ### Changed — behaviour
 
+- **Place order no longer verifies the guest email once the address or phone check
+  has rejected the order** (LOQ-20300). The order is refused anyway, so the email
+  verification would be a billable call that cannot change the outcome; skipping it
+  saves that call and closes the probe of forcing an address failure to check
+  emails. The shopper sees the address or phone error first; the email is checked on
+  the next attempt, once those pass. Anonymous checkout can still be used to test
+  emails one paid call at a time (place order with a valid address, and the Luma
+  shipping step), as with addresses and phone numbers; to limit this, enable Magento
+  reCAPTCHA for checkout/place order or rate-limit those requests (tracked in
+  LOQ-20315).
+
+- **Email API errors are now logged at warning level and raise an admin notice at
+  most once an hour** (LOQ-20300). An error (for example the API key, its credit or
+  limits, or an outage) used to be logged at info level only. While it persists,
+  guest orders placed at checkout go through without an email check, and account
+  registration and edit, the Luma shipping step and admin customer and order forms
+  show an error. The admin notice does not contain the shopper's email; it points to
+  `var/log/loqate_log_file.log` for the cause. Raising it is best-effort: if it
+  fails, a second warning is logged and the request carries on. The notice needs
+  the Magento_AdminNotification module; without it, only the warning log line
+  remains.
+
 - **With "Prevent Submit" = Yes, guest orders placed through the REST API by
   integrations, and through GraphQL, are now email-checked** (LOQ-20300). This
   covers OMS/ERP connectors and marketplace importers that place guest orders through
@@ -432,6 +454,11 @@ predate it and are described by their git tags and commit history.
   (LOQ-17149).
 
 ### Changed — for developers extending this module
+
+- **`Helper\Validator`'s constructor takes two more required arguments**, a
+  `Magento\Framework\Notification\NotifierInterface` and a
+  `Magento\Framework\App\CacheInterface`, last (LOQ-20300). DI supplies them; a
+  subclass or code that calls `new Validator(...)` must pass them.
 
 - **`Plugin\AbstractPlugin::$session` is now `private`.** It was `protected` on the
   base class of ten plugins, which meant any of them — or any third-party subclass —

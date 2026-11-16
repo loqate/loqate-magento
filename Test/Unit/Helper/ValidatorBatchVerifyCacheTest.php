@@ -9,7 +9,9 @@ use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -394,7 +396,9 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             $regionFactory,
             $moduleList,
             $helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
 
         // The connector is built inside the constructor (new Verify($apiKey)), so the only
@@ -3172,7 +3176,9 @@ class ValidatorBatchVerifyCacheTest extends TestCase
             $this->createMock(RegionFactory::class),
             $this->createMock(ModuleListInterface::class),
             $helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
     }
 

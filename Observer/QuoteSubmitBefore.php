@@ -143,14 +143,12 @@ class QuoteSubmitBefore implements ObserverInterface
         }
 
         // --- Customer email validation ---
-        // Guests only, as on Luma, and only where a session persists: 'frontend' (Hyvä Checkout,
-        // Luma's review-page place orders) and webapi_rest with the storefront session cookie
-        // (Luma's REST place order, incl. virtual carts). A cookie-less REST client, graphql, CLI
-        // and unresolvable areas keep no session, so with Prevent Submit = No the guest would be
-        // warned on every submit. A pass from Luma's shipping step is reused, not re-billed (LOQ-20299).
-        // graphql and cookie-less REST are checked when Prevent Submit = Yes (LOQ-20300): an invalid
-        // email simply blocks, so no warn-once state is needed, and without a session the pass cache
-        // just misses.
+        // Guests only, where a session persists: 'frontend' (Hyvä Checkout, Luma review-page orders)
+        // and webapi_rest with the storefront session cookie (Luma's REST place order, incl. virtual
+        // carts); a pass from Luma's shipping step is reused, not re-billed (LOQ-20299). Without a
+        // session (cookie-less REST, graphql, CLI, unresolvable area) Prevent Submit = No would warn
+        // on every submit, so graphql and cookie-less REST are checked only with Prevent Submit = Yes,
+        // where an invalid email simply blocks and the pass cache just misses (LOQ-20300).
         // shortcut: graphql and cookie-less REST with Prevent Submit = No are not checked; add them
         // once a session-free warn-once exists (LOQ-20301).
         // customer_is_guest OR no customer id, because not every checkout sets the flag before this event.
@@ -159,7 +157,12 @@ class QuoteSubmitBefore implements ObserverInterface
                 && $this->cookieReader->getCookie($this->sessionConfig->getName()));
         $blocksWithoutSession = in_array($areaCode, [Area::AREA_GRAPHQL, Area::AREA_WEBAPI_REST], true)
             && $this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit');
-        if (($hasSession || $blocksWithoutSession)
+        // !$errors: a rejected order can't be changed by the email verdict, so don't bill the check;
+        // this also closes the forced-address-failure probe.
+        // shortcut: a deliverable address plus a probe email still returns the email verdict for one paid call,
+        // as address and phone checks do; add reCAPTCHA/rate limiting on place order to close it (LOQ-20315).
+        if (!$errors
+            && ($hasSession || $blocksWithoutSession)
             && $this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
             && ($quote->getCustomerIsGuest() || !$quote->getCustomerId())
         ) {

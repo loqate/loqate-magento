@@ -8,7 +8,9 @@ use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Serialize\SerializerInterface;
 use PHPUnit\Framework\MockObject\MockObject;
 
@@ -190,6 +192,8 @@ trait ShopperSessionHarness
                 $moduleList,
                 $helper,
                 $this->createMock(SerializerInterface::class),
+                $this->createMock(NotifierInterface::class),
+                $this->createMock(CacheInterface::class),
             ])
             ->onlyMethods(['verifyEmail', 'verifyPhoneNumber', 'verifyAddress', 'verifyMultipleAddresses'])
             ->getMock();

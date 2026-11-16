@@ -14,9 +14,11 @@ use Loqate\ApiIntegration\Test\Support\Csprng;
 use Loqate\ApiIntegration\Test\Support\ProductionSerializerDouble;
 use Magento\Customer\Model\Session;
 use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\App\CacheInterface;
 use Magento\Framework\App\RequestInterface;
 use Magento\Framework\Controller\ResultFactory;
 use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Notification\NotifierInterface;
 use Magento\Framework\Serialize\SerializerInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -2573,7 +2575,9 @@ class ShopperScopedSessionStoresTest extends TestCase
                 $this->createMock(RegionFactory::class),
                 $moduleList,
                 $helper,
-                $serializer
+                $serializer,
+                $this->createMock(NotifierInterface::class),
+                $this->createMock(CacheInterface::class)
             ),
             // The two readers of the billing-error gate. Neither extends AbstractPlugin, so
             // each builds its own seam inline from the Session it is given (LOQ-17149).
@@ -2637,7 +2641,9 @@ class ShopperScopedSessionStoresTest extends TestCase
             $this->createMock(RegionFactory::class),
             $moduleList,
             $helper,
-            $serializer
+            $serializer,
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
         );
 
         // The connector is built inside the constructor (new Verify($apiKey)), so the only
