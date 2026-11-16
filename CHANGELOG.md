@@ -227,7 +227,7 @@ predate it and are described by their git tags and commit history.
   wait on Linux. Because the browser now gives up after 10 seconds and sends the
   shopper's next search, a shopper who keeps typing can start up to one more request
   every 10 seconds. Until that is fixed, set `request_terminate_timeout` on the PHP-FPM
-  pool. A fix to the SDK is tracked in LOQ-XXXXX.
+  pool. A fix to the SDK is tracked in LOQ-20334.
 
 - **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
   `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
