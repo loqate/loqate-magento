@@ -202,10 +202,38 @@ class PendingEmailAddressTest extends TestCase
     }
 
     /**
+     * LOQ-20299: the shipping step opts in to the pass cache. With Prevent Submit = Yes - where
+     * the "already warned" list is never read, so nothing else can spare the call - an address
+     * that passed and is offered again (the shopper edits and re-enters the same email) is not
+     * billed a second time, and the pass is held as a digest.
+     */
+    public function testAPassAtTheShippingStepIsReusedWhenTheSameAddressIsOfferedAgain(): void
+    {
+        $harness = $this->createCheckout(['preventSubmit' => '1']);
+
+        $this->offerEmailAddress($harness, self::SHOPPER_A_EMAIL);
+        $this->saveShippingInformation($harness);
+        $this->offerEmailAddress($harness, self::SHOPPER_A_EMAIL);
+        $this->saveShippingInformation($harness);
+
+        $this->assertCount(
+            1,
+            $harness['emailRequests'],
+            'CheckoutShippingInformation must call validateEmail() with usePassCache: true, so a passed '
+            . 'address is billed once per session.'
+        );
+        $this->assertMatchesRegularExpression(
+            '/^[0-9a-f]{64}$/',
+            $harness['session']['loqate_email_passed'][0] ?? '',
+            'The shipping step\'s pass must be recorded (as a digest) for the place-order check to reuse.'
+        );
+    }
+
+    /**
      * The two plugins that own the pending address, sharing ONE customer session, built through
      * their real constructors.
      *
-     * @param array{emailPasses?: bool, customerId?: int|string|null} $options
+     * @param array{emailPasses?: bool, customerId?: int|string|null, preventSubmit?: string} $options
      * @return array<string, mixed>
      */
     private function createCheckout(array $options = []): array
@@ -221,6 +249,7 @@ class PendingEmailAddressTest extends TestCase
             // Only the email check is on, so the pending address is the only thing the shipping
             // step can report an error about.
             'loqate_settings/email_settings/enable_checkout' => 1,
+            'loqate_settings/email_settings/prevent_submit' => $options['preventSubmit'] ?? '',
         ]);
         $validator = $this->createCountingValidator(
             $session,

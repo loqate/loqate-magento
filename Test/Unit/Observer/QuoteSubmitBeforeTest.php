@@ -6,10 +6,23 @@ use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Observer\QuoteSubmitBefore;
+use Loqate\ApiIntegration\Plugin\Frontend\AccountManagement;
+use Loqate\ApiIntegration\Plugin\Frontend\CheckoutShippingInformation;
+use Loqate\ApiIntegration\Test\Unit\Plugin\ShopperSessionHarness;
+use Magento\Checkout\Model\ShippingInformationManagement;
+use Magento\Customer\Model\AccountManagement as CoreAccountManagement;
+use Magento\Framework\App\Action\Context;
 use Magento\Framework\App\Area;
 use Magento\Framework\App\State;
 use Magento\Framework\Event\Observer;
+use Magento\Directory\Model\RegionFactory;
+use Magento\Framework\Controller\Result\JsonFactory;
 use Magento\Framework\Exception\LocalizedException;
+use Magento\Framework\Module\ModuleListInterface;
+use Magento\Framework\Serialize\SerializerInterface;
+use Magento\Framework\UrlInterface;
+use Magento\Framework\Session\Config\ConfigInterface as SessionConfig;
+use Magento\Framework\Stdlib\Cookie\CookieReaderInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -47,6 +60,10 @@ use PHPUnit\Framework\TestCase;
  */
 class QuoteSubmitBeforeTest extends TestCase
 {
+    // A remembering session and a Validator that counts billable calls, for the LOQ-20299
+    // journeys that share ONE real Validator between the shipping-step plugin and this observer.
+    use ShopperSessionHarness;
+
     /** Config path gating address verification at checkout. */
     private const ADDRESS_CHECKOUT = 'loqate_settings/address_settings/enable_checkout';
 
@@ -55,6 +72,18 @@ class QuoteSubmitBeforeTest extends TestCase
 
     /** Config path gating email verification at checkout. */
     private const EMAIL_CHECKOUT = 'loqate_settings/email_settings/enable_checkout';
+
+    /** Config path: reject an invalid email outright (1) or warn once (0, the shipped default). */
+    private const EMAIL_PREVENT_SUBMIT = 'loqate_settings/email_settings/prevent_submit';
+
+    /**
+     * The storefront session cookie's name, as Session\Config\ConfigInterface::getName() answers.
+     * Deliberately NOT PHPSESSID, so an observer that hard-coded the default name would fail.
+     */
+    private const SESSION_COOKIE_NAME = 'storefront_sid';
+
+    /** A storefront session id, as the browser sends it on Luma's REST place order. */
+    private const SESSION_ID = 'a1b2c3d4e5f6';
 
     /** A guest's email address as Quote::getCustomerEmail() delivers it. */
     private const GUEST_EMAIL = 'guest.shopper@example.com';
@@ -99,6 +128,9 @@ class QuoteSubmitBeforeTest extends TestCase
     /** @var false|string Value the Validator returns from validateEmail(): false or the error. */
     private $emailResponse = false;
 
+    /** @var string|null Value of the storefront session cookie on the request; null when absent. */
+    private $sessionCookie = null;
+
     protected function setUp(): void
     {
         $this->validatorCalls = new ArrayObject();
@@ -113,6 +145,7 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->addressResponse = ['error' => false];
         $this->phoneResponse = true;
         $this->emailResponse = false;
+        $this->sessionCookie = null;
     }
 
     /**
@@ -506,20 +539,29 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * LOQ-19188: the guest's email is verified on quote submit on the Hyvä Checkout page
-     * ('frontend') only. Every other area, an unresolvable one included, is a NOT-verified
-     * case, see emailNotCheckedProvider().
+     * The guest's email is verified on quote submit where a session persists: the 'frontend'
+     * area (Hyvä Checkout, LOQ-19188) and 'webapi_rest' requests carrying the storefront session
+     * cookie (Luma's REST place order, virtual carts included, LOQ-20299). Every other case, an
+     * unresolvable area included, is a NOT-verified one, see emailNotCheckedProvider().
      *
      * Asserted on the spy, in full and in order, so this also pins that the email check is
-     * ADDED after the address and phone checks and replaces none of them, and that it is made
-     * exactly ONCE - each call on the shipped prevent_submit default is a billable verify.
+     * ADDED after the address and phone checks and replaces none of them, that it is made
+     * exactly ONCE, and that it is made with $blockOnApiError = false and $usePassCache = true -
+     * so a pass from Luma's shipping step is reused rather than billed a second time.
      *
      * @param string|\Throwable $area Area code, or what State::getAreaCode() raises instead.
+     * @param string|null $sessionCookie The storefront session cookie, or null when absent.
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit, set explicitly.
      */
     #[DataProvider('emailCheckedAreaProvider')]
-    public function testAGuestEmailIsVerifiedOnceWhereNothingEarlierVerifiedIt($area): void
-    {
+    public function testAGuestEmailIsVerifiedExactlyOnceWhereTheObserverChecksIt(
+        $area,
+        ?string $sessionCookie,
+        string $preventSubmit = '0'
+    ): void {
         $this->config[self::EMAIL_CHECKOUT] = '1';
+        $this->config[self::EMAIL_PREVENT_SUBMIT] = $preventSubmit;
+        $this->sessionCookie = $sessionCookie;
         $observer = $this->createObserver($area);
 
         $observer->execute(
@@ -532,13 +574,13 @@ class QuoteSubmitBeforeTest extends TestCase
                 ['verifyPhoneNumber', '02079460000', 'GB'],
                 ['verifyAddress', self::BILLING_ADDRESS],
                 ['verifyPhoneNumber', '01189990000', 'GB'],
-                ['validateEmail', self::GUEST_EMAIL, false],
+                ['validateEmail', self::GUEST_EMAIL, false, true],
             ],
             $this->recordedCalls(),
-            'A guest email must be verified exactly once on quote submit here: Hyvä Checkout never '
-            . 'reaches Plugin\Frontend\CheckoutShippingInformation, so without this call the email is not '
-            . 'checked at all (LOQ-19188). It is called with $blockOnApiError = false, so an email API '
-            . 'outage cannot block the order, as the phone check already behaves.'
+            'A guest email must be verified exactly once on quote submit here: Hyvä Checkout and Luma virtual '
+            . 'carts never reach Plugin\Frontend\CheckoutShippingInformation, so without this call the email is '
+            . 'not checked at all. It is called with $blockOnApiError = false, so an email API outage cannot '
+            . 'block the order, and with $usePassCache = true, so a pass earned earlier is not billed again.'
         );
     }
 
@@ -548,11 +590,18 @@ class QuoteSubmitBeforeTest extends TestCase
      * numbers are valid here, so the email message is the whole of the exception.
      *
      * @param string|\Throwable $area Area code, or what State::getAreaCode() raises instead.
+     * @param string|null $sessionCookie The storefront session cookie, or null when absent.
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit, set explicitly.
      */
     #[DataProvider('emailCheckedAreaProvider')]
-    public function testARejectedGuestEmailAbortsTheOrderWithItsMessage($area): void
-    {
+    public function testARejectedGuestEmailAbortsTheOrderWithItsMessage(
+        $area,
+        ?string $sessionCookie,
+        string $preventSubmit = '0'
+    ): void {
         $this->config[self::EMAIL_CHECKOUT] = '1';
+        $this->config[self::EMAIL_PREVENT_SUBMIT] = $preventSubmit;
+        $this->sessionCookie = $sessionCookie;
         $this->emailResponse = 'Invalid email address. Submit again to use this email address.';
         $observer = $this->createObserver($area);
 
@@ -631,7 +680,7 @@ class QuoteSubmitBeforeTest extends TestCase
 
         $observer->execute($this->quoteEvent(self::SHIPPING_ADDRESS, $billing, false, $customerEmail, 1));
 
-        $this->assertSame([['validateEmail', $expected, false]], $this->emailCalls());
+        $this->assertSame([['validateEmail', $expected, false, true]], $this->emailCalls());
     }
 
     public static function emailSourceProvider(): array
@@ -658,7 +707,7 @@ class QuoteSubmitBeforeTest extends TestCase
         );
 
         $this->assertSame(
-            [['validateEmail', self::GUEST_EMAIL, false]],
+            [['validateEmail', self::GUEST_EMAIL, false, true]],
             $this->emailCalls(),
             'customer_is_guest = 0 with no customer id is a guest whose checkout did not set the flag yet.'
         );
@@ -684,12 +733,22 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * Where the guest email is verified. Named from Magento\Framework\App\Area, as above.
+     * Where the guest email is verified: wherever a session persists, under either Prevent
+     * Submit setting (LOQ-20299), and - with Prevent Submit = Yes only - on GraphQL and on REST
+     * without a session, where an invalid email simply blocks and no warn-once state is needed
+     * (LOQ-20300). Named from Magento\Framework\App\Area, as above.
      */
     public static function emailCheckedAreaProvider(): array
     {
         return [
-            'Hyvä Checkout page' => [Area::AREA_FRONTEND],
+            'Hyvä Checkout page' => [Area::AREA_FRONTEND, self::SESSION_ID],
+            'frontend never depends on the cookie' => [Area::AREA_FRONTEND, null],
+            'Luma REST place order with the storefront session cookie' => [Area::AREA_WEBAPI_REST, self::SESSION_ID],
+            'GraphQL place order, no session, prevent_submit on' => [Area::AREA_GRAPHQL, null, '1'],
+            'REST place order without the session cookie, prevent_submit on' => [Area::AREA_WEBAPI_REST, null, '1'],
+            'REST place order with an empty session cookie, prevent_submit on' => [Area::AREA_WEBAPI_REST, '', '1'],
+            // Both the session condition and the prevent_submit one hold: still ONE billable call.
+            'REST place order with the cookie AND prevent_submit on' => [Area::AREA_WEBAPI_REST, self::SESSION_ID, '1'],
         ];
     }
 
@@ -697,8 +756,9 @@ class QuoteSubmitBeforeTest extends TestCase
      * Every case in which the email must NOT be verified, asserted on the spy: a skipped check
      * and a passing one both end without an exception, so only the call log tells them apart.
      *
-     * Each row breaks exactly one of the four conditions, so deleting any one of them fails
-     * exactly that row.
+     * Each row breaks exactly one of the four conditions (a checked area - session-bearing, or
+     * GraphQL/REST with prevent_submit on - the setting, a guest, an email), so deleting any one
+     * of them fails exactly that row.
      *
      * @param string|\Throwable $area Area the request is handled in, or what
      *                                State::getAreaCode() raises instead.
@@ -707,16 +767,24 @@ class QuoteSubmitBeforeTest extends TestCase
      * @param mixed $customerEmail What Quote::getCustomerEmail() answers.
      * @param string $emailSetting loqate_settings/email_settings/enable_checkout.
      * @param string $why The reason, for the failure message.
+     * @param string|null $sessionCookie The storefront session cookie. PRESENT unless a row says
+     *                                   otherwise, so an excluded area stays excluded even with one.
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit, set EXPLICITLY
+     *                              (off = '0', the shipped default) rather than left unset.
      */
     #[DataProvider('emailNotCheckedProvider')]
-    public function testTheEmailIsNotVerifiedOutsideTheGuestHyvaPath(
+    public function testTheEmailIsNotVerifiedOutsideTheCheckedPaths(
         $area,
         $customerIsGuest,
         $customerEmail,
         string $emailSetting,
-        string $why
+        string $why,
+        ?string $sessionCookie = self::SESSION_ID,
+        string $preventSubmit = '0'
     ): void {
         $this->config[self::EMAIL_CHECKOUT] = $emailSetting;
+        $this->config[self::EMAIL_PREVENT_SUBMIT] = $preventSubmit;
+        $this->sessionCookie = $sessionCookie;
         $observer = $this->createObserver($area);
 
         $observer->execute(
@@ -734,24 +802,61 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * One row per condition of the email block, each with the other three satisfied.
+     * One row per condition of the email block, each with the other three satisfied. The session
+     * cookie is present unless a row passes null or ''; prevent_submit is '0' unless a row says '1'.
      */
     public static function emailNotCheckedProvider(): array
     {
         return [
-            'Luma REST checkout' => [
+            'REST place order without the session cookie, prevent_submit off' => [
                 Area::AREA_WEBAPI_REST, 1, self::GUEST_EMAIL, '1',
-                'In webapi_rest Luma already verified this email in CheckoutShippingInformation; with '
-                . 'prevent_submit on, a second verify here would bill the same order twice.',
+                'A cookie-less REST client keeps no session, so with prevent_submit off (set to 0 here) the '
+                . '"warned once" record would be lost and the guest warned on every submit, never able to place '
+                . 'the order. With prevent_submit on, it is checked (LOQ-20300).',
+                null,
+            ],
+            'REST place order with an empty session cookie, prevent_submit off' => [
+                Area::AREA_WEBAPI_REST, 1, self::GUEST_EMAIL, '1',
+                'An empty cookie names no session, so it is treated as no cookie at all: with prevent_submit '
+                . 'off (set to 0 here) the email is not verified.',
+                '',
             ],
             'unresolvable area (CLI or programmatic order placement)' => [
                 new LocalizedException('Area code is not set'), 1, self::GUEST_EMAIL, '1',
-                'An unresolvable area has the same no-session lockout risk as GraphQL, so the email is not verified.',
+                'An unresolvable area has the same no-session lockout risk as GraphQL, so the email is not verified, '
+                . 'cookie or not.',
             ],
-            'GraphQL checkout' => [
+            'GraphQL checkout with prevent_submit off' => [
                 Area::AREA_GRAPHQL, 1, self::GUEST_EMAIL, '1',
-                'GraphQL clients often keep no session, so with prevent_submit off the "warned once" record '
-                . 'would be lost and the guest warned on every submit, never able to place the order.',
+                'GraphQL clients often keep no session, so with prevent_submit off (set to 0 here) the "warned once" '
+                . 'record would be lost and the guest warned on every submit, never able to place the order. A '
+                . 'cookie does not change that: only webapi_rest is opted in by it. With prevent_submit on, '
+                . 'GraphQL is checked (LOQ-20300).',
+            ],
+            'GraphQL checkout with prevent_submit off and no session' => [
+                Area::AREA_GRAPHQL, 1, self::GUEST_EMAIL, '1',
+                'With prevent_submit off GraphQL is not checked, session or not.',
+                null,
+            ],
+            'GraphQL, prevent_submit on, logged-in customer' => [
+                Area::AREA_GRAPHQL, 0, self::GUEST_EMAIL, '1',
+                'prevent_submit on opens GraphQL to GUEST emails only; a customer is still not checked.',
+                null, '1',
+            ],
+            'GraphQL, prevent_submit on, email verification switched off' => [
+                Area::AREA_GRAPHQL, 1, self::GUEST_EMAIL, '',
+                'prevent_submit on must not override email checkout verification being off.',
+                null, '1',
+            ],
+            'unresolvable area, prevent_submit on' => [
+                new LocalizedException('Area code is not set'), 1, self::GUEST_EMAIL, '1',
+                'prevent_submit on opens graphql and webapi_rest only, not CLI or programmatic placement.',
+                null, '1',
+            ],
+            'admin order create, prevent_submit on' => [
+                Area::AREA_ADMINHTML, 1, self::GUEST_EMAIL, '1',
+                'Admin order create stays excluded whatever prevent_submit says.',
+                null, '1',
             ],
             'admin order create' => [
                 Area::AREA_ADMINHTML, 1, self::GUEST_EMAIL, '1',
@@ -775,6 +880,263 @@ class QuoteSubmitBeforeTest extends TestCase
                 'A quote with no email set has nothing to verify and must not be sent as a billable request.',
             ],
         ];
+    }
+
+    /**
+     * LOQ-20299 journey: Luma guest checkout - email step, shipping step, REST place order - bills
+     * the email ONCE. The shipping step's pass is recorded and the place-order check reuses it,
+     * under both Prevent Submit settings. Driven through the real plugins and a real Validator,
+     * with only the billable verifyEmail() counted.
+     *
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     */
+    #[DataProvider('preventSubmitProvider')]
+    public function testLumaShippingStepThenPlaceOrderBillsTheEmailExactlyOnce(string $preventSubmit): void
+    {
+        $journey = $this->createJourney($preventSubmit, ['Valid' => true]);
+        $journey['accountManagement']->beforeIsEmailAvailable(
+            $this->createMock(CoreAccountManagement::class),
+            self::GUEST_EMAIL,
+            1
+        );
+        $this->saveShippingInformation($journey['shipping']);
+
+        $rejection = $this->placeOrder(
+            $journey['observer'],
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertNull($rejection, 'A valid email must not stop the order.');
+        $this->assertSame(
+            [self::GUEST_EMAIL],
+            iterator_to_array($journey['emailRequests']),
+            'Shipping step plus place order must make exactly ONE billable email call: the observer reuses the '
+            . 'pass CheckoutShippingInformation recorded.'
+        );
+    }
+
+    /**
+     * LOQ-20299 journey: a VIRTUAL cart never reaches the shipping step, so the observer
+     * (webapi_rest with the session cookie) is the only email check. With Prevent Submit = Yes an
+     * invalid email is rejected - and billed - on every attempt: no rejection is ever cached.
+     */
+    public function testAVirtualCartWithAnInvalidEmailIsRejectedOnEveryAttemptWithPreventSubmitOn(): void
+    {
+        $journey = $this->createJourney('1', false);
+        $event = $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1);
+
+        $rejections = [];
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $rejections[] = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        }
+
+        $this->assertSame(
+            array_fill(0, 3, 'The provided email address is invalid.'),
+            $rejections,
+            'Every attempt with the invalid email must be refused.'
+        );
+        $this->assertCount(3, $journey['emailRequests'], 'Each attempt is verified (billed).');
+    }
+
+    /**
+     * ...and with Prevent Submit = No the guest is warned ONCE and the resubmission is accepted
+     * without a second billable call - which only works because the REST request carries the
+     * session, the reason the cookie gates this check.
+     */
+    public function testAVirtualCartWithAnInvalidEmailIsWarnedOnceThenAcceptedWithPreventSubmitOff(): void
+    {
+        $journey = $this->createJourney('', false);
+        $event = $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1);
+
+        $rejections = [];
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $rejections[] = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        }
+
+        $this->assertSame(
+            ['Invalid email address. Submit again to use this email address.', null, null],
+            $rejections,
+            'The first attempt is warned; every resubmission of the same email is accepted.'
+        );
+        $this->assertCount(1, $journey['emailRequests'], 'Only the first attempt is billed.');
+    }
+
+    /**
+     * LOQ-20300 journey: with Prevent Submit = Yes a GraphQL (or cookie-less REST) place order
+     * with an invalid guest email is rejected on EVERY attempt. Each attempt is its own request
+     * with no session - a fresh session and Validator per attempt - so the pass cache always
+     * misses and each attempt is billed; and nothing about a rejection could be remembered anyway.
+     *
+     * @param string $area Area of the session-less place order.
+     */
+    #[DataProvider('sessionlessAreaProvider')]
+    public function testWithPreventSubmitOnASessionlessInvalidEmailIsRejectedOnEveryAttempt(string $area): void
+    {
+        $emailRequests = new ArrayObject();
+        $event = $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1);
+
+        $rejections = [];
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $journey = $this->createJourney('1', false, $area, null, $emailRequests);
+            $rejections[] = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        }
+
+        $this->assertSame(
+            array_fill(0, 3, 'The provided email address is invalid.'),
+            $rejections,
+            'With Prevent Submit = Yes an invalid email must block a session-less place order every time.'
+        );
+        $this->assertCount(3, $emailRequests, 'Each session-less attempt is verified (billed).');
+    }
+
+    /**
+     * ...and an email API error lets the order through (blockOnApiError: false), so an outage
+     * cannot stop GraphQL or headless orders.
+     *
+     * @param string $area Area of the session-less place order.
+     */
+    #[DataProvider('sessionlessAreaProvider')]
+    public function testWithPreventSubmitOnASessionlessApiErrorLetsTheOrderThrough(string $area): void
+    {
+        $journey = $this->createJourney('1', ['error' => true, 'message' => 'timeout'], $area, null);
+
+        $rejection = $this->placeOrder(
+            $journey['observer'],
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertNull($rejection, 'An email API outage must not block the order.');
+        $this->assertCount(1, $journey['emailRequests'], 'Fixture guard: the email really was sent for verification.');
+    }
+
+    public static function sessionlessAreaProvider(): array
+    {
+        return [
+            'GraphQL, no session' => [Area::AREA_GRAPHQL],
+            'REST without the session cookie' => [Area::AREA_WEBAPI_REST],
+        ];
+    }
+
+    public static function preventSubmitProvider(): array
+    {
+        return [
+            'prevent submit Yes' => ['1'],
+            'prevent submit No' => [''],
+        ];
+    }
+
+    /**
+     * The shipping-step plugins and this observer over ONE session and ONE real Validator, in
+     * webapi_rest with the storefront session cookie - Luma's REST checkout. Only the email check
+     * is switched on, so the email is the only thing that can be billed or rejected.
+     *
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     * @param mixed $verifyResponse What the billable verifyEmail() answers (false = invalid).
+     * @param string $area The area the request is handled in.
+     * @param string|null $sessionCookie The storefront session cookie, or null when absent.
+     * @param ArrayObject|null $emailRequests Shared billable-call log, so several journeys - one
+     *                                        per session-less request - can be counted together.
+     * @return array{accountManagement: AccountManagement, shipping: CheckoutShippingInformation,
+     *     observer: QuoteSubmitBefore, emailRequests: ArrayObject}
+     */
+    private function createJourney(
+        string $preventSubmit,
+        $verifyResponse,
+        string $area = Area::AREA_WEBAPI_REST,
+        ?string $sessionCookie = self::SESSION_ID,
+        ?ArrayObject $emailRequests = null
+    ): array {
+        $emailRequests = $emailRequests ?? new ArrayObject();
+        $session = $this->createSessionDouble(new ArrayObject(), new ArrayObject(['customerId' => null]));
+        $helper = $this->createConfigHelper([
+            'loqate_settings/settings/api_key' => 'TEST-API-KEY-0000',
+            self::EMAIL_CHECKOUT => '1',
+            self::EMAIL_PREVENT_SUBMIT => $preventSubmit,
+        ]);
+        // A real Validator with only the billable verifyEmail() stubbed and counted.
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
+        $validator = $this->getMockBuilder(Validator::class)
+            ->setConstructorArgs([
+                $this->createMock(Logger::class),
+                $session,
+                $this->createMock(RegionFactory::class),
+                $moduleList,
+                $helper,
+                $this->createMock(SerializerInterface::class),
+            ])
+            ->onlyMethods(['verifyEmail'])
+            ->getMock();
+        $validator->method('verifyEmail')->willReturnCallback(
+            static function ($email) use ($emailRequests, $verifyResponse) {
+                $emailRequests[] = $email;
+
+                return $verifyResponse;
+            }
+        );
+        $pluginArguments = [
+            $this->createMock(Context::class),
+            $this->createMock(UrlInterface::class),
+            $session,
+            $validator,
+            $helper,
+            $this->createMock(JsonFactory::class),
+        ];
+        $appState = $this->createMock(State::class);
+        $appState->method('getAreaCode')->willReturn($area);
+        $this->sessionCookie = $sessionCookie;
+
+        return [
+            'accountManagement' => new AccountManagement(...$pluginArguments),
+            'shipping' => new CheckoutShippingInformation(...$pluginArguments),
+            'observer' => new QuoteSubmitBefore(
+                $helper,
+                $validator,
+                $this->createMock(Logger::class),
+                $appState,
+                ...$this->sessionCookieDoubles()
+            ),
+            'emailRequests' => $emailRequests,
+        ];
+    }
+
+    /**
+     * Save the shipping information the way ShippingInformationManagement does.
+     */
+    private function saveShippingInformation(CheckoutShippingInformation $plugin): void
+    {
+        $plugin->aroundSaveAddressInformation(
+            $this->createMock(ShippingInformationManagement::class),
+            static fn ($cartId, $addressInformation) => 'shipping saved',
+            1,
+            new class {
+                public function getShippingAddress(): object
+                {
+                    return new class {
+                        public function getData(): array
+                        {
+                            return ['street' => ['1 High St'], 'city' => 'London', 'country_id' => 'GB'];
+                        }
+                    };
+                }
+            }
+        );
+    }
+
+    /**
+     * Fire the observer once, as one place-order attempt.
+     *
+     * @return LocalizedException|null The rejection, or null when the order goes through.
+     */
+    private function placeOrder(QuoteSubmitBefore $observer, Observer $event): ?LocalizedException
+    {
+        try {
+            $observer->execute($event);
+        } catch (LocalizedException $rejection) {
+            return $rejection;
+        }
+
+        return null;
     }
 
     /**
@@ -812,8 +1174,8 @@ class QuoteSubmitBeforeTest extends TestCase
             }
         );
         $validator->method('validateEmail')->willReturnCallback(
-            function ($email, $blockOnApiError = true) use ($calls) {
-                $calls[] = ['validateEmail', $email, $blockOnApiError];
+            function ($email, $blockOnApiError = true, $usePassCache = false) use ($calls) {
+                $calls[] = ['validateEmail', $email, $blockOnApiError, $usePassCache];
 
                 return $this->emailResponse;
             }
@@ -836,7 +1198,25 @@ class QuoteSubmitBeforeTest extends TestCase
             $appState->method('getAreaCode')->willReturn($area);
         }
 
-        return new QuoteSubmitBefore($helper, $validator, $logger, $appState);
+        return new QuoteSubmitBefore($helper, $validator, $logger, $appState, ...$this->sessionCookieDoubles());
+    }
+
+    /**
+     * The session config and cookie reader the observer is given: the cookie named by the config
+     * answers $this->sessionCookie, any other name answers the default.
+     *
+     * @return array{0: SessionConfig, 1: CookieReaderInterface}
+     */
+    private function sessionCookieDoubles(): array
+    {
+        $sessionConfig = $this->createMock(SessionConfig::class);
+        $sessionConfig->method('getName')->willReturn(self::SESSION_COOKIE_NAME);
+        $cookieReader = $this->createMock(CookieReaderInterface::class);
+        $cookieReader->method('getCookie')->willReturnCallback(
+            fn ($name, $default = null) => $name === self::SESSION_COOKIE_NAME ? $this->sessionCookie : $default
+        );
+
+        return [$sessionConfig, $cookieReader];
     }
 
     /**
@@ -980,7 +1360,7 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * The validateEmail() calls alone, as ['validateEmail', email, blockOnApiError].
+     * The validateEmail() calls alone, as ['validateEmail', email, blockOnApiError, usePassCache].
      *
      * @return array<int, array>
      */
