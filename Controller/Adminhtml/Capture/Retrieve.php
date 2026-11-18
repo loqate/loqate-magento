@@ -3,25 +3,37 @@
 namespace Loqate\ApiIntegration\Controller\Adminhtml\Capture;
 
 use Loqate\ApiIntegration\Helper\Controller;
-use Magento\Framework\App\ActionInterface;
+use Magento\Backend\App\Action;
+use Magento\Backend\App\Action\Context;
+use Magento\Framework\App\Action\HttpGetActionInterface;
 use Magento\Framework\App\ResponseInterface;
 use Magento\Framework\Controller\ResultInterface;
 
 /**
  * Retrieve class
+ *
+ * Extends the backend Action so Magento requires an admin login before execute() runs.
  */
-class Retrieve implements ActionInterface
+class Retrieve extends Action implements HttpGetActionInterface
 {
+    /**
+     * Any logged-in admin: the lookup serves the order-create, order-address-edit and
+     * customer-edit pages, whose users may lack configuration rights.
+     */
+    public const ADMIN_RESOURCE = 'Magento_Backend::admin';
+
     /** @var Controller $controllerHelper */
     private $controllerHelper;
 
     /**
      * Retrieve constructor
      *
+     * @param Context $context
      * @param Controller $controllerHelper
      */
-    public function __construct(Controller $controllerHelper)
+    public function __construct(Context $context, Controller $controllerHelper)
     {
+        parent::__construct($context);
         $this->controllerHelper = $controllerHelper;
     }
 
@@ -33,10 +45,5 @@ class Retrieve implements ActionInterface
     public function execute()
     {
         return $this->controllerHelper->retrieve();
-    }
-
-    protected function _isAllowed()
-    {
-        return true;
     }
 }

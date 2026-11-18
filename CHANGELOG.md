@@ -7,6 +7,17 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+### Security
+
+- **The admin address-lookup routes now require an admin login** (LOQ-20336).
+  `loqate_admin/capture/find` and `retrieve` ran a Loqate lookup on the merchant's API key
+  for any request, logged in or not. Logged-in admins are unaffected, including roles
+  without configuration rights. The storefront lookup routes (`loqate/capture/find` and
+  `retrieve`) are public by design and unchanged.
+
+  Run `bin/magento setup:di:compile` after upgrading: both controllers' constructors
+  changed, and until the store recompiles, admin address lookup fails.
+
 ## [2.2.1] - 2026-11-18
 
 ### Fixed
