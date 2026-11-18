@@ -2,6 +2,7 @@
 
 namespace Loqate\ApiIntegration\Test\Unit\Dependency;
 
+use Loqate\ApiConnector\Client\Capture;
 use Loqate\ApiConnector\Client\Http\HttpClient;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -23,7 +24,7 @@ use PHPUnit\Framework\TestCase;
  * between them: `"lqt/api-connector": "^1.1"` was equally satisfied by the fixed 1.1.3 and the
  * broken 1.1.2, so an upstream release could not reach a merchant who had already resolved
  * 1.1.2 and had no reason to move. This test is the module-side half - it asks what is in
- * vendor/ - and it is what makes the `^1.1.3` constraint in composer.json an enforced
+ * vendor/ - and it is what makes the `^1.1.4` constraint in composer.json an enforced
  * guarantee rather than a hopeful one.
  *
  * WHY IT DRIVES THE REAL VENDORED CLASS AND A REAL SOCKET. A double cannot answer the
@@ -62,6 +63,23 @@ class ApiConnectorCompletesRequestsTest extends TestCase
 
     /** How long the stub waits for the request, and the parent for the stub's port, in seconds. */
     private const TIMEOUT_SECONDS = 10;
+
+    /**
+     * The explicit total limit the never-answers cases pass to get()/post(), in seconds. Short,
+     * so the suite stays fast; what is proven is that the limit is honoured, not its size.
+     */
+    private const GIVE_UP_AFTER_SECONDS = 1;
+
+    /** Slack allowed on top of a limit before it counts as not honoured, in seconds. */
+    private const MARGIN_SECONDS = 1.0;
+
+    /**
+     * How long the never-answers stub holds a connection before closing it, in seconds. Longer
+     * than GIVE_UP_AFTER_SECONDS + MARGIN_SECONDS, so a client that honours its limit has given
+     * up well before; short, so a client with no limit (1.1.3) fails the test instead of
+     * hanging the suite.
+     */
+    private const SILENT_HOLD_SECONDS = 3;
 
     /**
      * The two ways this module reaches Loqate, both of which called the deprecated
@@ -111,6 +129,322 @@ class ApiConnectorCompletesRequestsTest extends TestCase
     }
 
     /**
+     * LOQ-20334: AN UPSTREAM THAT ACCEPTS AND NEVER ANSWERS MUST NOT HOLD A SHOPPER FOREVER.
+     *
+     * Up to 1.1.3 HttpClient set no cURL timeout at all, so a Loqate endpoint that took the
+     * connection and then stalled held the PHP worker - and the shopper's checkout - for as long
+     * as the network let it. 1.1.4 sets CURLOPT_TIMEOUT from get()/post()'s third argument and
+     * turns the failure into an Exception("cURL error 28: …"), which Client\Capture and
+     * Client\Verify already turn into an error envelope. The stub here reads the request and
+     * sends nothing; the test asserts the SDK gives up inside the limit it was handed, and says
+     * so with an exception rather than a value.
+     */
+    #[DataProvider('requestMethodProvider')]
+    public function testVendoredHttpClientGivesUpOnAServerThatNeverAnswers(string $method): void
+    {
+        $stub = $this->startStubEndpoint(false);
+
+        try {
+            [$response, $thrown, $seconds] = $this->attemptThroughMagentosErrorHandler(
+                $method,
+                'http://' . $stub['address'] . '/Capture/Interactive/Find/v1.10/json3.ws',
+                self::GIVE_UP_AFTER_SECONDS
+            );
+        } finally {
+            $this->stopStubEndpoint($stub);
+        }
+
+        $this->assertCurlFailure(
+            $method,
+            28,
+            self::GIVE_UP_AFTER_SECONDS + self::MARGIN_SECONDS,
+            $response,
+            $thrown,
+            $seconds,
+            sprintf('a server that accepted the request and never answered, with a %d s limit', self::GIVE_UP_AFTER_SECONDS)
+        );
+    }
+
+    /**
+     * LOQ-20334: A REFUSED CONNECTION IS A FAILURE, NOT AN EMPTY ANSWER.
+     *
+     * 1.1.3 handed curl_exec()'s false straight to json_decode() and returned null, so a request
+     * that never reached Loqate looked to HttpClient's caller like a response with nothing in it
+     * (Capture, Verify and Extras then answered their generic 'Unexpected error occurred.'). 1.1.4
+     * throws Exception("cURL error 7: …"). The address is one this process bound and released
+     * a moment ago, so nothing is listening on it and the kernel refuses at once.
+     */
+    #[DataProvider('requestMethodProvider')]
+    public function testVendoredHttpClientReportsARefusedConnectionAsAnException(string $method): void
+    {
+        [$response, $thrown, $seconds] = $this->attemptThroughMagentosErrorHandler(
+            $method,
+            'http://' . $this->refusingAddress() . '/Capture/Interactive/Find/v1.10/json3.ws',
+            // Short, so a process that grabs the released port and never answers fails this fast.
+            self::GIVE_UP_AFTER_SECONDS
+        );
+
+        $this->assertCurlFailure(
+            $method,
+            7,
+            self::MARGIN_SECONDS,
+            $response,
+            $thrown,
+            $seconds,
+            'a port nothing listens on'
+        );
+    }
+
+    /**
+     * LOQ-20334: an interactive lookup gives up within 8 s. Capture find/retrieve sit in front
+     * of a shopper typing an address, where a longer wait is indistinguishable from broken.
+     *
+     * Asserts what the vendored Capture actually hands HttpClient::get(), not a constant: an SDK
+     * that kept Capture::TIMEOUT but stopped passing it would leave lookups on the 30 s default.
+     * Same check as the SDK's tests/timeouts.php. A spy replaces Capture's private $httpClient,
+     * records each limit and answers from a canned body, so no request leaves the process.
+     */
+    public function testInstalledCapturePassesAnEightSecondLimitToEveryLookup(): void
+    {
+        $canned = ['Items' => [['Id' => 'GB|RM|A|1', 'Type' => 'Address', 'Text' => '1 High Street']]];
+        $spy = new class ($canned) extends HttpClient {
+            /** @var array<int, int|null> Limit each get() was given; null when none was passed. */
+            public array $timeouts = [];
+
+            /**
+             * @param array $canned What every get() answers.
+             */
+            public function __construct(private readonly array $canned)
+            {
+            }
+
+            /**
+             * Record the limit and answer without touching the network.
+             *
+             * @param string $endpoint
+             * @param array $params
+             * @param int|null $timeout
+             * @return array
+             */
+            public function get(string $endpoint, array $params, ?int $timeout = null)
+            {
+                $this->timeouts[] = $timeout;
+
+                return $this->canned;
+            }
+        };
+
+        $capture = new Capture('LOQ-20334-NOT-A-REAL-KEY');
+        // Else a renamed property makes the bind add a dynamic one and the real client calls Loqate.
+        $this->assertTrue(
+            property_exists(Capture::class, 'httpClient'),
+            'Capture no longer has a private $httpClient, so the spy cannot be injected; update this test.'
+        );
+        \Closure::bind(function () use ($spy) {
+            $this->httpClient = $spy;
+        }, $capture, Capture::class)();
+
+        $lookups = [
+            'find' => ['Text' => '1 High Street', 'Country' => 'GB'],
+            'retrieve' => ['Id' => 'GB|RM|A|1'],
+        ];
+        foreach ($lookups as $method => $params) {
+            $spy->timeouts = [];
+
+            $this->assertSame($canned['Items'], $capture->$method($params), sprintf(
+                'Capture::%s() did not answer from the injected HttpClient, so its limit was not observed.',
+                $method
+            ));
+            $this->assertCount(1, $spy->timeouts, sprintf('Capture::%s() did not call get() exactly once.', $method));
+
+            $limit = $spy->timeouts[0];
+            $this->assertNotNull($limit, sprintf(
+                'Capture::%s() passes get() no limit, so it waits HttpClient\'s default (none before 1.1.4). '
+                . 'Check `composer show lqt/api-connector` reports 1.1.4 or later.',
+                $method
+            ));
+            $this->assertGreaterThan(0, $limit, sprintf('Capture::%s() passes 0, which cURL reads as no limit.', $method));
+            $this->assertLessThanOrEqual(8, $limit, sprintf(
+                'Capture::%s() passes get() %d s; LOQ-20334 allows an address lookup at most 8 s.',
+                $method,
+                $limit
+            ));
+        }
+    }
+
+    /**
+     * LOQ-20334: an unreachable Loqate is detected within 2 s, whatever the total limit.
+     *
+     * Reads the constant only; the SDK's tests/timeouts.php proves get()/post() apply it.
+     */
+    public function testInstalledSdkCapsTheConnectAtTwoSeconds(): void
+    {
+        $limit = $this->sdkConstant(HttpClient::class, 'CONNECT_TIMEOUT');
+
+        $this->assertGreaterThan(0, $limit, 'HttpClient::CONNECT_TIMEOUT of 0 means cURL\'s own 300 s.');
+        $this->assertLessThanOrEqual(2, $limit, sprintf(
+            'HttpClient::CONNECT_TIMEOUT is %d s; LOQ-20334 allows connecting at most 2 s.',
+            $limit
+        ));
+    }
+
+    /**
+     * LOQ-20334: the default total stays at least 30 s, and above the longest email Timeout this
+     * module can send Loqate.
+     *
+     * Reads the constant only; the SDK's tests/timeouts.php proves get()/post() fall back to it.
+     *
+     * Verify::verifyEmail() uses the default. Helper\Validator sends Loqate a `Timeout` in ms
+     * from email_validation_timeout_value, and Loqate may legitimately take that long to answer;
+     * a client limit at or below it cuts off an answer Loqate is still entitled to give and turns
+     * a valid email into a fault. The module's figure is read from both etc/config.xml (the
+     * default) and etc/adminhtml/system.xml (the admin form maximum, a client-side range check
+     * the server does not enforce), so raising either past the SDK's limit turns this red.
+     */
+    public function testInstalledSdkDefaultLimitOutlastsTheEmailTimeoutSentToLoqate(): void
+    {
+        $limit = $this->sdkConstant(HttpClient::class, 'TIMEOUT');
+        $emailTimeoutMs = $this->longestEmailTimeoutMs();
+
+        $this->assertGreaterThanOrEqual(30, $limit, sprintf(
+            'HttpClient::TIMEOUT is %d s; LOQ-20334 requires the default total to be at least 30 s.',
+            $limit
+        ));
+        $this->assertGreaterThan($emailTimeoutMs, $limit * 1000, sprintf(
+            'HttpClient::TIMEOUT is %d s but this module can ask Loqate to spend up to %d ms on an '
+            . 'email check, so the SDK would give up on answers Loqate is still allowed to send.',
+            $limit,
+            $emailTimeoutMs
+        ));
+    }
+
+    // A normal response through get()/post() is unchanged by LOQ-20334: that is exactly what
+    // testVendoredHttpClientReturnsADecodedBodyOnThisPhpVersion() asserts, so it is not repeated.
+
+    /**
+     * Assert a request failed the way 1.1.4 reports a transport failure: a plain Exception whose
+     * message starts "cURL error <errno>", inside $withinSeconds.
+     *
+     * @param string $method 'get' or 'post'.
+     * @param int $errno Expected cURL error number.
+     * @param float $withinSeconds Longest the failure may take.
+     * @param mixed $response What the SDK returned, if it returned.
+     * @param \Throwable|null $thrown What escaped the SDK, if anything.
+     * @param float $seconds How long the call took.
+     * @param string $against The situation, for the failure message.
+     * @return void
+     */
+    private function assertCurlFailure(
+        string $method,
+        int $errno,
+        float $withinSeconds,
+        mixed $response,
+        ?\Throwable $thrown,
+        float $seconds,
+        string $against
+    ): void {
+        if ($thrown === null) {
+            $this->fail(sprintf(
+                'HttpClient::%s() against %s returned %s after %.2f s instead of throwing "cURL error %d". '
+                . 'The caller cannot tell that from an empty Loqate answer. '
+                . 'Check `composer show lqt/api-connector` reports 1.1.4 or later.',
+                $method,
+                $against,
+                var_export($response, true),
+                $seconds,
+                $errno
+            ));
+        }
+
+        $this->assertSame(\Exception::class, get_class($thrown), sprintf(
+            'HttpClient::%s() against %s let %s escape ("%s"), not the SDK\'s own Exception.',
+            $method,
+            $against,
+            get_class($thrown),
+            $thrown->getMessage()
+        ));
+        $this->assertStringStartsWith(sprintf('cURL error %d:', $errno), $thrown->getMessage(), sprintf(
+            'HttpClient::%s() against %s threw the wrong failure.',
+            $method,
+            $against
+        ));
+        $this->assertLessThan($withinSeconds, $seconds, sprintf(
+            'HttpClient::%s() against %s took %.2f s to give up; the limit is %.2f s.',
+            $method,
+            $against,
+            $seconds,
+            $withinSeconds
+        ));
+    }
+
+    /**
+     * A 127.0.0.1 host:port nothing is listening on: bind port 0, note what the kernel gave,
+     * release it. Another process could take it in between; on loopback that is vanishingly rare.
+     *
+     * @return string
+     */
+    private function refusingAddress(): string
+    {
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($server === false) {
+            $this->fail(sprintf('Could not bind 127.0.0.1 to find a free port: %s (%d)', $errstr, $errno));
+        }
+
+        try {
+            return stream_socket_get_name($server, false);
+        } finally {
+            fclose($server);
+        }
+    }
+
+    /**
+     * Read an integer class constant the installed SDK may not have yet, failing with a clear
+     * message - rather than a fatal - when it is missing.
+     *
+     * @param string $class
+     * @param string $name
+     * @return int
+     */
+    private function sdkConstant(string $class, string $name): int
+    {
+        $this->assertTrue(defined($class . '::' . $name), sprintf(
+            '%s::%s is not defined, so the installed lqt/api-connector predates LOQ-20334 and sets no '
+            . 'such limit. Check `composer show lqt/api-connector` reports 1.1.4 or later.',
+            $class,
+            $name
+        ));
+
+        $value = constant($class . '::' . $name);
+        $this->assertIsInt($value, sprintf('%s::%s is not an integer number of seconds.', $class, $name));
+
+        return $value;
+    }
+
+    /**
+     * The longest email `Timeout`, in ms, this module can send Loqate: the larger of the shipped
+     * default and the top of the range the admin form accepts.
+     *
+     * @return int
+     */
+    private function longestEmailTimeoutMs(): int
+    {
+        $etc = __DIR__ . '/../../../etc';
+
+        $default = simplexml_load_file($etc . '/config.xml')->xpath('//email_settings/email_validation_timeout_value');
+        $this->assertCount(1, $default, 'etc/config.xml no longer has a single email_validation_timeout_value.');
+
+        $validate = simplexml_load_file($etc . '/adminhtml/system.xml')
+            ->xpath('//field[@id="email_validation_timeout_value"]/validate');
+        $this->assertCount(1, $validate, 'etc/adminhtml/system.xml no longer validates email_validation_timeout_value.');
+        $this->assertSame(1, preg_match('/digits-range-\d+-(\d+)/', (string)$validate[0], $range), sprintf(
+            'email_validation_timeout_value is no longer range-validated ("%s"), so its maximum is unbounded.',
+            (string)$validate[0]
+        ));
+
+        return max((int)$default[0], (int)$range[1]);
+    }
+
+    /**
      * Make one request through the real vendored HttpClient, under the error handler a live
      * Magento installation runs with.
      *
@@ -139,27 +473,9 @@ class ApiConnectorCompletesRequestsTest extends TestCase
      */
     private function requestThroughMagentosErrorHandler(string $method, string $endpoint)
     {
-        $client = new HttpClient();
-        $params = ['Text' => '1 High Street', 'Country' => 'GB'];
-        $call = match ($method) {
-            'get' => static fn () => $client->get($endpoint, $params),
-            'post' => static fn () => $client->post($endpoint, $params),
-        };
+        [$response, $escaped] = $this->attemptThroughMagentosErrorHandler($method, $endpoint);
 
-        $previousReporting = error_reporting(E_ALL);
-        set_error_handler(static function (int $severity, string $message, string $file = '', int $line = 0) {
-            // Exactly Magento\Framework\App\ErrorHandler::handler(): a suppressed or unreported
-            // error is handed back to PHP, everything else becomes an exception.
-            if ((error_reporting() & $severity) === 0) {
-                return false;
-            }
-
-            throw new \ErrorException($message, 0, $severity, $file, $line);
-        });
-
-        try {
-            return $call();
-        } catch (\Throwable $escaped) {
+        if ($escaped !== null) {
             $this->fail(sprintf(
                 'The vendored lqt/api-connector cannot complete a request on PHP %s: HttpClient::%s() let '
                 . '%s escape - "%s" (%s:%d). In a store this is not logged and moved past: Client\Capture '
@@ -174,6 +490,53 @@ class ApiConnectorCompletesRequestsTest extends TestCase
                 $escaped->getFile(),
                 $escaped->getLine()
             ));
+        }
+
+        return $response;
+    }
+
+    /**
+     * Make one request through the real vendored HttpClient under Magento's error handler, as
+     * requestThroughMagentosErrorHandler() describes, and report what happened instead of
+     * judging it: the LOQ-20334 cases EXPECT an exception, so a Throwable is a result here.
+     *
+     * $timeout is passed as get()/post()'s third argument only when given. PHP silently drops
+     * surplus arguments to a userland method, so against an SDK without the parameter (1.1.3)
+     * the call still runs - with no limit - and the test fails on what comes back, not on a
+     * fatal.
+     *
+     * @param string $method 'get' or 'post'.
+     * @param string $endpoint Absolute URL to request.
+     * @param int|null $timeout Total limit in seconds to pass through, or null for the default.
+     * @return array{0: mixed, 1: \Throwable|null, 2: float} What the SDK returned, what
+     *         escaped it, and how many seconds the call took.
+     */
+    private function attemptThroughMagentosErrorHandler(string $method, string $endpoint, ?int $timeout = null): array
+    {
+        $client = new HttpClient();
+        $params = ['Text' => '1 High Street', 'Country' => 'GB'];
+        $arguments = $timeout === null ? [$endpoint, $params] : [$endpoint, $params, $timeout];
+        $call = match ($method) {
+            'get' => static fn () => $client->get(...$arguments),
+            'post' => static fn () => $client->post(...$arguments),
+        };
+
+        $previousReporting = error_reporting(E_ALL);
+        set_error_handler(static function (int $severity, string $message, string $file = '', int $line = 0) {
+            // Exactly Magento\Framework\App\ErrorHandler::handler(): a suppressed or unreported
+            // error is handed back to PHP, everything else becomes an exception.
+            if ((error_reporting() & $severity) === 0) {
+                return false;
+            }
+
+            throw new \ErrorException($message, 0, $severity, $file, $line);
+        });
+
+        $started = hrtime(true);
+        try {
+            return [$call(), null, (hrtime(true) - $started) / 1e9];
+        } catch (\Throwable $escaped) {
+            return [null, $escaped, (hrtime(true) - $started) / 1e9];
         } finally {
             restore_error_handler();
             error_reporting($previousReporting);
@@ -188,15 +551,17 @@ class ApiConnectorCompletesRequestsTest extends TestCase
      * port 0 and reports back the port the kernel gave it, rather than the parent picking one,
      * so the test cannot fail because a port looked free a moment ago and no longer is.
      *
+     * @param bool $answer False for a stub that accepts the request and never answers it.
      * @return array{process: resource, pipes: array, address: string} Handle for
      *         stopStubEndpoint(), plus the host:port the stub is listening on.
      */
-    private function startStubEndpoint(): array
+    private function startStubEndpoint(bool $answer = true): array
     {
         $child = sprintf(
-            'require %s; $test = %s; $test::serveOneRequest();',
+            'require %s; $test = %s; $test::serveOneRequest(%s);',
             var_export(__DIR__ . '/../../bootstrap.php', true),
-            var_export(self::class, true)
+            var_export(self::class, true),
+            var_export($answer, true)
         );
 
         $pipes = [];
@@ -294,9 +659,14 @@ class ApiConnectorCompletesRequestsTest extends TestCase
      * write error instead of the response, which would fail this test for a reason that has
      * nothing to do with the SDK.
      *
+     * With $answer false it is the LOQ-20334 hung upstream: it reads the request and then sends
+     * nothing, holding the connection until the client hangs up or SILENT_HOLD_SECONDS pass.
+     * That bound is what stops an SDK with no timeout from hanging the suite.
+     *
+     * @param bool $answer False to accept the request and never answer it.
      * @return void
      */
-    public static function serveOneRequest(): void
+    public static function serveOneRequest(bool $answer = true): void
     {
         $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
         if ($server === false) {
@@ -331,6 +701,15 @@ class ApiConnectorCompletesRequestsTest extends TestCase
                 break;
             }
             $bodyLength -= strlen($chunk);
+        }
+
+        if (!$answer) {
+            // Blocks until the client hangs up (EOF) or the hold runs out.
+            stream_set_timeout($connection, self::SILENT_HOLD_SECONDS);
+            fread($connection, 1);
+            fclose($connection);
+            fclose($server);
+            return;
         }
 
         fwrite($connection, sprintf(
