@@ -17,19 +17,32 @@ predate it and are described by their git tags and commit history.
 
 - **Storefront address lookups are now limited per client** (LOQ-20339). The public
   `loqate/capture/find` and `retrieve` routes ran a Loqate lookup on the merchant's API key
-  for anyone, as often as they liked. Each client may now make 200 lookups, Find and
-  Retrieve counted together, in each 10-minute window. The limit is approximate: a client
-  sending many requests in parallel can get several times the limit through. This limit
-  slows down individual clients; it does not cap total spend on the key. To do that, set
-  usage limits on the API key in your Loqate account. A client over the limit gets HTTP 429
-  instead of a lookup: the lookup widget keeps working (since LOQ-20320) but shows no
-  suggestions until the window ends, and the shopper can still type the address by hand.
-  Shoppers who share an IP address, such as behind mobile-carrier NAT or an office network,
-  share one counter, and IPv6 clients are counted per /64 network. The first refused
-  request in each window is logged to `var/log/loqate_log_file.log` with the client's IP
-  address (its /64 network for IPv6). The counter lives in Magento's cache, so it is shared
-  across web nodes when the cache is Redis; if the cache fails, lookups are allowed rather
-  than blocked.
+  for anyone, as often as they liked. Each client may now make 200 lookups by default, Find
+  and Retrieve counted together, in each 10-minute window. A client over the limit gets
+  HTTP 429 instead of a lookup: the lookup widget keeps working (since LOQ-20320) but shows
+  no suggestions until the window ends, and the shopper can still enter the address
+  manually. A client is an IP address: shoppers who share one, such as behind
+  mobile-carrier NAT or an office network, share one counter, and IPv6 clients are counted
+  per /64 network. The first refused request from each client in each window is logged to
+  `var/log/loqate_log_file.log` with the client's IP address (its /64 network for IPv6).
+  The counter lives in Magento's cache, so it is shared across web nodes when the cache is
+  Redis; if the cache fails, lookups are allowed rather than blocked. The limit is
+  approximate: a client sending many requests in parallel can get several times the limit
+  through. It slows down individual clients and does not cap total spend on the key; to do
+  that, set usage limits on the API key in your Loqate account.
+
+  The limit is set in Stores > Configuration > Loqate > Main Settings > Address Capture >
+  Storefront lookups per client per 10 minutes (LOQ-20340). It is global, because one
+  counter per client is shared by every store view, and defaults to 200. Raise it for
+  stores where many shoppers share an address, such as behind NAT or a CDN not yet set up
+  to pass the client IP. 0 turns the limit off, which brings back unlimited anonymous
+  lookups on your API key.
+
+  To size it, estimated from how the lookup widget behaves: it sends one Find per key press
+  in the lookup box and one Retrieve per address picked. A shopper who picks a suggestion
+  after typing part of the address uses roughly 10–20 lookups. Typing a whole address into
+  the lookup box, or correcting it, uses roughly 30–40. A checkout using separate shipping
+  and billing addresses with corrections is the worst case, at roughly 70–100.
 
   Both routes now answer 404 when storefront lookup is switched off for the store in both
   checkout and customer account. The admin lookup routes are not limited.

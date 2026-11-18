@@ -21,15 +21,20 @@ use stdClass;
 
 /**
  * The storefront address-lookup routes are switched off with storefront lookup and rate
- * limited per client (LOQ-20339).
+ * limited per client (LOQ-20339), with a configurable limit (LOQ-20340).
+ *
+ * rate_limit is unset unless a test sets it, so DEFAULT_LIMIT applies.
  */
 class StorefrontCaptureGateTest extends TestCase
 {
     /** @var array<string, string> In-memory cache behind the CacheInterface double. */
     private array $cacheEntries = [];
 
-    /** @var array<string, string|null> */
+    /** @var array<string, string|null> Default-scope config; store-scope reads fall back to it. */
     private array $config = [];
+
+    /** @var array<string, string|null> Store-scope values, which override $config for store-scope reads only. */
+    private array $storeConfig = [];
 
     /** @var array<int, int|null> Lifetime passed to each cache save(). */
     private array $savedLifetimes = [];
@@ -52,7 +57,7 @@ class StorefrontCaptureGateTest extends TestCase
     {
         $gate = $this->gate();
 
-        for ($i = 0; $i < StorefrontCaptureGate::LIMIT; $i++) {
+        for ($i = 0; $i < StorefrontCaptureGate::DEFAULT_LIMIT; $i++) {
             $this->assertNull($gate->refusal());
         }
     }
@@ -77,7 +82,7 @@ class StorefrontCaptureGateTest extends TestCase
             ->with($this->stringContains($this->clientIp));
         $lookup = new stdClass();
         $helper = $this->createMock(Controller::class);
-        $helper->expects($this->exactly(StorefrontCaptureGate::LIMIT))
+        $helper->expects($this->exactly(StorefrontCaptureGate::DEFAULT_LIMIT))
             ->method($method)
             ->willReturn($lookup);
         $json = $this->createMock(Json::class);
@@ -88,7 +93,7 @@ class StorefrontCaptureGateTest extends TestCase
         ]);
         $controller = new $class($helper, $this->gate($logger, $json));
 
-        for ($i = 0; $i < StorefrontCaptureGate::LIMIT; $i++) {
+        for ($i = 0; $i < StorefrontCaptureGate::DEFAULT_LIMIT; $i++) {
             $this->assertSame($lookup, $controller->execute());
         }
 
@@ -136,7 +141,7 @@ class StorefrontCaptureGateTest extends TestCase
         $find = new Find($this->createStub(Controller::class), $this->gate());
         $retrieve = new Retrieve($this->createStub(Controller::class), $this->gate());
 
-        for ($i = 0; $i < StorefrontCaptureGate::LIMIT / 2; $i++) {
+        for ($i = 0; $i < StorefrontCaptureGate::DEFAULT_LIMIT / 2; $i++) {
             $find->execute();
             $retrieve->execute();
         }
@@ -154,6 +159,23 @@ class StorefrontCaptureGateTest extends TestCase
 
         $this->now += 1;
         $this->assertNull($gate->refusal());
+    }
+
+    /**
+     * The "refusal logged" flag belongs to one window, so a client still over the limit is logged again next window.
+     */
+    public function testLogsTheFirstRefusalAgainInTheNextWindow(): void
+    {
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->exactly(2))->method('warning');
+        $gate = $this->gate($logger);
+        $this->spendTheLimit($gate);
+        $this->assertNotNull($gate->refusal());
+
+        $this->now += StorefrontCaptureGate::WINDOW_SECONDS;
+        $this->spendTheLimit($gate);
+
+        $this->assertNotNull($gate->refusal());
     }
 
     public function testSavesTheCountForOneWindow(): void
@@ -379,6 +401,170 @@ class StorefrontCaptureGateTest extends TestCase
         $this->assertNull($gate->refusal());
     }
 
+    /**
+     * Fails open even when the stored count already puts the client over the limit.
+     */
+    public function testAllowsAClientOverTheLimitWhenTheCacheCannotSave(): void
+    {
+        $cache = $this->createStub(CacheInterface::class);
+        $cache->method('load')->willReturn($this->window() . '|' . StorefrontCaptureGate::DEFAULT_LIMIT);
+        $cache->method('save')->willThrowException(new RuntimeException('Redis went away'));
+        $gate = new StorefrontCaptureGate(
+            $this->helper(),
+            $cache,
+            $this->remoteAddress(),
+            $this->clock(),
+            $this->createStub(ResultFactory::class),
+            $this->createStub(Logger::class)
+        );
+
+        $this->assertNull($gate->refusal());
+    }
+
+    /**
+     * @return array<string, array{string, int}>
+     */
+    public static function configuredLimits(): array
+    {
+        return [
+            'plain' => ['5', 5],
+            'surrounded by spaces' => [' 50 ', 50],
+        ];
+    }
+
+    #[DataProvider('configuredLimits')]
+    public function testAppliesTheConfiguredLimitAndNamesItInTheLog(string $value, int $limit): void
+    {
+        $this->config['loqate_settings/capture_settings/rate_limit'] = $value;
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->once())
+            ->method('warning')
+            ->with($this->stringContains("made more than $limit lookups"));
+        $gate = $this->gate($logger);
+
+        for ($i = 0; $i < $limit; $i++) {
+            $this->assertNull($gate->refusal());
+        }
+
+        $this->assertNotNull($gate->refusal());
+    }
+
+    /**
+     * Lowered mid-window, the count is already past the new limit; the first refusal must still be logged.
+     */
+    public function testLogsTheFirstRefusalOnceWhenTheLimitIsLoweredMidWindow(): void
+    {
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->once())
+            ->method('warning')
+            ->with($this->stringContains('made more than 100 lookups'));
+        $gate = $this->gate($logger);
+        for ($i = 0; $i < 150; $i++) {
+            $this->assertNull($gate->refusal());
+        }
+
+        $this->config['loqate_settings/capture_settings/rate_limit'] = '100';
+
+        $this->assertNotNull($gate->refusal());
+        $this->assertNotNull($gate->refusal());
+        $this->assertNotNull($gate->refusal());
+    }
+
+    public function testAZeroLimitTurnsTheLimitOff(): void
+    {
+        $this->config['loqate_settings/capture_settings/rate_limit'] = '0';
+        $cache = $this->createMock(CacheInterface::class);
+        $cache->expects($this->never())->method('load');
+        $cache->expects($this->never())->method('save');
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->never())->method('warning');
+        $gate = new StorefrontCaptureGate(
+            $this->helper(),
+            $cache,
+            $this->remoteAddress(),
+            $this->clock(),
+            $this->createStub(ResultFactory::class),
+            $logger
+        );
+
+        for ($i = 0; $i <= StorefrontCaptureGate::DEFAULT_LIMIT; $i++) {
+            $this->assertNull($gate->refusal());
+        }
+
+        // No proxy warning either.
+        $this->clientIp = '10.0.0.5';
+        $this->assertNull($gate->refusal());
+    }
+
+    public function testAZeroLimitStillAnswers404WhenStorefrontLookupIsOff(): void
+    {
+        $this->config = [
+            'loqate_settings/capture_settings/enable_checkout' => '0',
+            'loqate_settings/capture_settings/enable_customer_account' => '0',
+            'loqate_settings/capture_settings/rate_limit' => '0',
+        ];
+        $forward = $this->createStub(Forward::class);
+        $resultFactory = $this->createStub(ResultFactory::class);
+        $resultFactory->method('create')->willReturn($forward);
+        $gate = new StorefrontCaptureGate(
+            $this->helper(),
+            $this->createStub(CacheInterface::class),
+            $this->remoteAddress(),
+            $this->clock(),
+            $resultFactory,
+            $this->createStub(Logger::class)
+        );
+
+        $this->assertSame($forward, $gate->refusal());
+    }
+
+    /**
+     * The limit is global: a store-scope value (set via CLI, config.php/env.php or an old row) is invisible
+     * in the admin and must not override it.
+     */
+    public function testIgnoresAStoreScopeLimit(): void
+    {
+        $this->config['loqate_settings/capture_settings/rate_limit'] = '3';
+        $this->storeConfig['loqate_settings/capture_settings/rate_limit'] = '0';
+        $gate = $this->gate();
+
+        for ($i = 0; $i < 3; $i++) {
+            $this->assertNull($gate->refusal());
+        }
+
+        $this->assertNotNull($gate->refusal());
+    }
+
+    /**
+     * @return array<string, array{string|null}>
+     */
+    public static function unusableLimits(): array
+    {
+        return [
+            'unset' => [null],
+            'empty' => [''],
+            'not a number' => ['abc'],
+            'negative' => ['-1'],
+            'fraction' => ['1.5'],
+        ];
+    }
+
+    /**
+     * A value set with bin/magento config:set is not validated, and must not turn the limit off.
+     */
+    #[DataProvider('unusableLimits')]
+    public function testFallsBackToTheDefaultLimitForAnUnusableValue(?string $value): void
+    {
+        $this->config['loqate_settings/capture_settings/rate_limit'] = $value;
+        $gate = $this->gate();
+
+        for ($i = 0; $i < StorefrontCaptureGate::DEFAULT_LIMIT; $i++) {
+            $this->assertNull($gate->refusal());
+        }
+
+        $this->assertNotNull($gate->refusal());
+    }
+
     private function window(): int
     {
         return intdiv($this->now, StorefrontCaptureGate::WINDOW_SECONDS);
@@ -386,7 +572,7 @@ class StorefrontCaptureGateTest extends TestCase
 
     private function spendTheLimit(StorefrontCaptureGate $gate): void
     {
-        for ($i = 0; $i < StorefrontCaptureGate::LIMIT; $i++) {
+        for ($i = 0; $i < StorefrontCaptureGate::DEFAULT_LIMIT; $i++) {
             $gate->refusal();
         }
     }
@@ -423,7 +609,10 @@ class StorefrontCaptureGateTest extends TestCase
     private function helper(): Data
     {
         $helper = $this->createStub(Data::class);
-        $helper->method('getConfigValue')->willReturnCallback(fn ($path) => $this->config[$path] ?? null);
+        $helper->method('getConfigValue')->willReturnCallback(
+            fn ($path) => $this->storeConfig[$path] ?? $this->config[$path] ?? null
+        );
+        $helper->method('getDefaultConfigValue')->willReturnCallback(fn ($path) => $this->config[$path] ?? null);
 
         return $helper;
     }

@@ -19,8 +19,8 @@ use Throwable;
  */
 class StorefrontCaptureGate
 {
-    /** Lookups, Find and Retrieve together, one client may make per window. */
-    const LIMIT = 200;
+    /** Lookups, Find and Retrieve together, one client may make per window when rate_limit is unset or invalid. */
+    const DEFAULT_LIMIT = 200;
 
     /** Length of the fixed rate-limit window, in seconds. */
     const WINDOW_SECONDS = 600;
@@ -100,14 +100,20 @@ class StorefrontCaptureGate
     /**
      * Count this request against the client's current window and tell whether it is over the limit
      *
-     * A request from a private or reserved address comes from the merchant's own proxy, not a
-     * shopper, so it is not counted. Fails open: when the cache cannot be read or written the
-     * request is allowed, so a broken cache never breaks address lookup in checkout.
+     * A configured limit of 0 turns the limit off: nothing is counted. A request from a private
+     * or reserved address comes from the merchant's own proxy, not a shopper, so it is not
+     * counted. Fails open: when the cache cannot be read or written the request is allowed, so
+     * a broken cache never breaks address lookup in checkout.
      *
      * @return bool
      */
     private function isOverLimit(): bool
     {
+        $limit = $this->limit();
+        if ($limit === 0) {
+            return false;
+        }
+
         $address = $this->clientAddress((string) $this->remoteAddress->getRemoteAddress());
         $window = intdiv((int) $this->dateTime->gmtTimestamp(), self::WINDOW_SECONDS);
 
@@ -121,11 +127,21 @@ class StorefrontCaptureGate
         $key = self::CACHE_KEY_PREFIX . hash('sha256', $bucket);
 
         try {
-            // shortcut: load-then-save is not atomic, so a client sending N requests in parallel can get up to about N × LIMIT through per window (capped by PHP-FPM workers); move to an atomic counter (e.g. Redis INCR) if the key's usage in the Loqate account is well above what the refusal log suggests.
-            $stored = explode('|', (string) $this->cache->load($key), 2);
+            // shortcut: load-then-save is not atomic, so a client sending N requests in parallel can get up to about N × limit through per window (capped by PHP-FPM workers); move to an atomic counter (e.g. Redis INCR) if the key's usage in the Loqate account is well above what the refusal log suggests.
+            // Stored as "<window>|<count>", with "|1" appended once this window's refusal has been logged.
+            $stored = explode('|', (string) $this->cache->load($key), 3);
             // A count from a different window, or a malformed value, starts the count again.
-            $count = count($stored) === 2 && $stored[0] === (string) $window ? (int) $stored[1] + 1 : 1;
-            $this->cache->save($window . '|' . $count, $key, [], self::WINDOW_SECONDS);
+            $current = count($stored) >= 2 && $stored[0] === (string) $window;
+            $count = $current ? (int) $stored[1] + 1 : 1;
+            $wasLogged = $current && ($stored[2] ?? '') === '1';
+            // Not "count === limit + 1": a limit lowered mid-window can leave the count already past it.
+            $logNow = $count > $limit && !$wasLogged;
+            $this->cache->save(
+                $window . '|' . $count . ($wasLogged || $logNow ? '|1' : ''),
+                $key,
+                [],
+                self::WINDOW_SECONDS
+            );
         } catch (Throwable $e) {
             $this->logger->warning(
                 'Loqate storefront lookup rate limit skipped, the cache failed: ' . $e->getMessage()
@@ -133,17 +149,35 @@ class StorefrontCaptureGate
             return false;
         }
 
-        if ($count === self::LIMIT + 1) {
+        if ($logNow) {
             $this->logger->warning(sprintf(
                 'Loqate storefront lookup rate limit reached: client IP %s made more than %d lookups'
                 . ' in %d seconds; further lookups are refused until the window ends.',
                 $bucket !== '' ? $bucket : '(unknown)',
-                self::LIMIT,
+                $limit,
                 self::WINDOW_SECONDS
             ));
         }
 
-        return $count > self::LIMIT;
+        return $count > $limit;
+    }
+
+    /**
+     * Get the configured lookups per client per window
+     *
+     * rate_limit is read at default scope only, because one counter per client is shared by every store;
+     * a website or store value, which the admin does not show, is ignored.
+     *
+     * @return int rate_limit; DEFAULT_LIMIT when it is unset or not a non-negative integer
+     */
+    private function limit(): int
+    {
+        // The (string) cast matters: ctype_digit(null) and trim(null) raise a deprecation, which Magento's
+        // ErrorHandler turns into an exception on every lookup.
+        $value = trim((string) $this->helper->getDefaultConfigValue('loqate_settings/capture_settings/rate_limit'));
+
+        // bin/magento config:set skips the admin field's validation, and garbage must not turn the limit off.
+        return ctype_digit($value) ? (int) $value : self::DEFAULT_LIMIT;
     }
 
     /**
