@@ -6,7 +6,8 @@
  *
  * Needed because Helper\Controller type-hints this class in its constructor, so a test
  * that builds a Controller - and therefore anything covering the captured-address store
- * it owns - cannot even create a double for it without the type existing.
+ * it owns - cannot even create a double for it without the type existing. Helper\StorefrontCaptureGate
+ * also uses it, to build its 404 forward (TYPE_FORWARD) and its 429 JSON result.
  */
 
 namespace Magento\Framework\Controller;
@@ -17,6 +18,8 @@ if (!class_exists(\Magento\Framework\Controller\ResultFactory::class, false)) {
         const TYPE_JSON = 'json';
 
         const TYPE_RAW = 'raw';
+
+        const TYPE_FORWARD = 'forward';
 
         public function create($type, array $arguments = [])
         {
