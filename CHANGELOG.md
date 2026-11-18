@@ -7,6 +7,71 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-18
+
+### Fixed
+
+- **Address lookup keeps responding after a slow or failed search, and keeps refining
+  as the shopper types** (LOQ-20320). After a lookup request failed with an HTTP error
+  other than a network error — for example a gateway 504 because the module's Find proxy
+  answered slowly — or simply never came back, address lookups stopped responding: the
+  browser script never released the request, so every later keystroke was queued and
+  never sent, and any loading indicator on the page never cleared. Failed requests are
+  now reported as errors, lookup and address-retrieve requests time out after 10
+  seconds, and in both cases the most recent search typed in the meantime is sent.
+
+  The server side is bounded in this same release (LOQ-20334, below). The module now
+  requires `lqt/api-connector` 1.1.4, where lookup and retrieve give up after 8 seconds
+  and every call has a 2-second connect limit. So while the Loqate API is slow, an
+  abandoned lookup holds its PHP-FPM worker in cURL for at most 8 seconds. That is cURL
+  time only: waiting for a free PHP-FPM worker, Magento's bootstrap and any wait on the
+  session lock come on top, so the browser's 10 seconds and the server's 8 do not line
+  up exactly, and a lookup the browser has given up on can still be running on the
+  server. Setting `request_terminate_timeout` on the PHP-FPM pool remains an optional
+  backstop.
+
+- **Calls to the Loqate API now time out instead of waiting as long as cURL does**
+  (LOQ-20334). The `lqt/api-connector` SDK set no cURL timeout, so a slow or unreachable
+  Loqate API held each PHP-FPM worker that called it until cURL returned or the pool's
+  `request_terminate_timeout` killed it; the web server's gateway timeout does not free
+  it, and `max_execution_time` does not count I/O wait on Linux. `lqt/api-connector`
+  **1.1.4** gives every call a 2-second connect limit and a total limit of 8 seconds for
+  address lookup and retrieve and 30 seconds for every other call the module makes.
+  Email validation gets
+  the 30-second limit, above the Timeout the module sends Loqate (15000 ms, the module's
+  default and admin-form maximum), so Loqate's own timeout still answers first. Admin
+  batch address verification — customer import (`Plugin/Admin/ValidateImportAddress.php`,
+  100 rows per call) and admin order save (`Plugin/Admin/OrderSave.php`), both through
+  the batch verify in `Helper/Validator.php` — now has each batch call capped at 30
+  seconds (per call, not per import or order) where a slow batch used to wait without
+  limit, and hitting the cap fails closed: the import stops
+  verifying and fails validation with one critical error ("Addresses could not be
+  validated: the Loqate service did not respond. Please try the import again."), and the
+  admin order is not saved and shows "An unexpected error occurred while trying to
+  validate your address."
+
+  A failed connection was already returned as the SDK's error shape, `['error' => true,
+  'message' => …]`, but with generic text: in 1.1.3 `HttpClient` returned null, and every
+  client method the module calls (`Capture::find()` and `retrieve()`, the `Verify`
+  checks, `Extras::ipToCountry()`) fell through to "Unexpected error occurred." With
+  1.1.4 the message the module logs names the cURL error, for example `cURL error 28:
+  Timeout was reached`. What shoppers see when a call fails is unchanged — lookups answer
+  with the module's error JSON, and the email, phone and address checks follow their
+  existing API-error handling. What is new is that slow calls are cut off.
+
+  **To pick it up, upgrade this module to the release carrying this entry.** It requires
+  `"lqt/api-connector": "^1.1.4"`, which an installed 1.1.3 does not satisfy, so name both
+  packages — `composer update gbg-loqate/loqate-integration lqt/api-connector` — and
+  Composer moves the SDK with the module. A merchant who stays on an older module version
+  can still take the fix with `composer update lqt/api-connector`: those releases require
+  `"^1.1.3"` or `"^1.1"`, which the installed SDK already satisfies, so Composer will not
+  move it unless it is named. Either way, check the result with `composer show
+  lqt/api-connector`, which must report 1.1.4 or later: that check is what catches a
+  partial update that silently left 1.1.3 in place. Do not run a bare `composer
+  update` in a Magento root — that updates the whole install's dependency tree.
+
+## [2.2.0] - 2026-11-16
+
 ### Changed — behaviour
 
 - **Place order no longer verifies the guest email once the address or phone check
@@ -66,6 +131,196 @@ predate it and are described by their git tags and commit history.
   checkouts. With "Prevent Submit" = Yes an invalid email now blocks the order there;
   with No the shopper is warned once and the next attempt goes through. An email
   that already passed at Luma's shipping step is not verified again (LOQ-20299).
+
+### Fixed
+
+- **Email validation now runs on Hyvä Checkout** (LOQ-19188). It used to run only
+  when Luma's checkout saved the shipping step, which Hyvä Checkout never calls, so
+  guest emails were not checked at all there. The guest's email is now checked when
+  a Hyvä Checkout order is placed, with the same "Prevent Submit" behaviour as Luma:
+  with Yes an invalid email blocks the order, and with No the first attempt warns and
+  placing the order again with the same email goes through. If the email service
+  returns an error at that point, the order goes through and the error is logged,
+  as the phone check there already does. Only guest emails are checked, as on Luma.
+  Luma's REST place order is checked as well since LOQ-20299, when it carries the
+  storefront session cookie, and GraphQL and cookie-less REST place orders with
+  "Prevent Submit" = Yes since LOQ-20300. GraphQL and cookie-less REST with
+  "Prevent Submit" = No are **not** covered: they often keep no session, so the
+  shopper would be warned on every attempt and could never place the order
+  (tracked in LOQ-20301). CLI and cron order placement are not covered either. See
+  also "Changed — behaviour" above.
+
+- **GraphQL and headless REST guest place orders now have their email checked when
+  "Prevent Submit" = Yes** (LOQ-20300). This covers GraphQL and REST place orders
+  without the storefront session cookie. An invalid email blocks the order; if the
+  email service returns an error, the order goes through and the error is logged. An
+  email that already passed earlier in the same session is not verified again
+  (LOQ-20299); without a session it is verified on every place order. With "Prevent
+  Submit" = No, these place orders are still not email-checked: warning once and
+  letting the next attempt through needs a session, which headless clients often do
+  not keep (tracked in LOQ-20301). CLI and cron order placement are still not
+  checked.
+
+### Changed — for developers extending this module
+
+- **`Helper\Validator`'s constructor takes two more required arguments**, a
+  `Magento\Framework\Notification\NotifierInterface` and a
+  `Magento\Framework\App\CacheInterface`, last (LOQ-20300). DI supplies them; a
+  subclass or code that calls `new Validator(...)` must pass them.
+
+## [2.1.4] - 2026-10-13
+
+### Fixed
+
+- **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
+  `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
+  Edit/New page and the Hyvä checkout "Add new address" modal now get Capture; before,
+  it silently did not. On any theme, including Luma and admin set to 1 street line, a
+  form with fewer street inputs than address lines folds every line into the ones it has.
+
+## [2.1.3] - 2026-09-10
+
+### Fixed
+
+- **Every Loqate API call the module makes failed on PHP 8.5, and works again**
+  (LOQ-17709). Reported by a merchant on Magento 2.4.9 / PHP 8.5. Address lookup and
+  retrieve, the email and phone checks, the single and batch address verifications and
+  set-country-by-IP all returned an error envelope instead of a result — 100% of the
+  time, in production and developer mode alike — so the lookup offered no suggestions,
+  every verification came back as a fault, and the checkout and customer address forms
+  stopped pre-selecting the shopper's country. The map's reverse-geocode lookup never
+  broke: the browser asks Loqate for that one directly, never this module's PHP.
+
+  It is a deprecation promoted to an exception: PHP 8.5 deprecated `curl_close()`, and
+  the `lqt/api-connector` dependency called it after every request in
+  `src/Client/Http/HttpClient.php` (this module makes no cURL calls of its own). On
+  Magento that is not a log line. `app/bootstrap.php` calls `error_reporting(E_ALL)`
+  unconditionally, and `Magento\Framework\App\ErrorHandler`, which throws on
+  `E_DEPRECATED`, is installed by both entry points: by
+  `Magento\Framework\App\Bootstrap::run()` on the web path, before it consults
+  `MAGE_MODE` at all, and by `bin/magento` itself before it runs the CLI application —
+  so the CLI paths that carry the batch verification (customer import, cron, the
+  consumers) failed exactly as web requests did. The throw lands inside
+  `HttpClient::get()` and `::post()` before either returns, and the SDK's own `catch
+  (Throwable)` turns it into `['error' => true, 'message' => …]`, which the module acts
+  on and `Helper/Controller.php:159` writes to `var/log/`. The handler adds its own
+  level, file and line around PHP's wording, so **the string to grep for is**
+  `Deprecated Functionality: Function curl_close() is deprecated since 8.5, as it has no
+  effect since PHP 8.0 in …/Client/Http/HttpClient.php on line 28` (line 51 on the
+  address verifications, which POST). PHP 8.5 is itself past Adobe's platform matrix for
+  2.4.9, which stops at 8.4, but `app/bootstrap.php` enforces only `>= 8.1.0`, so
+  nothing stops a merchant running it.
+
+  The fix is upstream, in `lqt/api-connector` **1.1.3**, which is released and on
+  Packagist. It drops the SDK's reference to the handle with `unset()` instead of
+  calling `curl_close()`. On PHP 8 that function was already a no-op — the handle is a
+  garbage-collected object, freed when the method returned — so `unset()` now frees it a
+  few statements earlier, at the same point in the code. On PHP 7, where the handle is a
+  refcounted resource, `unset()` frees it at exactly the statement `curl_close()` used
+  to. **Nothing changes for merchants on PHP 8.3 or 8.4**: the requests sent, the
+  responses parsed and the errors the module raises from them are identical there. On
+  8.5 the change is the difference between every call failing and every call working.
+
+  **To pick it up, upgrade this module to v2.1.3 or later.** That release requires
+  `"lqt/api-connector": "^1.1.3"`, so the fixed SDK is installed with it and no separate
+  step is needed. A merchant who stays on an older module version can still take the fix
+  by naming the package — `composer update lqt/api-connector` — because those releases
+  carry the looser `"^1.1"` constraint, which 1.1.2 already satisfies, so Composer will
+  not move the SDK unless it is named. Either way, check the result with `composer show
+  lqt/api-connector`, which must report 1.1.3 or later. Do not run a bare `composer
+  update` in a Magento root — that updates the whole install's dependency tree.
+
+  CI now also runs the module's unit suite on PHP 8.5, alongside 8.3 and 8.4, and the
+  suite carries a module-side regression guard for this defect:
+  `Test/Unit/Dependency/ApiConnectorCompletesRequestsTest.php` drives the real vendored
+  `HttpClient` — one case for `get()`, one for `post()`, the two call sites that broke —
+  over a real socket at a stub endpoint on `127.0.0.1`, under a replica of Magento's
+  throwing `ErrorHandler` with `error_reporting(E_ALL)`, and asserts that the decoded
+  response body comes back. It needs no API key, no network and no billable request, and
+  on PHP 8.5 it fails against the unfixed 1.1.2 — which is what makes the `^1.1.3`
+  constraint an enforced guarantee rather than a hopeful one.
+
+  **That guard only has teeth on the 8.5 leg.** `curl_close()` is not deprecated below
+  8.5, so the same test passes on 8.3 and 8.4 even with the unfixed SDK in `vendor/`. It
+  also installs that error handler and widens `error_reporting()` itself, because
+  `phpunit.xml.dist` sets `failOnWarning` and `failOnRisky` but not `failOnDeprecation`
+  — PHPUnit alone would not fail the run on the deprecation. The SDK repository keeps
+  its own guard as well (`composer test`), which drives `HttpClient` at a local stub
+  under a throwing error handler on PHP 7.0 through 8.5.
+
+## [2.1.2] - 2026-09-04
+
+### Fixed
+
+- **An address picked from the lookup no longer empties itself again on Hyvä
+  Checkout** (LOQ-17502). The shopper searched, picked a suggestion, watched city,
+  postcode and region fill in, and then lost them the moment focus moved to another
+  field — leaving the checkout without the data it had just shown. Reported on
+  Magento 2.4.8-p5 with module 2.0.16, reproducible on Hyvä's own default theme, and
+  not reproducible once the checkout was switched to Luma. Every release up to and
+  including v2.1.1 is affected; upgrading alone does not fix it.
+
+  Hyvä Checkout's fields are Magewire `wire:model.defer`, which Magewire rewrites
+  into an Alpine `x-model`, and Alpine syncs a text input to the component state on
+  `input` — `change` only on a select, checkbox or radio. The bundled capture SDK
+  dispatched `change` and nothing else for a text input, so the component never
+  learned the field had been filled in, and its next render morphed the stale empty
+  value back over what the shopper could see. Luma is unaffected because Knockout's
+  `value` binding listens for `change`, which is exactly what was being sent. The
+  street field looked like it survived, on both front ends, only because the shopper
+  typed into it and real `input` events had already fired.
+
+  The bundled SDK's own event dispatcher, `pca.reactTriggerChange`, now sends both
+  events for a text input: one bubbling `input`, then one bubbling `change`, in the
+  order a browser would (`input` while editing, `change` on commit). The value the
+  shopper picked therefore reaches Hyvä's component state, survives the next
+  re-render, and is the address the order is placed with. Fixing it in the dispatcher
+  rather than on the capture control's `populate` event also closes three sibling
+  write paths a `populate` hook missed — the drill-down write back to the search
+  field, the country list restoring the search text when it is dismissed, and
+  clearing the address — and it removes a re-vendor trap: a hook that added only
+  `input` would have depended on a separate local change further down the same file to
+  keep supplying `change`, so the next clean re-vendor of the SDK would have broken
+  Luma silently.
+
+  **Luma, multishipping, the customer address book and the admin order-create and
+  customer-edit screens behave the same for every consumer of `change`.** The
+  dispatcher still sends `change` for every node type it already sent it for, in the
+  same cases, and `select`, `input[type=file]`, checkbox, radio and textarea are not
+  touched at all — a text input is the only node type whose behaviour changed.
+
+  What is new on those screens too is that **every text input the SDK writes now also
+  receives one native bubbling `input`, immediately before the `change`** — the event
+  a browser would have sent and the SDK never did. No Magento binding on those screens
+  acts on `input`: Luma's Knockout `value` binding, the address-book and multishipping
+  forms and the admin UI components all listen for `change`. So no shopper-visible
+  behaviour is expected to change there, but a custom listener or third-party
+  extension bound to both events on a captured field will now run twice, and any
+  integration that treats an `input` on those fields as "the shopper typed" will now
+  see one. The regression steps for each of those screens are in
+  `Test/manual/LOQ-17502-manual-qa.md`.
+
+  The event contract is now asserted by an automated test: exactly one `input`, then
+  exactly one `change`, per populated text field. The country field and the region
+  `<select>` are unaffected; both are populated by paths that fire their own `change`.
+
+  This is a front-end-only change, and it now has automated coverage: a JavaScript
+  suite run by `npm test` — Node's built-in test runner with jsdom and the real Alpine
+  package, in `Test/js/`, wired into CI as its own job — which loads the real
+  `capture.js` rather than a re-implementation and asserts the event contract above,
+  that an Alpine `x-model` component ends up holding the populated city and postcode
+  and keeps them across a simulated Magewire commit and re-render, that the drill-down
+  and country-list-cancel paths dispatch `input` as well, that the extra event starts
+  no lookup loop, and that the capture control is constructed only once. Nothing
+  automated runs against a real Hyvä Checkout, so a manual pass over every screen the
+  script serves is still required before release; see
+  `Test/manual/LOQ-17502-manual-qa.md`. The standalone Alpine harness that ships
+  alongside it demonstrates the binding behaviour that caused the defect, but it does
+  not load `capture.js` and so proves nothing about the shipped code.
+
+## [2.1.0] - 2026-08-12
+
+### Changed — behaviour
 
 - **Admin order create is no longer AVC-checked, and obeys only the
   "Enable on Create Order (Admin)" toggles.** `Observer\QuoteSubmitBefore` now
@@ -184,228 +439,6 @@ predate it and are described by their git tags and commit history.
 
 ### Fixed
 
-- **Email validation now runs on Hyvä Checkout** (LOQ-19188). It used to run only
-  when Luma's checkout saved the shipping step, which Hyvä Checkout never calls, so
-  guest emails were not checked at all there. The guest's email is now checked when
-  a Hyvä Checkout order is placed, with the same "Prevent Submit" behaviour as Luma:
-  with Yes an invalid email blocks the order, and with No the first attempt warns and
-  placing the order again with the same email goes through. If the email service
-  returns an error at that point, the order goes through and the error is logged,
-  as the phone check there already does. Only guest emails are checked, as on Luma.
-  Luma's REST place order is checked as well since LOQ-20299, when it carries the
-  storefront session cookie, and GraphQL and cookie-less REST place orders with
-  "Prevent Submit" = Yes since LOQ-20300. GraphQL and cookie-less REST with
-  "Prevent Submit" = No are **not** covered: they often keep no session, so the
-  shopper would be warned on every attempt and could never place the order
-  (tracked in LOQ-20301). CLI and cron order placement are not covered either. See
-  also "Changed — behaviour" above.
-
-- **GraphQL and headless REST guest place orders now have their email checked when
-  "Prevent Submit" = Yes** (LOQ-20300). This covers GraphQL and REST place orders
-  without the storefront session cookie. An invalid email blocks the order; if the
-  email service returns an error, the order goes through and the error is logged. An
-  email that already passed earlier in the same session is not verified again
-  (LOQ-20299); without a session it is verified on every place order. With "Prevent
-  Submit" = No, these place orders are still not email-checked: warning once and
-  letting the next attempt through needs a session, which headless clients often do
-  not keep (tracked in LOQ-20301). CLI and cron order placement are still not
-  checked.
-
-- **Address lookup keeps responding after a slow or failed search, and keeps refining
-  as the shopper types** (LOQ-20320). After a lookup request failed with an HTTP error
-  other than a network error — for example a gateway 504 because the module's Find proxy
-  answered slowly — or simply never came back, address lookups stopped responding: the
-  browser script never released the request, so every later keystroke was queued and
-  never sent, and any loading indicator on the page never cleared. Failed requests are
-  now reported as errors, lookup and address-retrieve requests time out after 10
-  seconds, and in both cases the most recent search typed in the meantime is sent.
-
-  The server side is bounded in this same release (LOQ-20334, below). The module now
-  requires `lqt/api-connector` 1.1.4, where lookup and retrieve give up after 8 seconds
-  and every call has a 2-second connect limit. So while the Loqate API is slow, an
-  abandoned lookup holds its PHP-FPM worker in cURL for at most 8 seconds. That is cURL
-  time only: waiting for a free PHP-FPM worker, Magento's bootstrap and any wait on the
-  session lock come on top, so the browser's 10 seconds and the server's 8 do not line
-  up exactly, and a lookup the browser has given up on can still be running on the
-  server. Setting `request_terminate_timeout` on the PHP-FPM pool remains an optional
-  backstop.
-
-- **Calls to the Loqate API now time out instead of waiting as long as cURL does**
-  (LOQ-20334). The `lqt/api-connector` SDK set no cURL timeout, so a slow or unreachable
-  Loqate API held each PHP-FPM worker that called it until cURL returned or the pool's
-  `request_terminate_timeout` killed it; the web server's gateway timeout does not free
-  it, and `max_execution_time` does not count I/O wait on Linux. `lqt/api-connector`
-  **1.1.4** gives every call a 2-second connect limit and a total limit of 8 seconds for
-  address lookup and retrieve and 30 seconds for everything else. Email validation gets
-  the 30-second limit, above the Timeout the module sends Loqate (15000 ms, the module's
-  default and admin-form maximum), so Loqate's own timeout still answers first. Admin
-  batch address verification — customer import (`Plugin/Admin/ValidateImportAddress.php`,
-  100 rows per call) and admin order save (`Plugin/Admin/OrderSave.php`), both through
-  the batch verify in `Helper/Validator.php` — now has each batch call capped at 30
-  seconds (per call, not per import or order) where a slow batch used to wait without
-  limit, and hitting the cap fails closed: the import stops
-  verifying and fails validation with one critical error ("Addresses could not be
-  validated: the Loqate service did not respond. Please try the import again."), and the
-  admin order is not saved and shows "An unexpected error occurred while trying to
-  validate your address."
-
-  A failed connection was already returned as the SDK's error shape, `['error' => true,
-  'message' => …]`, but with generic text: in 1.1.3 `HttpClient` returned null, and every
-  client method the module calls (`Capture::find()` and `retrieve()`, the `Verify`
-  checks, `Extras::ipToCountry()`) fell through to "Unexpected error occurred." With
-  1.1.4 the message the module logs names the cURL error, for example `cURL error 28:
-  Timeout was reached`. What shoppers see when a call fails is unchanged — lookups answer
-  with the module's error JSON, and the email, phone and address checks follow their
-  existing API-error handling. What is new is that slow calls are cut off.
-
-  **To pick it up, upgrade this module to the release carrying this entry.** It requires
-  `"lqt/api-connector": "^1.1.4"`, which an installed 1.1.3 does not satisfy, so name both
-  packages — `composer update gbg-loqate/loqate-integration lqt/api-connector` — and
-  Composer moves the SDK with the module. A merchant who stays on an older module version
-  can still take the fix with `composer update lqt/api-connector`: those releases require
-  `"^1.1.3"` or `"^1.1"`, which the installed SDK already satisfies, so Composer will not
-  move it unless it is named. Either way, check the result with `composer show
-  lqt/api-connector`, which must report 1.1.4 or later: that check is what catches a
-  partial update that silently left 1.1.3 in place. Do not run a bare `composer
-  update` in a Magento root — that updates the whole install's dependency tree.
-
-- **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
-  `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
-  Edit/New page and the Hyvä checkout "Add new address" modal now get Capture; before,
-  it silently did not. On any theme, including Luma and admin set to 1 street line, a
-  form with fewer street inputs than address lines folds every line into the ones it has.
-
-- **Every Loqate API call the module makes failed on PHP 8.5, and works again**
-  (LOQ-17709). Reported by a merchant on Magento 2.4.9 / PHP 8.5. Address lookup and
-  retrieve, the email and phone checks, the single and batch address verifications and
-  set-country-by-IP all returned an error envelope instead of a result — 100% of the
-  time, in production and developer mode alike — so the lookup offered no suggestions,
-  every verification came back as a fault, and the checkout and customer address forms
-  stopped pre-selecting the shopper's country. The map's reverse-geocode lookup never
-  broke: the browser asks Loqate for that one directly, never this module's PHP.
-
-  It is a deprecation promoted to an exception: PHP 8.5 deprecated `curl_close()`, and
-  the `lqt/api-connector` dependency called it after every request in
-  `src/Client/Http/HttpClient.php` (this module makes no cURL calls of its own). On
-  Magento that is not a log line. `app/bootstrap.php` calls `error_reporting(E_ALL)`
-  unconditionally, and `Magento\Framework\App\ErrorHandler`, which throws on
-  `E_DEPRECATED`, is installed by both entry points: by
-  `Magento\Framework\App\Bootstrap::run()` on the web path, before it consults
-  `MAGE_MODE` at all, and by `bin/magento` itself before it runs the CLI application —
-  so the CLI paths that carry the batch verification (customer import, cron, the
-  consumers) failed exactly as web requests did. The throw lands inside
-  `HttpClient::get()` and `::post()` before either returns, and the SDK's own `catch
-  (Throwable)` turns it into `['error' => true, 'message' => …]`, which the module acts
-  on and `Helper/Controller.php:159` writes to `var/log/`. The handler adds its own
-  level, file and line around PHP's wording, so **the string to grep for is**
-  `Deprecated Functionality: Function curl_close() is deprecated since 8.5, as it has no
-  effect since PHP 8.0 in …/Client/Http/HttpClient.php on line 28` (line 51 on the
-  address verifications, which POST). PHP 8.5 is itself past Adobe's platform matrix for
-  2.4.9, which stops at 8.4, but `app/bootstrap.php` enforces only `>= 8.1.0`, so
-  nothing stops a merchant running it.
-
-  The fix is upstream, in `lqt/api-connector` **1.1.3**, which is released and on
-  Packagist. It drops the SDK's reference to the handle with `unset()` instead of
-  calling `curl_close()`. On PHP 8 that function was already a no-op — the handle is a
-  garbage-collected object, freed when the method returned — so `unset()` now frees it a
-  few statements earlier, at the same point in the code. On PHP 7, where the handle is a
-  refcounted resource, `unset()` frees it at exactly the statement `curl_close()` used
-  to. **Nothing changes for merchants on PHP 8.3 or 8.4**: the requests sent, the
-  responses parsed and the errors the module raises from them are identical there. On
-  8.5 the change is the difference between every call failing and every call working.
-
-  **To pick it up, upgrade this module to v2.1.3 or later.** That release requires
-  `"lqt/api-connector": "^1.1.3"`, so the fixed SDK is installed with it and no separate
-  step is needed. A merchant who stays on an older module version can still take the fix
-  by naming the package — `composer update lqt/api-connector` — because those releases
-  carry the looser `"^1.1"` constraint, which 1.1.2 already satisfies, so Composer will
-  not move the SDK unless it is named. Either way, check the result with `composer show
-  lqt/api-connector`, which must report 1.1.3 or later. Do not run a bare `composer
-  update` in a Magento root — that updates the whole install's dependency tree.
-
-  CI now also runs the module's unit suite on PHP 8.5, alongside 8.3 and 8.4, and the
-  suite carries a module-side regression guard for this defect:
-  `Test/Unit/Dependency/ApiConnectorCompletesRequestsTest.php` drives the real vendored
-  `HttpClient` — one case for `get()`, one for `post()`, the two call sites that broke —
-  over a real socket at a stub endpoint on `127.0.0.1`, under a replica of Magento's
-  throwing `ErrorHandler` with `error_reporting(E_ALL)`, and asserts that the decoded
-  response body comes back. It needs no API key, no network and no billable request, and
-  on PHP 8.5 it fails against the unfixed 1.1.2 — which is what makes the `^1.1.3`
-  constraint an enforced guarantee rather than a hopeful one.
-
-  **That guard only has teeth on the 8.5 leg.** `curl_close()` is not deprecated below
-  8.5, so the same test passes on 8.3 and 8.4 even with the unfixed SDK in `vendor/`. It
-  also installs that error handler and widens `error_reporting()` itself, because
-  `phpunit.xml.dist` sets `failOnWarning` and `failOnRisky` but not `failOnDeprecation`
-  — PHPUnit alone would not fail the run on the deprecation. The SDK repository keeps
-  its own guard as well (`composer test`), which drives `HttpClient` at a local stub
-  under a throwing error handler on PHP 7.0 through 8.5.
-
-- **An address picked from the lookup no longer empties itself again on Hyvä
-  Checkout** (LOQ-17502). The shopper searched, picked a suggestion, watched city,
-  postcode and region fill in, and then lost them the moment focus moved to another
-  field — leaving the checkout without the data it had just shown. Reported on
-  Magento 2.4.8-p5 with module 2.0.16, reproducible on Hyvä's own default theme, and
-  not reproducible once the checkout was switched to Luma. Every release up to and
-  including v2.1.1 is affected; upgrading alone does not fix it.
-
-  Hyvä Checkout's fields are Magewire `wire:model.defer`, which Magewire rewrites
-  into an Alpine `x-model`, and Alpine syncs a text input to the component state on
-  `input` — `change` only on a select, checkbox or radio. The bundled capture SDK
-  dispatched `change` and nothing else for a text input, so the component never
-  learned the field had been filled in, and its next render morphed the stale empty
-  value back over what the shopper could see. Luma is unaffected because Knockout's
-  `value` binding listens for `change`, which is exactly what was being sent. The
-  street field looked like it survived, on both front ends, only because the shopper
-  typed into it and real `input` events had already fired.
-
-  The bundled SDK's own event dispatcher, `pca.reactTriggerChange`, now sends both
-  events for a text input: one bubbling `input`, then one bubbling `change`, in the
-  order a browser would (`input` while editing, `change` on commit). The value the
-  shopper picked therefore reaches Hyvä's component state, survives the next
-  re-render, and is the address the order is placed with. Fixing it in the dispatcher
-  rather than on the capture control's `populate` event also closes three sibling
-  write paths a `populate` hook missed — the drill-down write back to the search
-  field, the country list restoring the search text when it is dismissed, and
-  clearing the address — and it removes a re-vendor trap: a hook that added only
-  `input` would have depended on a separate local change further down the same file to
-  keep supplying `change`, so the next clean re-vendor of the SDK would have broken
-  Luma silently.
-
-  **Luma, multishipping, the customer address book and the admin order-create and
-  customer-edit screens behave the same for every consumer of `change`.** The
-  dispatcher still sends `change` for every node type it already sent it for, in the
-  same cases, and `select`, `input[type=file]`, checkbox, radio and textarea are not
-  touched at all — a text input is the only node type whose behaviour changed.
-
-  What is new on those screens too is that **every text input the SDK writes now also
-  receives one native bubbling `input`, immediately before the `change`** — the event
-  a browser would have sent and the SDK never did. No Magento binding on those screens
-  acts on `input`: Luma's Knockout `value` binding, the address-book and multishipping
-  forms and the admin UI components all listen for `change`. So no shopper-visible
-  behaviour is expected to change there, but a custom listener or third-party
-  extension bound to both events on a captured field will now run twice, and any
-  integration that treats an `input` on those fields as "the shopper typed" will now
-  see one. The regression steps for each of those screens are in
-  `Test/manual/LOQ-17502-manual-qa.md`.
-
-  The event contract is now asserted by an automated test: exactly one `input`, then
-  exactly one `change`, per populated text field. The country field and the region
-  `<select>` are unaffected; both are populated by paths that fire their own `change`.
-
-  This is a front-end-only change, and it now has automated coverage: a JavaScript
-  suite run by `npm test` — Node's built-in test runner with jsdom and the real Alpine
-  package, in `Test/js/`, wired into CI as its own job — which loads the real
-  `capture.js` rather than a re-implementation and asserts the event contract above,
-  that an Alpine `x-model` component ends up holding the populated city and postcode
-  and keeps them across a simulated Magewire commit and re-render, that the drill-down
-  and country-list-cancel paths dispatch `input` as well, that the extra event starts
-  no lookup loop, and that the capture control is constructed only once. Nothing
-  automated runs against a real Hyvä Checkout, so a manual pass over every screen the
-  script serves is still required before release; see
-  `Test/manual/LOQ-17502-manual-qa.md`. The standalone Alpine harness that ships
-  alongside it demonstrates the binding behaviour that caused the defect, but it does
-  not load `capture.js` and so proves nothing about the shipped code.
 - Repeated billable `/Cleansing/International/Batch` requests for the same address
   in one session, at checkout and on admin order create (LOQ-16969, LOQ-16976).
   Verify verdicts are cached per shopper for the session, keyed on the region value
@@ -513,11 +546,6 @@ predate it and are described by their git tags and commit history.
 
 ### Changed — for developers extending this module
 
-- **`Helper\Validator`'s constructor takes two more required arguments**, a
-  `Magento\Framework\Notification\NotifierInterface` and a
-  `Magento\Framework\App\CacheInterface`, last (LOQ-20300). DI supplies them; a
-  subclass or code that calls `new Validator(...)` must pass them.
-
 - **`Plugin\AbstractPlugin::$session` is now `private`.** It was `protected` on the
   base class of ten plugins, which meant any of them — or any third-party subclass —
   could read or write the module's session stores directly and bypass the bounding
@@ -536,7 +564,7 @@ predate it and are described by their git tags and commit history.
   alias is kept. Every session attribute *value* is unchanged, so open sessions keep
   their stores across the upgrade (LOQ-17149).
 
-### Known limitations
+## Known limitations
 
 - **Dedupe across import RUNS is not delivered for a file with more than 200 distinct
   addresses** (LOQ-17148 delivers dedupe *within* one run, above). The session cache
@@ -596,12 +624,12 @@ predate it and are described by their git tags and commit history.
   admin can inherit is a verification the first already paid for — an identical admin
   order create, customer-email re-check, address re-check or Capture lookup — so the
   merchant pays nothing extra and only the attribution between two admin users is
-  imprecise. Since this release the two contact lists hold salted digests rather than
+  imprecise. Since v2.1.0 the two contact lists hold salted digests rather than
   values, so no email address or phone number is inherited with it. The **addresses
   are still readable**, and all three address stores are: `captured_addresses` holds
   the addresses the first admin looked up, and the keys of the two verify caches carry
   the addresses the first admin verified or imported, in plain text. That is unchanged
-  by this release in either direction. Closing the swap itself would mean either a
+  by v2.1.0 in either direction. Closing the swap itself would mean either a
   backend dependency in a helper built on every storefront checkout request or a
   second bill for a verdict that is identical by construction.
 - For the same reason, **two successive guests on one browser are not covered
