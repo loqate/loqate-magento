@@ -624,12 +624,12 @@ predate it and are described by their git tags and commit history.
   admin can inherit is a verification the first already paid for — an identical admin
   order create, customer-email re-check, address re-check or Capture lookup — so the
   merchant pays nothing extra and only the attribution between two admin users is
-  imprecise. Since this release the two contact lists hold salted digests rather than
+  imprecise. Since v2.1.0 the two contact lists hold salted digests rather than
   values, so no email address or phone number is inherited with it. The **addresses
   are still readable**, and all three address stores are: `captured_addresses` holds
   the addresses the first admin looked up, and the keys of the two verify caches carry
   the addresses the first admin verified or imported, in plain text. That is unchanged
-  by this release in either direction. Closing the swap itself would mean either a
+  by v2.1.0 in either direction. Closing the swap itself would mean either a
   backend dependency in a helper built on every storefront checkout request or a
   second bill for a verdict that is identical by construction.
 - For the same reason, **two successive guests on one browser are not covered
