@@ -22,6 +22,18 @@
       DO NOT drop either event when re-vendoring the SDK: losing 'change' breaks Luma and the
       admin, losing 'input' breaks Hyva Checkout (populated values are reverted by the next
       Magewire re-render). Other node types are untouched by this change.
+    - Made a failed or slow request release the request queue (LOQ-20320). Without this, a blocking
+      search that failed left `pca.waitingRequest`/`pca.blockRequests` set, every later search was
+      parked in `pca.requestQueue` and never sent, and the spinner never stopped:
+        - `getRequestXHR`/`postRequestXHR` call `request.serviceError` for any non-200 response
+          (status 0 is still left to `onerror`/`ontimeout`, so each request reports exactly once).
+        - XHRs time out after `pca.timeout` (10 s by default), which fires `request.timeoutError`.
+        - `request.serviceError`/`request.timeoutError` go through `processFailure`, which resets
+          `pca.waitingRequest`/`pca.blockRequests` and sends the queued request, as
+          `processResponse` does after a response. The error callback must run BEFORE the queue is
+          drained: `address.error` calls `pca.clearBlockingRequests()`, which would otherwise
+          unblock the queued request already in flight.
+      DO NOT drop this when re-vendoring the SDK: the capture spinner hangs again after any failed search.
   */
 
   /*! Copyright © 2009-2025 Postcode Anywhere (Holdings) Ltd. (http://www.postcodeanywhere.co.uk)
@@ -47,6 +59,8 @@
     pca.host = "services.postcodeanywhere.co.uk";
     pca.endpoint = "json3ex.ws";
     pca.limit = 2000;
+    // LOCAL CHANGE (LOQ-20320): XHR timeout in ms, so a slow request fails instead of blocking the queue.
+    pca.timeout = pca.timeout || 10000;
     pca.sourceString = pca.sourceString || "PCA-SCRIPT";
 
     //Synonyms for list filtering.
@@ -241,9 +255,13 @@
     function postRequestXHR(request) {
       var xhr = new pca.XMLHttpRequest();
 
+      // LOCAL CHANGE (LOQ-20320): non-200 responses are reported, or the request queue never drains.
       xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4 && xhr.status === 200)
+        if (xhr.readyState !== 4) return;
+        if (xhr.status === 200)
           request.callback(pca.parseJSON(xhr.responseText));
+        //status 0 (network error, timeout) is reported by onerror/ontimeout
+        else if (xhr.status) request.serviceError({ currentTarget: xhr });
       };
 
       if (request.credentials) xhr.withCredentials = request.credentials;
@@ -251,6 +269,7 @@
       xhr.onerror = request.serviceError;
       xhr.ontimeout = request.timeoutError;
       xhr.open("POST", request.destination, true);
+      xhr.timeout = pca.timeout;
       xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
       xhr.send(request.query);
     }
@@ -312,9 +331,13 @@
         request.post = true;
         postRequest(request);
       } else {
+        // LOCAL CHANGE (LOQ-20320): non-200 responses are reported, or the request queue never drains.
         xhr.onreadystatechange = function () {
-          if (xhr.readyState === 4 && xhr.status === 200)
+          if (xhr.readyState !== 4) return;
+          if (xhr.status === 200)
             request.callback(pca.parseJSON(xhr.responseText));
+          //status 0 (network error, timeout) is reported by onerror/ontimeout
+          else if (xhr.status) request.serviceError({ currentTarget: xhr });
         };
 
         if (request.credentials) xhr.withCredentials = request.credentials;
@@ -322,6 +345,7 @@
         xhr.onerror = request.serviceError;
         xhr.ontimeout = request.timeoutError;
         xhr.open("GET", request.url, true);
+        xhr.timeout = pca.timeout;
         xhr.send();
       }
     }
@@ -426,6 +450,19 @@
       if (pca.requestQueue.length) processRequest(pca.requestQueue.shift());
     }
 
+    // LOCAL CHANGE (LOQ-20320): releases the request state after a failed request, as processResponse
+    // does after a response, so the search typed while it was pending is still sent.
+    function processFailure(request, message) {
+      pca.waitingRequest = false;
+
+      if (request.block) pca.blockRequests = false;
+
+      //before the drain: address.error clears the block, which would unblock the queued request in flight
+      request.error(message, request);
+
+      if (pca.requestQueue.length) processRequest(pca.requestQueue.shift());
+    }
+
     /** Represents a service request
      * @memberof pca
      * @constructor
@@ -504,15 +541,20 @@
         };
 
         request.serviceError = function (event) {
-          request.error(
-            event && event.currentTarget && event.currentTarget.statusText
-              ? "Webservice request error: " + event.currentTarget.statusText
+          var xhr = event && event.currentTarget,
+            //HTTP/2 has no status text, so fall back to the status code
+            reason = xhr && (xhr.statusText || xhr.status);
+
+          processFailure(
+            request,
+            reason
+              ? "Webservice request error: " + reason
               : "Webservice request failed."
           );
         };
 
         request.timeoutError = function () {
-          request.error("Webservice request timed out.");
+          processFailure(request, "Webservice request timed out.");
         };
 
         request.process = function () {

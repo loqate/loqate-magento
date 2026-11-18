@@ -211,6 +211,64 @@ predate it and are described by their git tags and commit history.
   not keep (tracked in LOQ-20301). CLI and cron order placement are still not
   checked.
 
+- **Address lookup keeps responding after a slow or failed search, and keeps refining
+  as the shopper types** (LOQ-20320). After a lookup request failed with an HTTP error
+  other than a network error — for example a gateway 504 because the module's Find proxy
+  answered slowly — or simply never came back, address lookups stopped responding: the
+  browser script never released the request, so every later keystroke was queued and
+  never sent, and any loading indicator on the page never cleared. Failed requests are
+  now reported as errors, lookup and address-retrieve requests time out after 10
+  seconds, and in both cases the most recent search typed in the meantime is sent.
+
+  The server side is bounded in this same release (LOQ-20334, below). The module now
+  requires `lqt/api-connector` 1.1.4, where lookup and retrieve give up after 8 seconds
+  and every call has a 2-second connect limit. So while the Loqate API is slow, an
+  abandoned lookup holds its PHP-FPM worker in cURL for at most 8 seconds. That is cURL
+  time only: waiting for a free PHP-FPM worker, Magento's bootstrap and any wait on the
+  session lock come on top, so the browser's 10 seconds and the server's 8 do not line
+  up exactly, and a lookup the browser has given up on can still be running on the
+  server. Setting `request_terminate_timeout` on the PHP-FPM pool remains an optional
+  backstop.
+
+- **Calls to the Loqate API now time out instead of waiting as long as cURL does**
+  (LOQ-20334). The `lqt/api-connector` SDK set no cURL timeout, so a slow or unreachable
+  Loqate API held each PHP-FPM worker that called it until cURL returned or the pool's
+  `request_terminate_timeout` killed it; the web server's gateway timeout does not free
+  it, and `max_execution_time` does not count I/O wait on Linux. `lqt/api-connector`
+  **1.1.4** gives every call a 2-second connect limit and a total limit of 8 seconds for
+  address lookup and retrieve and 30 seconds for everything else. Email validation gets
+  the 30-second limit, above the Timeout the module sends Loqate (15000 ms, the module's
+  default and admin-form maximum), so Loqate's own timeout still answers first. Admin
+  batch address verification — customer import (`Plugin/Admin/ValidateImportAddress.php`,
+  100 rows per call) and admin order save (`Plugin/Admin/OrderSave.php`), both through
+  the batch verify in `Helper/Validator.php` — now has each batch call capped at 30
+  seconds (per call, not per import or order) where a slow batch used to wait without
+  limit, and hitting the cap fails closed: the import stops
+  verifying and fails validation with one critical error ("Addresses could not be
+  validated: the Loqate service did not respond. Please try the import again."), and the
+  admin order is not saved and shows "An unexpected error occurred while trying to
+  validate your address."
+
+  A failed connection was already returned as the SDK's error shape, `['error' => true,
+  'message' => …]`, but with generic text: in 1.1.3 `HttpClient` returned null, and every
+  client method the module calls (`Capture::find()` and `retrieve()`, the `Verify`
+  checks, `Extras::ipToCountry()`) fell through to "Unexpected error occurred." With
+  1.1.4 the message the module logs names the cURL error, for example `cURL error 28:
+  Timeout was reached`. What shoppers see when a call fails is unchanged — lookups answer
+  with the module's error JSON, and the email, phone and address checks follow their
+  existing API-error handling. What is new is that slow calls are cut off.
+
+  **To pick it up, upgrade this module to the release carrying this entry.** It requires
+  `"lqt/api-connector": "^1.1.4"`, which an installed 1.1.3 does not satisfy, so name both
+  packages — `composer update gbg-loqate/loqate-integration lqt/api-connector` — and
+  Composer moves the SDK with the module. A merchant who stays on an older module version
+  can still take the fix with `composer update lqt/api-connector`: those releases require
+  `"^1.1.3"` or `"^1.1"`, which the installed SDK already satisfies, so Composer will not
+  move it unless it is named. Either way, check the result with `composer show
+  lqt/api-connector`, which must report 1.1.4 or later: that check is what catches a
+  partial update that silently left 1.1.3 in place. Do not run a bare `composer
+  update` in a Magento root — that updates the whole install's dependency tree.
+
 - **Address lookup now binds to Hyvä street inputs** (LOQ-18103). The single
   `street` input (1 street line) and the `street[]` inputs on the Hyvä address book
   Edit/New page and the Hyvä checkout "Add new address" modal now get Capture; before,
