@@ -95,6 +95,21 @@ class DataTest extends TestCase
     }
 
     /**
+     * A default-scope read must pass the default scope type and no scope code, so no website or
+     * store value can override it.
+     */
+    public function testTheDefaultScopeReadNamesNoScope(): void
+    {
+        $helper = $this->helper(['some/path' => 'default-value']);
+
+        $this->assertSame('default-value', $helper->getDefaultConfigValue('some/path'));
+        $this->assertSame(
+            [['path' => 'some/path', 'scope' => ScopeConfigInterface::SCOPE_TYPE_DEFAULT, 'scopeCode' => null]],
+            $this->reads
+        );
+    }
+
+    /**
      * Helper under test, over a scope config that records every read.
      *
      * @param array<string, mixed> $values Config values keyed by path.
