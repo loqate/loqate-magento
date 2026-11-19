@@ -2,6 +2,7 @@
 
 namespace Loqate\ApiIntegration\Helper;
 
+use Magento\Framework\App\Config\ScopeConfigInterface;
 use Magento\Framework\App\Helper\AbstractHelper;
 use Magento\Framework\App\Helper\Context;
 use Magento\Framework\Exception\NoSuchEntityException;
@@ -80,6 +81,20 @@ class Data extends AbstractHelper
     public function getConfigValue($configPath)
     {
         return $this->scopeConfig->getValue($configPath, ScopeInterface::SCOPE_STORE);
+    }
+
+    /**
+     * Get config value at default scope, ignoring any website or store view value
+     *
+     * For settings that are global by design, so a website or store row (set via CLI,
+     * config.php/env.php or left in the database) cannot override what the admin shows.
+     *
+     * @param $configPath
+     * @return mixed
+     */
+    public function getDefaultConfigValue($configPath)
+    {
+        return $this->scopeConfig->getValue($configPath, ScopeConfigInterface::SCOPE_TYPE_DEFAULT);
     }
 
     /**

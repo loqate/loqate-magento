@@ -7,6 +7,63 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+### Security
+
+- **The admin address-lookup routes now require an admin login** (LOQ-20336).
+  `loqate_admin/capture/find` and `retrieve` ran a Loqate lookup on the merchant's API key
+  for any request, logged in or not. Logged-in admins are unaffected, including roles
+  without configuration rights. The storefront lookup routes (`loqate/capture/find` and
+  `retrieve`) are public by design; LOQ-20339, below, limits them.
+
+- **Storefront address lookups are now limited per client** (LOQ-20339). The public
+  `loqate/capture/find` and `retrieve` routes ran a Loqate lookup on the merchant's API key
+  for anyone, as often as they liked. Each client may now make 200 lookups by default, Find
+  and Retrieve counted together, in each 10-minute window. A client over the limit gets
+  HTTP 429 instead of a lookup: the lookup widget keeps working (since LOQ-20320) but shows
+  no suggestions until the window ends, and the shopper can still enter the address
+  manually. A client is an IP address: shoppers who share one, such as behind
+  mobile-carrier NAT or an office network, share one counter, and IPv6 clients are counted
+  per /64 network. The first refused request from each client in each window is logged to
+  `var/log/loqate_log_file.log` with the client's IP address (its /64 network for IPv6).
+  The counter lives in Magento's cache, so it is shared across web nodes when the cache is
+  Redis; if the cache fails, lookups are allowed rather than blocked. The limit is
+  approximate: a client sending many requests in parallel can get several times the limit
+  through. It slows down individual clients and does not cap total spend on the key; to do
+  that, set usage limits on the API key in your Loqate account.
+
+  The limit is set in Stores > Configuration > Loqate > Main Settings > Address Capture >
+  Storefront lookups per client per 10 minutes (LOQ-20340). It is global, because one
+  counter per client is shared by every store view, and defaults to 200. Raise it for
+  stores where many shoppers share an address, such as behind NAT or a CDN not yet set up
+  to pass the client IP. 0 turns the limit off, which brings back unlimited anonymous
+  lookups on your API key.
+
+  To size it, estimated from how the lookup widget behaves: it sends one Find per key press
+  in the lookup box and one Retrieve per address picked. A shopper who picks a suggestion
+  after typing part of the address uses roughly 10–20 lookups. Typing a whole address into
+  the lookup box, or correcting it, uses roughly 30–40. A checkout using separate shipping
+  and billing addresses with corrections is the worst case, at roughly 70–100.
+
+  Both routes now answer 404 when storefront lookup is switched off for the store in both
+  checkout and customer account. The admin lookup routes are not limited.
+
+  Magento must see the real client IP. Requests from a private or reserved address —
+  Varnish, a TLS terminator or a load balancer on the same network — are not limited, and
+  the first one in each window logs a warning. Requests from a CDN's public addresses are
+  limited as one client. Preferred setup: have the web server set `REMOTE_ADDR` from the
+  forwarded header, trusting it only from your proxy's addresses (nginx `set_real_ip_from`
+  with only your proxy ranges, `real_ip_header` and `real_ip_recursive on`; or Apache
+  `mod_remoteip` with `RemoteIPHeader` and `RemoteIPTrustedProxy`), and leave Magento's
+  `RemoteAddress` `alternativeHeaders` empty. If you use `alternativeHeaders` instead,
+  Magento reads that header on every request: make sure only the proxy can reach the
+  origin, use a header the proxy overwrites, and list every proxy hop's exact address in
+  `trustedProxies` (ranges are not supported). Otherwise any client can choose its own
+  counter, use up someone else's, or skip the limit entirely by sending a private address.
+
+Run `bin/magento setup:di:compile` after upgrading: the admin and storefront lookup
+controllers' constructors changed, and until a compiled store recompiles, address lookup
+fails in both.
+
 ## [2.2.1] - 2026-11-18
 
 ### Fixed

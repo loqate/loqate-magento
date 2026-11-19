@@ -38,6 +38,11 @@
                     <source_model>Magento\Directory\Model\Config\Source\Country</source_model>
                     <can_be_empty>1</can_be_empty>
                 </field>
+                <field id="rate_limit" translate="label comment" type="text" sortOrder="0" showInDefault="1" showInWebsite="0" showInStore="0">
+                    <label>Storefront lookups per client per 10 minutes</label>
+                    <comment>Maximum Find and Retrieve requests one client (IP address, or IPv6 /64 network) can make in each 10-minute window, across all store views. 0 turns the limit off: anyone can then make unlimited lookups on your API key, so set usage limits on the key in your Loqate account. (Default: 200)</comment>
+                    <validate>validate-digits</validate>
+                </field>
             </group>
             
             <group id="address_settings" translate="label" type="text" sortOrder="0" showInDefault="1" showInWebsite="1" showInStore="1">

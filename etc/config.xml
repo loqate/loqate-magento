@@ -7,6 +7,7 @@
                 <enable_checkout>1</enable_checkout>
                 <enable_customer_account_admin>1</enable_customer_account_admin>
                 <enable_create_order_admin>1</enable_create_order_admin>
+                <rate_limit>200</rate_limit>
             </capture_settings>
             <address_settings>
                 <avc_verification_status>P</avc_verification_status>
