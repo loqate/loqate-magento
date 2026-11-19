@@ -7,6 +7,8 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-19
+
 ### Security
 
 - **The admin address-lookup routes now require an admin login** (LOQ-20336).
