@@ -10,6 +10,7 @@ use Loqate\ApiIntegration\Logger\Logger;
 use Loqate\ApiIntegration\Plugin\AbstractPlugin;
 use Loqate\ApiIntegration\Test\Unit\Plugin\ShopperSessionHarness;
 use Magento\Customer\Model\Session;
+use Loqate\ApiConnector\Client\Http\HttpClient;
 use Loqate\ApiConnector\Client\Verify;
 use Magento\Directory\Model\RegionFactory;
 use Magento\Framework\App\Action\Context;
@@ -299,8 +300,8 @@ class ValidatorTest extends TestCase
         return [
             'invalid, prevent submit No: warn once' => ['', false, self::SUBMIT_AGAIN_MESSAGE],
             'invalid, prevent submit Yes: reject' => ['1', false, self::INVALID_MESSAGE],
-            'API error, prevent submit No' => ['', ['error' => true, 'message' => 'timeout'], self::UNEXPECTED_ERROR_MESSAGE],
-            'API error, prevent submit Yes' => ['1', ['error' => true, 'message' => 'timeout'], self::UNEXPECTED_ERROR_MESSAGE],
+            'Transport error, prevent submit No' => ['', ['error' => true, 'message' => 'cURL error 28: Operation timed out'], self::UNEXPECTED_ERROR_MESSAGE],
+            'Transport error, prevent submit Yes' => ['1', ['error' => true, 'message' => 'cURL error 28: Operation timed out'], self::UNEXPECTED_ERROR_MESSAGE],
             'no API key: let it through' => ['', ['noKeyFound' => true], false],
             'valid' => ['1', ['Valid' => true], false],
         ];
@@ -369,8 +370,8 @@ class ValidatorTest extends TestCase
     public static function validateEmailNotBlockingOnApiErrorProvider(): array
     {
         return [
-            'API error, prevent submit No: pass' => ['', ['error' => true, 'message' => 'timeout'], false],
-            'API error, prevent submit Yes: pass' => ['1', ['error' => true, 'message' => 'timeout'], false],
+            'Transport error, prevent submit No: pass' => ['', ['error' => true, 'message' => 'cURL error 28: Operation timed out'], false],
+            'Transport error, prevent submit Yes: pass' => ['1', ['error' => true, 'message' => 'cURL error 28: Operation timed out'], false],
             'invalid, prevent submit Yes: still rejected' => ['1', false, self::INVALID_MESSAGE],
             'invalid, prevent submit No: still warned' => ['', false, self::SUBMIT_AGAIN_MESSAGE],
         ];
@@ -519,8 +520,8 @@ class ValidatorTest extends TestCase
     {
         return [
             'invalid' => [false, true],
-            'API error, blocking (shipping step)' => [['error' => true, 'message' => 'timeout'], true],
-            'API error, let through (quote submit)' => [['error' => true, 'message' => 'timeout'], false],
+            'Transport error, blocking (shipping step)' => [['error' => true, 'message' => 'cURL error 28: Operation timed out'], true],
+            'Transport error, let through (quote submit)' => [['error' => true, 'message' => 'cURL error 28: Operation timed out'], false],
             'no API key' => [['noKeyFound' => true], true],
         ];
     }
@@ -714,7 +715,7 @@ class ValidatorTest extends TestCase
     #[DataProvider('absentCacheValueProvider')]
     public function testTheFirstEmailApiErrorRaisesOneMajorAdminNoticeAndOpensAnHourLongThrottle($absent): void
     {
-        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout'], $absent);
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'cURL error 28: Operation timed out'], $absent);
 
         $fixture['validator']->verifyEmail(self::EMAIL);
 
@@ -746,7 +747,7 @@ class ValidatorTest extends TestCase
     public function testAnEmailApiErrorWhileTheThrottleIsActiveRaisesNoNotice(): void
     {
         // A cache that holds every key: whatever throttle key the Validator uses is present.
-        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout'], false, '1');
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'cURL error 28: Operation timed out'], false, '1');
 
         $fixture['validator']->verifyEmail(self::EMAIL);
 
@@ -762,13 +763,13 @@ class ValidatorTest extends TestCase
      */
     public function testTheNoticeIsThrottledAcrossCallsRequestsAndEmailsUntilTheCacheEntryExpires(): void
     {
-        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'cURL error 28: Operation timed out']);
 
         $fixture['validator']->verifyEmail(self::EMAIL);
         $fixture['validator']->verifyEmail(self::EMAIL);
         $fixture['validator']->verifyEmail('another.shopper@example.com');
         $nextRequest = $this->emailApiFixture(
-            ['error' => true, 'message' => 'timeout'],
+            ['error' => true, 'message' => 'cURL error 28: Operation timed out'],
             false,
             null,
             $fixture['cacheStore'],
@@ -792,7 +793,7 @@ class ValidatorTest extends TestCase
     public function testTheAdminNoticeDoesNotContainTheEmailAddress(): void
     {
         $email = 'private.person+tag@shopper-domain.example';
-        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'cURL error 28: Operation timed out']);
 
         $fixture['validator']->verifyEmail($email);
 
@@ -815,7 +816,7 @@ class ValidatorTest extends TestCase
      */
     public function testANoticeFailureStillReturnsTheErrorAndLogsBothWarnings(): void
     {
-        $sdkResponse = ['error' => true, 'message' => 'timeout'];
+        $sdkResponse = ['error' => true, 'message' => 'cURL error 28: Operation timed out'];
         $fixture = $this->emailApiFixture($sdkResponse, addMajorThrows: new \RuntimeException('inbox table is locked'));
 
         $response = $fixture['validator']->verifyEmail(self::EMAIL);
@@ -823,7 +824,7 @@ class ValidatorTest extends TestCase
         $this->assertSame($sdkResponse, $response, 'The SDK error array must still be returned.');
         $this->assertCount(1, $fixture['notices'], 'Fixture guard: addMajor() was reached and threw.');
         $this->assertSame(
-            ['timeout', 'Loqate could not raise the email API error notice: inbox table is locked'],
+            ['cURL error 28: Operation timed out', 'Loqate could not raise the email API error notice: inbox table is locked'],
             $this->logMessages($fixture, 'warning'),
             'Both the API error and the notice failure must be logged as warnings.'
         );
@@ -857,18 +858,96 @@ class ValidatorTest extends TestCase
     }
 
     /**
+     * LOQ-20324: through the REAL SDK (lqt/api-connector 1.1.5+), with only its HTTP client
+     * stubbed. A Timeout ResponseCode is no verdict on the address: the blocking callers show the
+     * "unexpected error" message, never the invalid-email one, and the place-order path lets it
+     * through. Invalid and Valid_CatchAll still give their verdicts.
+     *
+     * @param string $responseCode The ResponseCode the email API answers.
+     * @param array<string, mixed> $config Configuration paths that are switched on.
+     * @param bool $blockOnApiError What the caller passes (false: Observer\QuoteSubmitBefore).
+     * @param false|string $expected What validateEmail() must return.
+     */
+    #[DataProvider('sdkResponseCodeProvider')]
+    public function testValidateEmailTurnsEachApiResponseCodeIntoTheShopperFacingVerdict(
+        string $responseCode,
+        array $config,
+        bool $blockOnApiError,
+        $expected
+    ): void {
+        $fixture = $this->emailApiFixture($this->verifyAnswering($responseCode), config: $config);
+
+        $this->assertSame($expected, $fixture['validator']->validateEmail(self::EMAIL, $blockOnApiError));
+    }
+
+    public static function sdkResponseCodeProvider(): array
+    {
+        $yes = [self::EMAIL_PREVENT_SUBMIT => '1'];
+
+        return [
+            'Timeout, blocking, prevent submit Yes' => ['Timeout', $yes, true, self::UNEXPECTED_ERROR_MESSAGE],
+            'Timeout, blocking, prevent submit No' => ['Timeout', [], true, self::UNEXPECTED_ERROR_MESSAGE],
+            'Timeout, place order, prevent submit Yes: pass' => ['Timeout', $yes, false, false],
+            'Timeout, place order, prevent submit No: pass' => ['Timeout', [], false, false],
+            'Valid' => ['Valid', $yes, true, false],
+            'Invalid' => ['Invalid', $yes, true, self::INVALID_MESSAGE],
+            'Valid_CatchAll, catch-all off' => ['Valid_CatchAll', $yes, true, self::INVALID_MESSAGE],
+            'Valid_CatchAll, catch-all on' => ['Valid_CatchAll', $yes + [self::EMAIL_CATCH_ALL => '1'], true, false],
+        ];
+    }
+
+    /**
+     * LOQ-20324: on the place-order path a Timeout lets the order through, but it is still an
+     * API error the merchant must see: a warning naming the Timeout, and the hourly admin notice
+     * raised once - a second checkout within the hour raises no other.
+     */
+    #[DataProvider('preventSubmitProvider')]
+    public function testATimeoutAtPlaceOrderIsLoggedAndRaisesTheNoticeOnce(string $preventSubmit): void
+    {
+        $fixture = $this->emailApiFixture(
+            $this->verifyAnswering('Timeout'),
+            config: [self::EMAIL_PREVENT_SUBMIT => $preventSubmit]
+        );
+
+        $first = $fixture['validator']->validateEmail(self::EMAIL, false);
+        $second = $fixture['validator']->validateEmail('another.shopper@example.com', false);
+
+        $this->assertFalse($first, 'A Timeout must not reject the order.');
+        $this->assertFalse($second, 'A Timeout must not reject the order.');
+        $warnings = $this->logMessages($fixture, 'warning');
+        $this->assertCount(2, $warnings, 'Each Timeout is logged as a warning.');
+        $this->assertStringContainsString('Timeout', $warnings[0]);
+        $this->assertCount(1, $fixture['notices'], 'Within the hour only the first Timeout raises a notice.');
+    }
+
+    /**
+     * A real SDK Verify whose HTTP client answers the decoded email API response with $responseCode,
+     * so the SDK's own ResponseCode handling runs.
+     */
+    private function verifyAnswering(string $responseCode): Verify
+    {
+        $httpClient = $this->createMock(HttpClient::class);
+        $httpClient->method('get')->willReturn(['Items' => [['ResponseCode' => $responseCode]]]);
+        $verify = new Verify('TEST-API-KEY-0000');
+        (new ReflectionProperty(Verify::class, 'httpClient'))->setValue($verify, $httpClient);
+
+        return $verify;
+    }
+
+    /**
      * A real Validator with an API key, whose SDK client is swapped for a double answering
      * $sdkResponse, so verifyEmail() itself runs. The logger, notifier and cache are recording
      * doubles; the cache is an in-memory map.
      *
      * Passes the notifier and cache as the 7th and 8th constructor arguments (SA-2).
      *
-     * @param mixed $sdkResponse What Verify::verifyEmail() answers.
+     * @param mixed $sdkResponse What Verify::verifyEmail() answers, or a real Verify to use as is.
      * @param false|string $absent What load() answers for a key the cache does not hold.
      * @param string|null $everyKey When set, load() answers this for EVERY key.
      * @param ArrayObject|null $cacheStore Shared cache contents, key => data.
      * @param ArrayObject|null $notices Shared addMajor() log.
      * @param \Throwable|null $addMajorThrows When set, addMajor() records the call and then throws it.
+     * @param array<string, mixed> $config Configuration paths switched on besides the API key.
      * @return array{validator: Validator, logs: ArrayObject, notices: ArrayObject, cacheStore: ArrayObject,
      *     cacheSaves: ArrayObject, cacheLoads: ArrayObject}
      */
@@ -878,7 +957,8 @@ class ValidatorTest extends TestCase
         ?string $everyKey = null,
         ?ArrayObject $cacheStore = null,
         ?ArrayObject $notices = null,
-        ?\Throwable $addMajorThrows = null
+        ?\Throwable $addMajorThrows = null,
+        array $config = []
     ): array {
         $logs = new ArrayObject();
         $notices = $notices ?? new ArrayObject();
@@ -935,15 +1015,18 @@ class ValidatorTest extends TestCase
             $this->createMock(Session::class),
             $this->createMock(RegionFactory::class),
             $moduleList,
-            $this->createConfigHelper(['loqate_settings/settings/api_key' => 'TEST-API-KEY-0000']),
+            $this->createConfigHelper(['loqate_settings/settings/api_key' => 'TEST-API-KEY-0000'] + $config),
             $this->createMock(SerializerInterface::class),
             $notifier,
             $cache
         );
 
         // The SDK client is built in the constructor (new Verify($apiKey)); swap it for a double.
-        $connector = $this->createMock(Verify::class);
-        $connector->method('verifyEmail')->willReturn($sdkResponse);
+        $connector = $sdkResponse;
+        if (!$connector instanceof Verify) {
+            $connector = $this->createMock(Verify::class);
+            $connector->method('verifyEmail')->willReturn($sdkResponse);
+        }
         $property = new ReflectionProperty(Validator::class, 'apiConnector');
         $property->setValue($validator, $connector);
 

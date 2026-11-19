@@ -2,6 +2,8 @@
 
 namespace Loqate\ApiIntegration\Test\Unit\Observer;
 
+use Loqate\ApiConnector\Client\Http\HttpClient;
+use Loqate\ApiConnector\Client\Verify;
 use Loqate\ApiIntegration\Helper\Data;
 use Loqate\ApiIntegration\Helper\Validator;
 use Loqate\ApiIntegration\Logger\Logger;
@@ -28,6 +30,7 @@ use Magento\Framework\Stdlib\Cookie\CookieReaderInterface;
 use ArrayObject;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use ReflectionProperty;
 
 /**
  * Unit tests for Observer\QuoteSubmitBefore, which had NO coverage at all.
@@ -1050,15 +1053,15 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * ...and an email API error lets the order through (blockOnApiError: false), so an outage
-     * cannot stop GraphQL or headless orders.
+     * ...and an email API (transport) error lets the order through (blockOnApiError: false), so an
+     * outage cannot stop GraphQL or headless orders.
      *
      * @param string $area Area of the session-less place order.
      */
     #[DataProvider('sessionlessAreaProvider')]
     public function testWithPreventSubmitOnASessionlessApiErrorLetsTheOrderThrough(string $area): void
     {
-        $journey = $this->createJourney('1', ['error' => true, 'message' => 'timeout'], $area, null);
+        $journey = $this->createJourney('1', ['error' => true, 'message' => 'cURL error 28: Operation timed out'], $area, null);
 
         $rejection = $this->placeOrder(
             $journey['observer'],
@@ -1066,6 +1069,33 @@ class QuoteSubmitBeforeTest extends TestCase
         );
 
         $this->assertNull($rejection, 'An email API outage must not block the order.');
+        $this->assertCount(1, $journey['emailRequests'], 'Fixture guard: the email really was sent for verification.');
+    }
+
+    /**
+     * LOQ-20324: Loqate answering ResponseCode Timeout is no verdict on the address, so the guest
+     * order goes through - neither rejected (Prevent Submit = Yes) nor warned (No). The response
+     * fed to the observer is what the real SDK's Verify::verifyEmail() makes of that API answer.
+     *
+     * @param string $preventSubmit loqate_settings/email_settings/prevent_submit.
+     */
+    #[DataProvider('preventSubmitProvider')]
+    public function testAnEmailCheckTimeoutLetsTheGuestOrderThrough(string $preventSubmit): void
+    {
+        $httpClient = $this->createMock(HttpClient::class);
+        $httpClient->method('get')->willReturn(['Items' => [['ResponseCode' => 'Timeout']]]);
+        $verify = new Verify('TEST-API-KEY-0000');
+        (new ReflectionProperty(Verify::class, 'httpClient'))->setValue($verify, $httpClient);
+        $sdkResponse = $verify->verifyEmail(['Email' => self::GUEST_EMAIL]);
+        $this->assertArrayHasKey('error', $sdkResponse, 'Fixture guard: the SDK reports a Timeout as an error, not a verdict.');
+        $journey = $this->createJourney($preventSubmit, $sdkResponse);
+
+        $rejection = $this->placeOrder(
+            $journey['observer'],
+            $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1)
+        );
+
+        $this->assertNull($rejection, 'A Timeout from the email check must not reject or warn the guest.');
         $this->assertCount(1, $journey['emailRequests'], 'Fixture guard: the email really was sent for verification.');
     }
 
