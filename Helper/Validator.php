@@ -412,10 +412,10 @@ class Validator
                         __('Loqate email validation API returned errors'),
                         __(
                             'The Loqate email validation API returned errors; see var/log/loqate_log_file.log '
-                            . 'for the cause (for example the API key, its credit or limits). While this '
-                            . 'persists, guest orders placed at checkout go through without an email check, '
-                            . 'and account registration and edit, the Luma shipping step and admin customer '
-                            . 'and order forms show an error.'
+                            . 'for the cause (for example the API key, its credit or limits, or checks that '
+                            . 'time out). While this persists, guest orders placed at checkout go through '
+                            . 'without an email check, and account registration and edit, the Luma shipping '
+                            . 'step and admin customer and order forms show an error.'
                         )
                     );
                     $this->cache->save('1', self::EMAIL_API_ERROR_NOTICE_CACHE_KEY, [], 3600);

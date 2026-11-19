@@ -7,6 +7,29 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Timeout from Loqate's email check is no longer treated as an invalid email**
+  (LOQ-20324). When the email service could not finish its check within the configured
+  timeout it answered "Timeout", and the `lqt/api-connector` SDK reported that as an
+  invalid email: with "Prevent Submit" = Yes the guest order was rejected, and with No
+  the shopper was warned that the email was invalid. A Timeout is now handled like any
+  other email API error since LOQ-20300: place order lets the guest order through without
+  an email check, a warning is logged to `var/log/loqate_log_file.log` and the admin
+  notice is raised (at most once an hour). Account registration and edit, the Luma
+  shipping step and the admin customer and order forms show "An unexpected error occurred
+  while trying to validate your email address." instead of calling the email invalid.
+  Timeouts are more frequent when Stores > Configuration > Loqate > Main Settings > Email
+  Validation > "Validation timeout(1-15000 ms)" is below its 15000 ms default; on the
+  default they come from slow mail servers at the shopper's domain.
+
+  The fix is in the SDK, `lqt/api-connector` 1.1.5: stores on module 2.2.0 or later get it
+  with `composer update lqt/api-connector` alone, since their `"^1.1.3"` or `"^1.1.4"`
+  constraint accepts 1.1.5. This release raises the requirement to `"^1.1.5"` so the module
+  cannot run with the old SDK; to upgrade the module, update both packages together:
+  `composer update gbg-loqate/loqate-integration lqt/api-connector`. Either way, check that
+  `composer show lqt/api-connector` reports 1.1.5 or later.
+
 ## [2.3.0] - 2026-11-19
 
 ### Security

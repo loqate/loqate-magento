@@ -4,7 +4,7 @@
   "type": "magento2-module",
   "version": "2.3.0",
   "require": {
-    "lqt/api-connector": "^1.1.4"
+    "lqt/api-connector": "^1.1.5"
   },
   "require-dev": {
     "phpunit/phpunit": "^11.5"
