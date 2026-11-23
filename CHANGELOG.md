@@ -7,6 +7,33 @@ predate it and are described by their git tags and commit history.
 
 ## [Unreleased]
 
+### Changed — behaviour
+
+- **Place order no longer verifies a phone number once an address or phone check has
+  rejected the order** (LOQ-20326). The order is refused anyway, so the phone
+  verification would be a billable call that cannot change the outcome; skipping it
+  saves that call and closes the probe of forcing an address failure to check phone
+  numbers. The billing address is still verified, as before. The shopper sees the
+  first error; the skipped phone numbers are checked on the next attempt, once those
+  pass. So when both the shipping and the billing phone number are invalid, place
+  order now reports one phone error per attempt instead of both at once. Anonymous
+  checkout can still be used to test phone numbers with valid addresses, up to two
+  paid calls per attempt (shipping and billing); to limit this, enable Magento reCAPTCHA for
+  checkout/place order or rate-limit those requests (tracked in LOQ-20315).
+
+- **Phone API errors are now logged at warning level and raise an admin notice at
+  most once an hour** (LOQ-20326). An error (for example the API key, its credit or
+  limits, or an outage) used to be logged at info level only, so phone validation
+  could stop with no visible sign. While it persists, the Luma shipping and billing
+  steps, the customer address book and admin order and customer address forms refuse
+  phone numbers with an error, and orders placed through other checkouts (for example
+  Hyvä or the REST and GraphQL APIs) go through without a phone check.
+  The admin notice does not contain the shopper's phone number; it points to
+  `var/log/loqate_log_file.log` for the cause. It is throttled separately from the
+  email API error notice, so an email notice cannot hide a phone outage in the same
+  hour. Raising it is best-effort: if it fails, a second warning is logged and the
+  request carries on.
+
 ## [2.3.0] - 2026-11-19
 
 ### Security
