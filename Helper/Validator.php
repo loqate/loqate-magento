@@ -550,9 +550,9 @@ class Validator
                 __(
                     'The Loqate phone validation API returned errors; see var/log/loqate_log_file.log '
                     . 'for the cause (for example the API key, its credit or limits). While this '
-                    . 'persists, orders placed at checkout go through without a phone check, and the '
-                    . 'Luma shipping and billing steps, the customer address book and admin order and '
-                    . 'customer address forms show an error.'
+                    . 'persists, the Luma shipping and billing steps, the customer address book and '
+                    . 'admin order and customer address forms refuse phone numbers with an error, and '
+                    . 'orders placed through other checkouts go through without a phone check.'
                 )
             );
         }
