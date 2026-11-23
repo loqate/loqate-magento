@@ -106,7 +106,9 @@ class QuoteSubmitBefore implements ObserverInterface
                 }
             }
 
-            if ($this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
+            // !$errors: once the order is rejected the phone verdict can't change it, so don't bill the
+            // check (as for email below); the shopper sees the phone error on the next attempt (LOQ-20326).
+            if (!$errors && $this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
                 $telephone = $shippingAddress->getTelephone();
                 $countryId = $shippingAddress->getCountryId();
                 if ($telephone) {
@@ -130,7 +132,9 @@ class QuoteSubmitBefore implements ObserverInterface
                 }
             }
 
-            if ($this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
+            // !$errors: once the order is rejected the phone verdict can't change it, so don't bill the
+            // check (as for email below); the shopper sees the phone error on the next attempt (LOQ-20326).
+            if (!$errors && $this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
                 $telephone = $billingAddress->getTelephone();
                 $countryId = $billingAddress->getCountryId();
                 if ($telephone) {

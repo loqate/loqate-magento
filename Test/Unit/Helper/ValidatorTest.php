@@ -48,6 +48,8 @@ class ValidatorTest extends TestCase
     /** An email address with nothing special about it. */
     private const EMAIL = 'guest.shopper@example.com';
 
+    private const PHONE = '02079460000';
+
     private const SUBMIT_AGAIN_MESSAGE = 'Invalid email address. Submit again to use this email address.';
     private const INVALID_MESSAGE = 'The provided email address is invalid.';
     private const UNEXPECTED_ERROR_MESSAGE = 'An unexpected error occurred while trying to validate your email address.';
@@ -857,8 +859,184 @@ class ValidatorTest extends TestCase
     }
 
     /**
+     * LOQ-20326: a phone API error (bad key, no credit, rate limit, outage) lets place order through
+     * unchecked, so like the email one it is a fault the merchant has to act on: logged as a WARNING,
+     * the level log shippers and alerting filter on. At info level the outage was silent.
+     */
+    public function testAPhoneApiErrorIsLoggedAsAWarningNotAsInfo(): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'Loqate phone API rate limited']);
+
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertSame([], $this->logMessages($fixture, 'info'), 'The phone API error must no longer be logged at info level.');
+        $this->assertSame(
+            ['Loqate phone API rate limited'],
+            $this->logMessages($fixture, 'warning'),
+            'The phone API error must be logged exactly once, as a warning carrying the SDK\'s message.'
+        );
+    }
+
+    /**
+     * LOQ-20326: the first phone API error raises ONE major admin notice, about PHONE validation, and
+     * opens a one-hour throttle window, so the merchant sees the outage without reading logs.
+     *
+     * @param false|string $absent What CacheInterface::load() answers for a key it does not hold.
+     */
+    #[DataProvider('absentCacheValueProvider')]
+    public function testTheFirstPhoneApiErrorRaisesOneMajorAdminNoticeAndOpensAnHourLongThrottle($absent): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout'], $absent);
+
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertCount(1, $fixture['notices'], 'The first phone API error must raise exactly one admin notice.');
+        $notice = $fixture['notices'][0];
+        $this->assertStringContainsString(
+            'phone',
+            strtolower((string)$notice['title']),
+            'The notice must say it is PHONE validation that is failing, or the merchant looks in the wrong place.'
+        );
+        $this->assertStringContainsString(
+            'without a phone check',
+            (string)$notice['description'],
+            'The notice must say what is affected while the error lasts: orders go through unchecked.'
+        );
+        $this->assertCount(1, $fixture['cacheSaves'], 'The throttle must be recorded in the cache, once.');
+        $save = $fixture['cacheSaves'][0];
+        $this->assertSame(3600, (int)$save['lifetime'], 'The throttle window is one hour.');
+        $this->assertNotSame('', (string)$save['data'], 'An empty entry would read back as absent.');
+        $this->assertContains(
+            $save['key'],
+            iterator_to_array($fixture['cacheLoads']),
+            'The throttle key saved must be the one checked before raising the notice.'
+        );
+    }
+
+    /**
+     * LOQ-20326: during an outage every checkout fails the phone call; the inbox must get one notice
+     * an hour, not one per order - across calls, requests (a new Validator) and phone numbers.
+     * Once the cache entry expires, the next error raises one again.
+     */
+    public function testThePhoneNoticeIsThrottledAcrossCallsRequestsAndNumbersUntilTheCacheEntryExpires(): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+        $fixture['validator']->verifyPhoneNumber('01189990000', 'GB');
+        $nextRequest = $this->emailApiFixture(
+            ['error' => true, 'message' => 'timeout'],
+            false,
+            null,
+            $fixture['cacheStore'],
+            $fixture['notices']
+        );
+        $nextRequest['validator']->verifyPhoneNumber('+447700900123');
+
+        $this->assertCount(1, $fixture['notices'], 'Within the hour only the first phone error may raise a notice.');
+
+        // The hour passes: the cache entry is gone.
+        $fixture['cacheStore']->exchangeArray([]);
+        $nextRequest['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertCount(2, $fixture['notices'], 'Once the throttle entry expires the next error raises a notice again.');
+    }
+
+    /**
+     * LOQ-20326 decision: phone and email have SEPARATE throttles. The two APIs fail independently
+     * (different products, credit and limits), so with a shared key an email notice earlier in the
+     * hour would hide a phone outage - phone checks would be off and nobody told. Each check still
+     * gets at most one notice an hour.
+     */
+    public function testAnEmailNoticeInTheSameHourDoesNotHideAPhoneOutage(): void
+    {
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+
+        $fixture['validator']->verifyEmail(self::EMAIL);
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+        $fixture['validator']->verifyEmail(self::EMAIL);
+        $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertCount(2, $fixture['notices'], 'One email notice and one phone notice: neither may hide the other.');
+        $titles = array_map(static fn (array $notice): string => strtolower((string)$notice['title']), iterator_to_array($fixture['notices']));
+        $this->assertStringContainsString('email', $titles[0], 'The first notice is the email one.');
+        $this->assertStringContainsString('phone', $titles[1], 'The second notice is the phone one.');
+        $savedKeys = array_map(static fn (array $save): string => $save['key'], iterator_to_array($fixture['cacheSaves']));
+        $this->assertCount(2, array_unique($savedKeys), 'Email and phone must throttle on different cache keys.');
+    }
+
+    /**
+     * LOQ-20326: the admin notice is visible to every admin user and stored in the inbox table, so it
+     * must not carry the shopper's phone number.
+     */
+    public function testThePhoneAdminNoticeDoesNotContainThePhoneNumber(): void
+    {
+        $phone = '+44 7700 900461';
+        $fixture = $this->emailApiFixture(['error' => true, 'message' => 'timeout']);
+
+        $fixture['validator']->verifyPhoneNumber($phone, 'GB');
+
+        $this->assertCount(1, $fixture['notices'], 'Fixture guard: a notice must have been raised.');
+        $digits = preg_replace('/\D/', '', $phone);
+        foreach ($fixture['notices'][0]['args'] as $index => $argument) {
+            $text = is_array($argument) ? implode(' ', $argument) : (string)$argument;
+            $this->assertStringNotContainsString($phone, $text, 'addMajor() argument #' . $index . ' must not name the phone number.');
+            $this->assertStringNotContainsString($digits, preg_replace('/\D/', '', $text), 'addMajor() argument #' . $index . ' must not carry the phone digits.');
+        }
+    }
+
+    /**
+     * LOQ-20326: the notice is best-effort. At place order a phone API error lets the order through,
+     * so an inbox (or cache) fault while raising the notice must not abort it: the SDK's error array
+     * is still returned and the fault is logged as a second warning.
+     */
+    public function testAPhoneNoticeFailureStillReturnsTheErrorAndLogsBothWarnings(): void
+    {
+        $sdkResponse = ['error' => true, 'message' => 'timeout'];
+        $fixture = $this->emailApiFixture($sdkResponse, addMajorThrows: new \RuntimeException('inbox table is locked'));
+
+        $response = $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertSame($sdkResponse, $response, 'The SDK error array must still be returned.');
+        $this->assertCount(1, $fixture['notices'], 'Fixture guard: addMajor() was reached and threw.');
+        $this->assertSame(
+            ['timeout', 'Loqate could not raise the phone API error notice: inbox table is locked'],
+            $this->logMessages($fixture, 'warning'),
+            'Both the API error and the notice failure must be logged as warnings.'
+        );
+    }
+
+    /**
+     * LOQ-20326: only an API ERROR is a fault. A valid (true) or invalid (false) phone number is
+     * normal operation: no notice, no warning, and the throttle is not touched.
+     *
+     * @param bool $sdkResponse What the SDK's verifyPhone() answers.
+     */
+    #[DataProvider('phoneVerdictProvider')]
+    public function testAValidOrInvalidPhoneNumberRaisesNoNoticeAndNoWarning(bool $sdkResponse): void
+    {
+        $fixture = $this->emailApiFixture($sdkResponse);
+
+        $response = $fixture['validator']->verifyPhoneNumber(self::PHONE, 'GB');
+
+        $this->assertSame($sdkResponse, $response, 'Fixture guard: the SDK verdict is returned unchanged.');
+        $this->assertCount(0, $fixture['notices'], 'A verdict is not a fault: no admin notice.');
+        $this->assertSame([], $this->logMessages($fixture, 'warning'), 'A verdict is not a fault: no warning.');
+        $this->assertCount(0, $fixture['cacheSaves'], 'A verdict must not open the throttle window.');
+    }
+
+    public static function phoneVerdictProvider(): array
+    {
+        return [
+            'valid phone number' => [true],
+            'invalid phone number' => [false],
+        ];
+    }
+
+    /**
      * A real Validator with an API key, whose SDK client is swapped for a double answering
-     * $sdkResponse, so verifyEmail() itself runs. The logger, notifier and cache are recording
+     * $sdkResponse, so verifyEmail() and verifyPhoneNumber() themselves run. The logger, notifier and cache are recording
      * doubles; the cache is an in-memory map.
      *
      * Passes the notifier and cache as the 7th and 8th constructor arguments (SA-2).
@@ -944,6 +1122,7 @@ class ValidatorTest extends TestCase
         // The SDK client is built in the constructor (new Verify($apiKey)); swap it for a double.
         $connector = $this->createMock(Verify::class);
         $connector->method('verifyEmail')->willReturn($sdkResponse);
+        $connector->method('verifyPhone')->willReturn($sdkResponse);
         $property = new ReflectionProperty(Validator::class, 'apiConnector');
         $property->setValue($validator, $connector);
 

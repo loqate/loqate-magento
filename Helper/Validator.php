@@ -59,6 +59,13 @@ class Validator
     private const EMAIL_API_ERROR_NOTICE_CACHE_KEY = 'loqate_email_api_error_notice';
 
     /**
+     * Cache key of the once-an-hour throttle on the phone API error admin notice. Separate from the
+     * email key (LOQ-20326): the two APIs fail independently, and a shared key would let an email
+     * notice earlier in the hour hide a phone outage.
+     */
+    private const PHONE_API_ERROR_NOTICE_CACHE_KEY = 'loqate_phone_api_error_notice';
+
+    /**
      * Every value address_quality_index is allowed to hold, BEST ('A') to WORST ('E') - the
      * Cleansing API's own grade order, and since LOQ-17148 the order the merchant's dropdown
      * lists them in, so this is not a cosmetic ordering.
@@ -345,7 +352,7 @@ class Validator
      * @param ModuleListInterface $moduleList
      * @param Data $helper
      * @param SerializerInterface $serializer
-     * @param NotifierInterface $notifier Raises the admin notice on an email API error.
+     * @param NotifierInterface $notifier Raises the admin notice on an email or phone API error.
      * @param CacheInterface $cache Throttles that notice to once an hour.
      */
     public function __construct(
@@ -405,27 +412,50 @@ class Validator
 
         if (isset($response['error'])) {
             $this->logger->warning($response['message']);
-            // Best-effort: a cache or inbox fault must not abort the order this error lets through.
-            try {
-                if (!$this->cache->load(self::EMAIL_API_ERROR_NOTICE_CACHE_KEY)) {
-                    $this->notifier->addMajor(
-                        __('Loqate email validation API returned errors'),
-                        __(
-                            'The Loqate email validation API returned errors; see var/log/loqate_log_file.log '
-                            . 'for the cause (for example the API key, its credit or limits). While this '
-                            . 'persists, guest orders placed at checkout go through without an email check, '
-                            . 'and account registration and edit, the Luma shipping step and admin customer '
-                            . 'and order forms show an error.'
-                        )
-                    );
-                    $this->cache->save('1', self::EMAIL_API_ERROR_NOTICE_CACHE_KEY, [], 3600);
-                }
-            } catch (\Throwable $e) {
-                $this->logger->warning('Loqate could not raise the email API error notice: ' . $e->getMessage());
-            }
+            $this->raiseApiErrorNotice(
+                self::EMAIL_API_ERROR_NOTICE_CACHE_KEY,
+                'email',
+                __('Loqate email validation API returned errors'),
+                __(
+                    'The Loqate email validation API returned errors; see var/log/loqate_log_file.log '
+                    . 'for the cause (for example the API key, its credit or limits). While this '
+                    . 'persists, guest orders placed at checkout go through without an email check, '
+                    . 'and account registration and edit, the Luma shipping step and admin customer '
+                    . 'and order forms show an error.'
+                )
+            );
         }
 
         return $response;
+    }
+
+    /**
+     * Raise a major admin notice for an API error, at most once an hour per $cacheKey.
+     *
+     * Best-effort: a cache or inbox fault must not abort the order the error lets through, so it
+     * is logged as a warning and swallowed. The notice text must not carry shopper data.
+     *
+     * @param string $cacheKey Throttle key; one per check, so one check's notice cannot hide another's.
+     * @param string $check Name of the check, for the failure log line.
+     * @param Phrase|string $title
+     * @param Phrase|string $description
+     * @return void
+     */
+    private function raiseApiErrorNotice(
+        string $cacheKey,
+        string $check,
+        Phrase|string $title,
+        Phrase|string $description
+    ): void
+    {
+        try {
+            if (!$this->cache->load($cacheKey)) {
+                $this->notifier->addMajor($title, $description);
+                $this->cache->save('1', $cacheKey, [], 3600);
+            }
+        } catch (\Throwable $e) {
+            $this->logger->warning('Loqate could not raise the ' . $check . ' API error notice: ' . $e->getMessage());
+        }
     }
 
     /**
@@ -493,6 +523,10 @@ class Validator
     /**
      * Verify phone number
      *
+     * On an API error, logs a warning and raises a major admin notice, throttled to once an hour
+     * install-wide on its own key (see raiseApiErrorNotice()). The notice is best-effort: if it
+     * fails, a second warning is logged and the SDK's error array is still returned.
+     *
      * @param $phoneNumber
      * @return array
      */
@@ -508,7 +542,19 @@ class Validator
         $response = $this->apiConnector->verifyPhone($data);
 
         if (isset($response['error'])) {
-            $this->logger->info($response['message']);
+            $this->logger->warning($response['message']);
+            $this->raiseApiErrorNotice(
+                self::PHONE_API_ERROR_NOTICE_CACHE_KEY,
+                'phone',
+                __('Loqate phone validation API returned errors'),
+                __(
+                    'The Loqate phone validation API returned errors; see var/log/loqate_log_file.log '
+                    . 'for the cause (for example the API key, its credit or limits). While this '
+                    . 'persists, orders placed at checkout go through without a phone check, and the '
+                    . 'Luma shipping and billing steps, the customer address book and admin order and '
+                    . 'customer address forms show an error.'
+                )
+            );
         }
 
         return $response;

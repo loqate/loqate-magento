@@ -121,7 +121,10 @@ class QuoteSubmitBeforeTest extends TestCase
     /** @var ArrayObject Live store configuration, config path => value. */
     private $config;
 
-    /** @var array Value the Validator returns from verifyAddress(). */
+    /**
+     * @var array|\Closure Value the Validator returns from verifyAddress(), or a closure given the
+     *                     address data that returns it (to reject one address but not the other).
+     */
     private $addressResponse = ['error' => false];
 
     /** @var mixed Value the Validator returns from verifyPhoneNumber(). */
@@ -254,12 +257,11 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->assertSame(
             [
                 ['verifyAddress', self::SHIPPING_ADDRESS],
-                ['verifyPhoneNumber', '02079460000', 'GB'],
                 ['verifyAddress', self::BILLING_ADDRESS],
-                ['verifyPhoneNumber', '01189990000', 'GB'],
             ],
             $this->recordedCalls(),
-            'A rejected shipping address must not stop the billing address being verified: the shopper is '
+            'A rejected shipping address must not stop the billing address being verified, but must skip both '
+            . 'phone checks: they are billable calls that cannot change the outcome (LOQ-20326). The shopper is '
             . 'shown every problem at once, which is the pre-existing behaviour.'
         );
     }
@@ -276,12 +278,103 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->phoneResponse = false;
         $observer = $this->createObserver($areaCode);
 
-        $this->expectException(LocalizedException::class);
-        $this->expectExceptionMessage(
-            'The provided phone number is invalid.' . PHP_EOL . 'The provided phone number is invalid.'
-        );
+        $rejection = $this->placeOrder($observer, $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS));
 
-        $observer->execute($this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS));
+        $this->assertNotNull($rejection, 'An invalid phone number must still abort the order.');
+        // Once: the billing phone is not checked after the shipping phone rejected the order (LOQ-20326).
+        $this->assertSame('The provided phone number is invalid.', $rejection->getMessage());
+    }
+
+    /**
+     * LOQ-20326: once an earlier address or phone check has rejected the order, place order makes no
+     * further phone API call. The order is refused anyway, so the call would be billed for a verdict
+     * that cannot change the outcome - and would let a caller force a rejection to probe numbers.
+     * The billing ADDRESS is still verified, as before; only phone checks are skipped.
+     *
+     * @param \Closure|null $addressResponse verifyAddress() answer per address; null = all pass.
+     * @param bool $phoneValid What verifyPhoneNumber() answers.
+     * @param array $expectedCalls Every Validator call, in order.
+     */
+    #[DataProvider('earlierRejectionProvider')]
+    public function testNoPhoneIsVerifiedOnceAnEarlierCheckHasRejectedTheOrder(
+        ?\Closure $addressResponse,
+        bool $phoneValid,
+        array $expectedCalls
+    ): void {
+        if ($addressResponse) {
+            $this->addressResponse = $addressResponse;
+        }
+        $this->phoneResponse = $phoneValid;
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $rejection = $this->placeOrder($observer, $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS));
+
+        $this->assertNotNull($rejection, 'Fixture guard: the earlier check must reject the order.');
+        $this->assertSame(
+            $expectedCalls,
+            $this->recordedCalls(),
+            'No phone may be verified after the order has been rejected: that call is billed for nothing.'
+        );
+    }
+
+    public static function earlierRejectionProvider(): array
+    {
+        $reject = ['error' => true, 'message' => 'The provided address is invalid.'];
+        $pass = ['error' => false];
+
+        return [
+            'shipping address rejected: neither phone verified' => [
+                static fn (array $address): array => $address === self::SHIPPING_ADDRESS ? $reject : $pass,
+                true,
+                [
+                    ['verifyAddress', self::SHIPPING_ADDRESS],
+                    ['verifyAddress', self::BILLING_ADDRESS],
+                ],
+            ],
+            'billing address rejected: billing phone not verified' => [
+                static fn (array $address): array => $address === self::BILLING_ADDRESS ? $reject : $pass,
+                true,
+                [
+                    ['verifyAddress', self::SHIPPING_ADDRESS],
+                    ['verifyPhoneNumber', '02079460000', 'GB'],
+                    ['verifyAddress', self::BILLING_ADDRESS],
+                ],
+            ],
+            'shipping phone rejected: billing phone not verified' => [
+                null,
+                false,
+                [
+                    ['verifyAddress', self::SHIPPING_ADDRESS],
+                    ['verifyPhoneNumber', '02079460000', 'GB'],
+                    ['verifyAddress', self::BILLING_ADDRESS],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * A phone API error (bad key, no credit, rate limit, outage) must still let the order through:
+     * an outage on Loqate's side must not stop the store taking orders. It is not a rejection, so
+     * the billing phone is still verified. The Validator logs and notifies (LOQ-20326).
+     */
+    public function testAPhoneApiErrorStillLetsTheOrderThrough(): void
+    {
+        $this->phoneResponse = ['error' => true, 'message' => 'Loqate phone API rate limited'];
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $rejection = $this->placeOrder($observer, $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS));
+
+        $this->assertNull($rejection, 'A phone API error must not abort the order.');
+        $this->assertSame(
+            [
+                ['verifyAddress', self::SHIPPING_ADDRESS],
+                ['verifyPhoneNumber', '02079460000', 'GB'],
+                ['verifyAddress', self::BILLING_ADDRESS],
+                ['verifyPhoneNumber', '01189990000', 'GB'],
+            ],
+            $this->recordedCalls(),
+            'An API error is not a rejection: the billing phone is still verified.'
+        );
     }
 
     /**
@@ -670,13 +763,14 @@ class QuoteSubmitBeforeTest extends TestCase
     }
 
     /**
-     * One row per email-checked path family; addresses fail on both shipping and billing, and so
-     * do phone numbers, so each message appears twice, one per line, as before.
+     * One row per email-checked path family. Addresses fail on both shipping and billing, so the
+     * address message appears twice, one per line, as before; the phone message appears once,
+     * because the billing phone is not checked after the shipping phone rejected the order (LOQ-20326).
      */
     public static function addressOrPhoneRejectedProvider(): array
     {
         $addressMessage = 'The provided address is invalid.' . PHP_EOL . 'The provided address is invalid.';
-        $phoneMessage = 'The provided phone number is invalid.' . PHP_EOL . 'The provided phone number is invalid.';
+        $phoneMessage = 'The provided phone number is invalid.';
 
         return [
             '(a) frontend session path, guest, address rejected' => [
@@ -1266,7 +1360,9 @@ class QuoteSubmitBeforeTest extends TestCase
             function ($address, $checkForCaptured = true) use ($calls): array {
                 $calls[] = ['verifyAddress', $address];
 
-                return $this->addressResponse;
+                return $this->addressResponse instanceof \Closure
+                    ? ($this->addressResponse)($address)
+                    : $this->addressResponse;
             }
         );
         $validator->method('verifyPhoneNumber')->willReturnCallback(
