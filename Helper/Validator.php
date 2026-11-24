@@ -275,6 +275,12 @@ class Validator
     private ShopperScopedSessionStores $shopperSession;
 
     /**
+     * The store view this instance is pinned to by forStore(), or null to follow the current
+     * store as Magento resolves it (LOQ-20327). Null on the shared DI instance, always.
+     */
+    private ?int $storeId = null;
+
+    /**
      * Batch verdicts earned by THIS instance, keyed exactly as the session store is
      * (buildBatchVerifyCacheKey()) and holding BOTH polarities (LOQ-17148).
      *
@@ -374,6 +380,9 @@ class Validator
         $this->serializer = $serializer;
         $this->notifier = $notifier;
         $this->cache = $cache;
+        // Set before the key check: forStore() can give a copy a key the current store lacks,
+        // and that copy must still tag its requests with the module version.
+        $this->version = 'AdobeCommerce_v' . $moduleList->getOne('Loqate_ApiIntegration')['setup_version'];
 
         if ($apiKey = $this->helper->getConfigValue('loqate_settings/settings/api_key')) {
             $this->apiConnector = new Verify($apiKey);
@@ -381,8 +390,55 @@ class Validator
             $this->logger->info('No Api Key found! - Please configure Loqate plugin on Admin side!');
             return false;
         }
+    }
 
-        $this->version = 'AdobeCommerce_v' . $moduleList->getOne('Loqate_ApiIntegration')['setup_version'];
+    /**
+     * A copy of this validator pinned to one store view (LOQ-20327).
+     *
+     * A REST place-order without a store code runs in the DEFAULT store view, so anything read
+     * through the current store - the API key, the email settings, the warn-once namespace and
+     * the verdict cache keys - answered for the wrong store. The copy reads all of them for
+     * $storeId instead.
+     *
+     * A CLONE, never a mutation: this class is a shared DI instance, and pinning it would
+     * silently move every later caller in the request onto $storeId.
+     *
+     * @param int $storeId The store view the order or quote belongs to.
+     * @return self
+     */
+    public function forStore(int $storeId): self
+    {
+        $scoped = clone $this;
+        $scoped->storeId = $storeId;
+        $apiKey = $scoped->config('loqate_settings/settings/api_key');
+        $scoped->apiConnector = $apiKey ? new Verify($apiKey) : null;
+        $scoped->shopperSession = $this->shopperSession->forStore($storeId);
+
+        return $scoped;
+    }
+
+    /**
+     * Read a config value for the pinned store, or the current store when not pinned.
+     *
+     * Every config read in this class goes through here so a forStore() copy cannot mix one
+     * store's key with another store's thresholds.
+     *
+     * @param string $path
+     * @return mixed
+     */
+    private function config(string $path)
+    {
+        return $this->storeId !== null
+            ? $this->helper->getConfigValueForStore($path, $this->storeId)
+            : $this->helper->getConfigValue($path);
+    }
+
+    /**
+     * The store view verdict cache keys are namespaced by: the pinned store, else the current one.
+     */
+    private function storeScope(): int
+    {
+        return $this->storeId ?? $this->helper->getCurrentStore();
     }
 
     /**
@@ -397,15 +453,16 @@ class Validator
      */
     public function verifyEmail($emailAddress)
     {
-        if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
+        // No client means no key was found when it was built; soft-pass rather than fatal.
+        if (empty($this->config('loqate_settings/settings/api_key')) || $this->apiConnector === null) {
             return ['noKeyFound' => true];
         }
 
-        $timeout = $this->helper->getConfigValue('loqate_settings/email_settings/email_validation_timeout_value');
+        $timeout = $this->config('loqate_settings/email_settings/email_validation_timeout_value');
 
         $data = ['Email' => $emailAddress, 'source' => $this->version, 'Timeout' => $timeout];
 
-        if ($this->helper->getConfigValue('loqate_settings/email_settings/enable_accept_valid_catch_all')) {
+        if ($this->config('loqate_settings/email_settings/enable_accept_valid_catch_all')) {
             $data[Verify::ACCEPT_VALID_CATCH_ALL] = true;
         }
         $response = $this->apiConnector->verifyEmail($data);
@@ -479,7 +536,7 @@ class Validator
         if ($usePassCache) {
             // Whether an email passes depends on the catch-all setting, so a pass is keyed by it and
             // flipping the setting re-verifies. Non-scalars stay as-is so contactDigest() refuses them.
-            $catchAll = (int)(bool)$this->helper->getConfigValue(
+            $catchAll = (int)(bool)$this->config(
                 'loqate_settings/email_settings/enable_accept_valid_catch_all'
             );
             $passedValue = ($email === null || is_scalar($email)) ? $catchAll . '|' . $email : $email;
@@ -489,7 +546,7 @@ class Validator
         }
 
         $errorMessage = __('The provided email address is invalid.');
-        if (!$this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit')) {
+        if (!$this->config('loqate_settings/email_settings/prevent_submit')) {
             if (!$this->shopperSession->shouldVerify(ShopperScopedSessionStores::VERIFIED_EMAIL_SESSION_KEY, $email)) {
                 return false;
             }
@@ -532,7 +589,8 @@ class Validator
      */
     public function verifyPhoneNumber($phoneNumber, $country = null)
     {
-        if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
+        // No client means no key was found when it was built; soft-pass rather than fatal.
+        if (empty($this->config('loqate_settings/settings/api_key')) || $this->apiConnector === null) {
             return ['noKeyFound' => true];
         }
         $data = ['Phone' => $phoneNumber, 'source' => $this->version];
@@ -608,7 +666,7 @@ class Validator
      */
     public function verifyAddress($address, $checkForCaptured = true): array
     {
-        if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
+        if (empty($this->config('loqate_settings/settings/api_key'))) {
             return ['noKeyFound' => true];
         }
 
@@ -877,7 +935,7 @@ class Validator
      */
     public function verifyMultipleAddresses($addresses, $checkForCaptured = true)
     {
-        if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
+        if (empty($this->config('loqate_settings/settings/api_key'))) {
             return ['noKeyFound' => true];
         }
 
@@ -1358,7 +1416,7 @@ class Validator
      */
     private function resolveQualityIndexThreshold()
     {
-        return $this->helper->getConfigValue('loqate_settings/address_settings/address_quality_index');
+        return $this->config('loqate_settings/address_settings/address_quality_index');
     }
 
     /**
@@ -1401,7 +1459,7 @@ class Validator
      */
     private function resolveComparerAvcString(): string
     {
-        $advancedToggle = $this->helper->getConfigValue(
+        $advancedToggle = $this->config(
             'loqate_settings/verify_threshold_settings/show_advanced_avc_settings'
         );
         $useAdvanced = ((int)$advancedToggle) === 1;
@@ -1422,7 +1480,7 @@ class Validator
 
         // Helper to read a path or fall back to default if empty/missing.
         $getOrDefault = function (string $key) use ($base, $defaults) {
-            $val = $this->helper->getConfigValue($base . '/' . $key);
+            $val = $this->config($base . '/' . $key);
             $val = ($val === null || $val === '') ? $defaults[$key] : (string)$val;
             return $val;
         };
@@ -1951,7 +2009,7 @@ class Validator
 
         $thresholdFingerprint = substr(hash('sha256', $this->resolveComparerAvcString()), 0, 12);
 
-        return $this->helper->getCurrentStore() . '|' . $thresholdFingerprint . '|' . $signature;
+        return $this->storeScope() . '|' . $thresholdFingerprint . '|' . $signature;
     }
 
     /**
@@ -2287,7 +2345,7 @@ class Validator
         $thresholdSource = gettype($threshold) . ':' . (is_scalar($threshold) ? (string)$threshold : '');
         $thresholdFingerprint = substr(hash('sha256', $thresholdSource), 0, 12);
 
-        return $this->helper->getCurrentStore() . '|' . $thresholdFingerprint . '|' . $signature;
+        return $this->storeScope() . '|' . $thresholdFingerprint . '|' . $signature;
     }
 
     /**

@@ -137,15 +137,22 @@ trait ShopperSessionHarness
      * to 0). That default is the only mode in which the contact bypass stores are consulted at
      * all, so a test that switched it would pass without ever reading the store it is about.
      *
+     * getConfigValueForStore() answers a NAMED store view's override from $storeConfig, else
+     * the same map, as Magento falls back from a store view to the default scope (LOQ-20327).
+     *
      * @param array<string, mixed> $config Configuration paths that are switched on.
      * @param ArrayObject|null $storeId Holds 'id', read LIVE so a test can switch store view.
+     * @param array<int, array<string, mixed>> $storeConfig Store view id => path => override.
      * @return Data&MockObject
      */
-    private function createConfigHelper(array $config, ?ArrayObject $storeId = null)
+    private function createConfigHelper(array $config, ?ArrayObject $storeId = null, array $storeConfig = [])
     {
         $helper = $this->createMock(Data::class);
         $helper->method('getConfigValue')->willReturnCallback(
             static fn ($configPath) => $config[$configPath] ?? ''
+        );
+        $helper->method('getConfigValueForStore')->willReturnCallback(
+            static fn ($configPath, $store) => $storeConfig[(int)$store][$configPath] ?? $config[$configPath] ?? ''
         );
         $helper->method('getCurrentStore')->willReturnCallback(
             static fn (): int => $storeId === null ? 1 : (int)$storeId['id']

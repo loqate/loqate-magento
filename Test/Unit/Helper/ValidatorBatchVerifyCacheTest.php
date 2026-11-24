@@ -3169,12 +3169,15 @@ class ValidatorBatchVerifyCacheTest extends TestCase
         $helper->method('getCurrentStore')->willReturn(0);
 
         $serializer = $this->createSerializerDouble();
+        // The constructor reads the module version even with no API key (LOQ-20327).
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => '9.9.9']);
 
         return new Validator(
             $this->createMock(Logger::class),
             $this->createMock(Session::class),
             $this->createMock(RegionFactory::class),
-            $this->createMock(ModuleListInterface::class),
+            $moduleList,
             $helper,
             $serializer,
             $this->createMock(NotifierInterface::class),
