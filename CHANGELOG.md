@@ -34,6 +34,17 @@ predate it and are described by their git tags and commit history.
   hour. Raising it is best-effort: if it fails, a second warning is logged and the
   request carries on.
 
+### Fixed
+
+- **Place order now checks a cart with the Loqate settings and API key of the cart's
+  own store view** (LOQ-20327). A REST or GraphQL place-order call without a store code
+  runs in the default store view, and the address, phone and email checks used to read
+  the default store view's settings and API key. On a multi-store headless setup a cart
+  from another store view could be checked with the wrong toggles, billed to the wrong
+  key, or not checked at all when only that store view has a key. The cart's store view
+  now decides, including Prevent Submit: when that store view blocks invalid emails, a
+  place order without a session cookie is refused every time, as configured.
+
 ## [2.3.0] - 2026-11-19
 
 ### Security

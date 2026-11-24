@@ -18,6 +18,11 @@ use Magento\Framework\Stdlib\Cookie\CookieReaderInterface;
  * and the guest email in the frontend area (Hyvä Checkout), on REST place orders that carry
  * the storefront session cookie and, with Prevent Submit = Yes, on every GraphQL and REST place order.
  * The sales_model_service_quote_submit_before event fires regardless of the checkout front-end used.
+ *
+ * Settings, the API key and the Validator are those of the QUOTE's store view (LOQ-20327): a REST or
+ * GraphQL place order without a store code runs in the default store view, so the current store is
+ * not the cart's. This observer and the Validator must read the same prevent_submit, or a
+ * session-less order would get a warn-once it cannot remember (LOQ-20301).
  */
 class QuoteSubmitBefore implements ObserverInterface
 {
@@ -82,15 +87,19 @@ class QuoteSubmitBefore implements ObserverInterface
             return;
         }
 
-        if (empty($this->helper->getConfigValue('loqate_settings/settings/api_key'))) {
-            return;
-        }
-
         /** @var \Magento\Quote\Model\Quote $quote */
         $quote = $observer->getEvent()->getQuote();
         if (!$quote) {
             return;
         }
+
+        // The quote's store, not the current one: see the class docblock (LOQ-20327).
+        $storeId = (int)$quote->getStoreId();
+        if (empty($this->helper->getConfigValueForStore('loqate_settings/settings/api_key', $storeId))) {
+            return;
+        }
+        // A local copy, never assigned to $this: the injected Validator is a shared instance.
+        $validator = $this->validator->forStore($storeId);
 
         $errors = [];
 
@@ -99,8 +108,8 @@ class QuoteSubmitBefore implements ObserverInterface
         if ($shippingAddress && !$quote->getIsVirtual()) {
             $addressData = $shippingAddress->getData();
 
-            if ($this->helper->getConfigValue('loqate_settings/address_settings/enable_checkout')) {
-                $response = $this->validator->verifyAddress($addressData);
+            if ($this->helper->getConfigValueForStore('loqate_settings/address_settings/enable_checkout', $storeId)) {
+                $response = $validator->verifyAddress($addressData);
                 if (!empty($response['error'])) {
                     $errors[] = $response['message'];
                 }
@@ -108,11 +117,13 @@ class QuoteSubmitBefore implements ObserverInterface
 
             // !$errors: once the order is rejected the phone verdict can't change it, so don't bill the
             // check (as for email below); the shopper sees the phone error on the next attempt (LOQ-20326).
-            if (!$errors && $this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
+            if (!$errors
+                && $this->helper->getConfigValueForStore('loqate_settings/phone_settings/enable_checkout', $storeId)
+            ) {
                 $telephone = $shippingAddress->getTelephone();
                 $countryId = $shippingAddress->getCountryId();
                 if ($telephone) {
-                    $errorMessage = $this->validatePhone($telephone, $countryId);
+                    $errorMessage = $this->validatePhone($validator, $telephone, $countryId);
                     if ($errorMessage) {
                         $errors[] = $errorMessage;
                     }
@@ -125,8 +136,8 @@ class QuoteSubmitBefore implements ObserverInterface
         if ($billingAddress) {
             $addressData = $billingAddress->getData();
 
-            if ($this->helper->getConfigValue('loqate_settings/address_settings/enable_checkout')) {
-                $response = $this->validator->verifyAddress($addressData);
+            if ($this->helper->getConfigValueForStore('loqate_settings/address_settings/enable_checkout', $storeId)) {
+                $response = $validator->verifyAddress($addressData);
                 if (!empty($response['error'])) {
                     $errors[] = $response['message'];
                 }
@@ -134,11 +145,13 @@ class QuoteSubmitBefore implements ObserverInterface
 
             // !$errors: once the order is rejected the phone verdict can't change it, so don't bill the
             // check (as for email below); the shopper sees the phone error on the next attempt (LOQ-20326).
-            if (!$errors && $this->helper->getConfigValue('loqate_settings/phone_settings/enable_checkout')) {
+            if (!$errors
+                && $this->helper->getConfigValueForStore('loqate_settings/phone_settings/enable_checkout', $storeId)
+            ) {
                 $telephone = $billingAddress->getTelephone();
                 $countryId = $billingAddress->getCountryId();
                 if ($telephone) {
-                    $errorMessage = $this->validatePhone($telephone, $countryId);
+                    $errorMessage = $this->validatePhone($validator, $telephone, $countryId);
                     if ($errorMessage) {
                         $errors[] = $errorMessage;
                     }
@@ -160,20 +173,20 @@ class QuoteSubmitBefore implements ObserverInterface
             || ($areaCode === Area::AREA_WEBAPI_REST
                 && $this->cookieReader->getCookie($this->sessionConfig->getName()));
         $blocksWithoutSession = in_array($areaCode, [Area::AREA_GRAPHQL, Area::AREA_WEBAPI_REST], true)
-            && $this->helper->getConfigValue('loqate_settings/email_settings/prevent_submit');
+            && $this->helper->getConfigValueForStore('loqate_settings/email_settings/prevent_submit', $storeId);
         // !$errors: a rejected order can't be changed by the email verdict, so don't bill the check;
         // this also closes the forced-address-failure probe.
         // shortcut: a deliverable address plus a probe email still returns the email verdict for one paid call,
         // as address and phone checks do; add reCAPTCHA/rate limiting on place order to close it (LOQ-20315).
         if (!$errors
             && ($hasSession || $blocksWithoutSession)
-            && $this->helper->getConfigValue('loqate_settings/email_settings/enable_checkout')
+            && $this->helper->getConfigValueForStore('loqate_settings/email_settings/enable_checkout', $storeId)
             && ($quote->getCustomerIsGuest() || !$quote->getCustomerId())
         ) {
             $email = $quote->getCustomerEmail() ?: ($billingAddress ? $billingAddress->getEmail() : null);
             if ($email) {
                 // false: an email API outage must not block the order, as validatePhone() below.
-                $errorMessage = $this->validator->validateEmail($email, blockOnApiError: false, usePassCache: true);
+                $errorMessage = $validator->validateEmail($email, blockOnApiError: false, usePassCache: true);
                 if ($errorMessage) {
                     $errors[] = $errorMessage;
                 }
@@ -273,13 +286,14 @@ class QuoteSubmitBefore implements ObserverInterface
     }
 
     /**
+     * @param Validator $validator The Validator pinned to the quote's store view (LOQ-20327).
      * @param string $phone
      * @param string|null $country
      * @return \Magento\Framework\Phrase|false
      */
-    private function validatePhone(string $phone, ?string $country)
+    private function validatePhone(Validator $validator, string $phone, ?string $country)
     {
-        $response = $this->validator->verifyPhoneNumber($phone, $country);
+        $response = $validator->verifyPhoneNumber($phone, $country);
 
         if (isset($response['error']) || isset($response['noKeyFound'])) {
             return false;

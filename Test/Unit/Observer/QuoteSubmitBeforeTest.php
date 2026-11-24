@@ -84,6 +84,12 @@ class QuoteSubmitBeforeTest extends TestCase
      */
     private const SESSION_COOKIE_NAME = 'storefront_sid';
 
+    /** The store view the request runs in when a REST/GraphQL call names no store code. */
+    private const DEFAULT_STORE_ID = 1;
+
+    /** Another store view ("B") the cart belongs to, with its own Loqate settings (LOQ-20327). */
+    private const STORE_B = 2;
+
     /** A storefront session id, as the browser sends it on Luma's REST place order. */
     private const SESSION_ID = 'a1b2c3d4e5f6';
 
@@ -136,6 +142,15 @@ class QuoteSubmitBeforeTest extends TestCase
     /** @var string|null Value of the storefront session cookie on the request; null when absent. */
     private $sessionCookie = null;
 
+    /**
+     * @var array<int, array<string, mixed>> Store view id => config path => value overriding
+     *      $this->config for that store view, as getConfigValueForStore() resolves it (LOQ-20327).
+     */
+    private $storeConfig = [];
+
+    /** @var ArrayObject Every store id the observer pinned the Validator to with forStore(). */
+    private $forStoreCalls;
+
     protected function setUp(): void
     {
         $this->validatorCalls = new ArrayObject();
@@ -151,6 +166,8 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->phoneResponse = true;
         $this->emailResponse = false;
         $this->sessionCookie = null;
+        $this->storeConfig = [];
+        $this->forStoreCalls = new ArrayObject();
     }
 
     /**
@@ -1199,6 +1216,146 @@ class QuoteSubmitBeforeTest extends TestCase
         $this->assertCount(1, $journey['emailRequests'], 'Attempt 3 costs no further email call.');
     }
 
+    /**
+     * LOQ-20327: a REST/GraphQL place order with no store code runs in the DEFAULT store view, but
+     * the cart belongs to store view B. B's merchant chose which checks run for B's orders, so the
+     * observer must read B's toggles - here B turns address checks off and phone checks on, the
+     * opposite of the default store - and pin the Validator to B too.
+     */
+    public function testAQuoteFromAnotherStoreViewUsesThatStoreViewsAddressAndPhoneSettings(): void
+    {
+        $this->config[self::PHONE_CHECKOUT] = '';
+        $this->storeConfig[self::STORE_B] = [self::ADDRESS_CHECKOUT => '', self::PHONE_CHECKOUT => '1'];
+        $observer = $this->createObserver(Area::AREA_WEBAPI_REST);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, null, 0, null, self::STORE_B)
+        );
+
+        $this->assertSame(
+            [
+                ['verifyPhoneNumber', self::SHIPPING_ADDRESS['telephone'], 'GB'],
+                ['verifyPhoneNumber', self::BILLING_ADDRESS['telephone'], 'GB'],
+            ],
+            $this->recordedCalls(),
+            "Store B's toggles (address off, phone on) must decide the checks, not the default store's."
+        );
+        $this->assertSame(
+            [self::STORE_B],
+            iterator_to_array($this->forStoreCalls),
+            "The Validator must be pinned to the quote's store, so it bills B's API key and reads B's settings."
+        );
+    }
+
+    /**
+     * LOQ-20327: a merchant who sets the API key only on store view B must still get B's orders
+     * checked when the place-order call names no store code; reading the default store's (empty)
+     * key used to skip every check silently.
+     */
+    public function testAnApiKeySetOnlyOnTheQuotesStoreViewStillVerifies(): void
+    {
+        $this->config['loqate_settings/settings/api_key'] = '';
+        $this->storeConfig[self::STORE_B] = ['loqate_settings/settings/api_key' => 'STORE-B-KEY'];
+        $observer = $this->createObserver(Area::AREA_GRAPHQL);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, null, 0, null, self::STORE_B)
+        );
+
+        $this->assertCount(4, $this->recordedCalls(), "B has a key, so B's addresses and phones are verified.");
+        $this->assertSame([self::STORE_B], iterator_to_array($this->forStoreCalls));
+    }
+
+    /**
+     * ...and the reverse: a store view with no key of its own must not be verified (or billed) on
+     * the default store's key just because the call named no store code.
+     */
+    public function testNoApiKeyOnTheQuotesStoreViewVerifiesNothingEvenWithADefaultKey(): void
+    {
+        $this->storeConfig[self::STORE_B] = ['loqate_settings/settings/api_key' => ''];
+        $observer = $this->createObserver(Area::AREA_WEBAPI_REST);
+
+        $observer->execute(
+            $this->quoteEvent(self::SHIPPING_ADDRESS, self::BILLING_ADDRESS, false, null, 0, null, self::STORE_B)
+        );
+
+        $this->assertSame([], $this->recordedCalls(), 'Store B has no API key: nothing may be verified.');
+        $this->assertSame([], iterator_to_array($this->forStoreCalls), 'Nothing to pin when nothing is checked.');
+    }
+
+    /**
+     * LOQ-20327 + LOQ-20301: store B blocks invalid emails (Prevent Submit = Yes), the default
+     * store only warns. A cookie-less REST guest place order for B must be REJECTED on every
+     * attempt. The observer and the Validator must agree on B's setting: if the observer read the
+     * default's No it would skip the check, and if the Validator did it would warn once and then
+     * accept the resubmission - a warn-once with no session behind it.
+     */
+    public function testPreventSubmitOnTheQuotesStoreViewRejectsACookielessRestOrderEveryTime(): void
+    {
+        $journey = $this->createJourney(
+            '',
+            false,
+            Area::AREA_WEBAPI_REST,
+            null,
+            null,
+            false,
+            [self::STORE_B => [self::EMAIL_PREVENT_SUBMIT => '1']]
+        );
+        $event = $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1, null, self::STORE_B);
+
+        $rejections = [];
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $rejections[] = $this->placeOrder($journey['observer'], $event)?->getMessage();
+        }
+
+        $this->assertSame(
+            array_fill(0, 3, 'The provided email address is invalid.'),
+            $rejections,
+            "Store B blocks invalid emails: every attempt is refused, never warned and then accepted."
+        );
+        $this->assertCount(3, $journey['emailRequests'], 'Each attempt is verified (billed).');
+    }
+
+    /**
+     * ...and the reverse: B only warns (Prevent Submit = No) while the default blocks. Without a
+     * session a warning could never be remembered, so B's cookie-less REST orders are not
+     * email-checked at all (LOQ-20301) - the default's Yes must not switch the check on.
+     */
+    public function testNoPreventSubmitOnTheQuotesStoreViewSkipsTheCookielessRestEmailCheck(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '1';
+        $this->config[self::EMAIL_PREVENT_SUBMIT] = '1';
+        $this->storeConfig[self::STORE_B] = [self::EMAIL_PREVENT_SUBMIT => ''];
+        $observer = $this->createObserver(Area::AREA_WEBAPI_REST);
+
+        $observer->execute(
+            $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1, null, self::STORE_B)
+        );
+
+        $this->assertSame([], $this->emailCalls(), "Store B warns only, and a cookie-less request cannot warn once.");
+    }
+
+    /**
+     * LOQ-20327: email checking switched on for store B alone must check B's guest orders even
+     * when the request runs in the default store view, where it is off.
+     */
+    public function testEmailCheckingEnabledOnlyOnTheQuotesStoreViewIsApplied(): void
+    {
+        $this->config[self::EMAIL_CHECKOUT] = '';
+        $this->storeConfig[self::STORE_B] = [self::EMAIL_CHECKOUT => '1'];
+        $observer = $this->createObserver(Area::AREA_FRONTEND);
+
+        $observer->execute(
+            $this->quoteEvent(null, self::BILLING_ADDRESS, true, self::GUEST_EMAIL, 1, null, self::STORE_B)
+        );
+
+        $this->assertSame(
+            [['validateEmail', self::GUEST_EMAIL, false, true]],
+            $this->emailCalls(),
+            "Store B checks emails at checkout, so B's guest email is verified."
+        );
+    }
+
     public static function sessionlessAreaProvider(): array
     {
         return [
@@ -1228,6 +1385,7 @@ class QuoteSubmitBeforeTest extends TestCase
      *                                        per session-less request - can be counted together.
      * @param bool $checkAddress Also switch the address check on; verifyAddress() answers the
      *                           live $this->addressResponse, so a test can fix the address between attempts.
+     * @param array<int, array<string, mixed>> $storeConfig Per-store-view overrides (LOQ-20327).
      * @return array{accountManagement: AccountManagement, shipping: CheckoutShippingInformation,
      *     observer: QuoteSubmitBefore, emailRequests: ArrayObject}
      */
@@ -1237,7 +1395,8 @@ class QuoteSubmitBeforeTest extends TestCase
         string $area = Area::AREA_WEBAPI_REST,
         ?string $sessionCookie = self::SESSION_ID,
         ?ArrayObject $emailRequests = null,
-        bool $checkAddress = false
+        bool $checkAddress = false,
+        array $storeConfig = []
     ): array {
         $emailRequests = $emailRequests ?? new ArrayObject();
         $session = $this->createSessionDouble(new ArrayObject(), new ArrayObject(['customerId' => null]));
@@ -1246,7 +1405,7 @@ class QuoteSubmitBeforeTest extends TestCase
             self::EMAIL_CHECKOUT => '1',
             self::EMAIL_PREVENT_SUBMIT => $preventSubmit,
             self::ADDRESS_CHECKOUT => $checkAddress ? '1' : '',
-        ]);
+        ], null, $storeConfig);
         // A real Validator with only the billable verifyEmail() and verifyAddress() stubbed.
         $moduleList = $this->createMock(ModuleListInterface::class);
         $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
@@ -1350,6 +1509,10 @@ class QuoteSubmitBeforeTest extends TestCase
         $helper->method('getConfigValue')->willReturnCallback(
             static fn ($configPath) => $config[$configPath] ?? ''
         );
+        // Store-aware, falling back to the default config as Magento does (LOQ-20327).
+        $helper->method('getConfigValueForStore')->willReturnCallback(
+            fn ($configPath, $storeId) => $this->storeConfig[(int)$storeId][$configPath] ?? $config[$configPath] ?? ''
+        );
 
         // A recording spy rather than a set of expectations, so a test can assert exactly WHICH
         // calls were made, in WHICH order and with WHICH arguments - and, for the admin guard,
@@ -1379,6 +1542,23 @@ class QuoteSubmitBeforeTest extends TestCase
                 return $this->emailResponse;
             }
         );
+        // The spy above is the store-pinned copy. The observer is given a SEPARATE shared
+        // instance that only hands that copy out and fails on any check made directly on it:
+        // a check that bypasses forStore() would run with the request store's key and settings
+        // (LOQ-20327), and must not pass these tests just because both objects record the same.
+        // The pinned store ids are kept apart so the exact-call assertions above are unchanged.
+        $forStoreCalls = $this->forStoreCalls;
+        $shared = $this->createMock(Validator::class);
+        $shared->method('forStore')->willReturnCallback(
+            static function (int $storeId) use ($forStoreCalls, $validator) {
+                $forStoreCalls[] = $storeId;
+
+                return $validator;
+            }
+        );
+        foreach (['verifyAddress', 'verifyPhoneNumber', 'validateEmail'] as $unscoped) {
+            $shared->expects($this->never())->method($unscoped);
+        }
 
         $records = $this->logRecords;
         $logger = $this->createMock(Logger::class);
@@ -1397,7 +1577,7 @@ class QuoteSubmitBeforeTest extends TestCase
             $appState->method('getAreaCode')->willReturn($area);
         }
 
-        return new QuoteSubmitBefore($helper, $validator, $logger, $appState, ...$this->sessionCookieDoubles());
+        return new QuoteSubmitBefore($helper, $shared, $logger, $appState, ...$this->sessionCookieDoubles());
     }
 
     /**
@@ -1433,6 +1613,7 @@ class QuoteSubmitBeforeTest extends TestCase
      * @param mixed $customerEmail What Quote::getCustomerEmail() answers.
      * @param mixed $customerIsGuest What Quote::getCustomerIsGuest() answers (Magento stores 0/1).
      * @param mixed $customerId What Quote::getCustomerId() answers; null for a guest quote.
+     * @param mixed $storeId What Quote::getStoreId() answers; 1 is the request's (default) store.
      * @return Observer
      */
     private function quoteEvent(
@@ -1441,18 +1622,28 @@ class QuoteSubmitBeforeTest extends TestCase
         bool $isVirtual = false,
         $customerEmail = null,
         $customerIsGuest = 0,
-        $customerId = null
+        $customerId = null,
+        $storeId = self::DEFAULT_STORE_ID
     ): Observer {
         $shippingAddress = $shipping === null ? null : self::addressDouble($shipping);
         $billingAddress = $billing === null ? null : self::addressDouble($billing);
 
-        $quote = new class ($shippingAddress, $billingAddress, $isVirtual, $customerEmail, $customerIsGuest, $customerId) {
+        $quote = new class (
+            $shippingAddress,
+            $billingAddress,
+            $isVirtual,
+            $customerEmail,
+            $customerIsGuest,
+            $customerId,
+            $storeId
+        ) {
             private $shippingAddress;
             private $billingAddress;
             private $isVirtual;
             private $customerEmail;
             private $customerIsGuest;
             private $customerId;
+            private $storeId;
 
             public function __construct(
                 $shippingAddress,
@@ -1460,7 +1651,8 @@ class QuoteSubmitBeforeTest extends TestCase
                 bool $isVirtual,
                 $customerEmail,
                 $customerIsGuest,
-                $customerId
+                $customerId,
+                $storeId
             ) {
                 $this->shippingAddress = $shippingAddress;
                 $this->billingAddress = $billingAddress;
@@ -1468,6 +1660,12 @@ class QuoteSubmitBeforeTest extends TestCase
                 $this->customerEmail = $customerEmail;
                 $this->customerIsGuest = $customerIsGuest;
                 $this->customerId = $customerId;
+                $this->storeId = $storeId;
+            }
+
+            public function getStoreId()
+            {
+                return $this->storeId;
             }
 
             public function getCustomerId()
