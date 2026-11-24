@@ -426,6 +426,14 @@ class ShopperScopedSessionStores
     private ?Data $helper;
 
     /**
+     * @var int|null Store view contact digests are namespaced by INSTEAD of the current one, or
+     *      null to follow the current store. Set only by Validator::forStore() (LOQ-20327), so a
+     *      warning earned for the quote's store is remembered for that store, not the one a REST
+     *      call without a store code happened to run in.
+     */
+    private ?int $storeId;
+
+    /**
      * How many OWNERSHIP EPOCHS this instance has seen: the number of times ownership of the
      * stores has been established or re-established since it was constructed.
      *
@@ -449,11 +457,26 @@ class ShopperScopedSessionStores
      * @param Session $session The per-shopper customer session the stores live in.
      * @param Data|null $helper Config/store helper, used only to namespace contact digests
      *                          by store view. Omit it unless contactDigest() will be called.
+     * @param int|null $storeId Pin contact digests to this store view instead of the current one.
      */
-    public function __construct(Session $session, ?Data $helper = null)
+    public function __construct(Session $session, ?Data $helper = null, ?int $storeId = null)
     {
         $this->session = $session;
         $this->helper = $helper;
+        $this->storeId = $storeId;
+    }
+
+    /**
+     * A guard over the same session whose contact digests are namespaced by $storeId
+     * (LOQ-20327, for Validator::forStore()).
+     *
+     * Built HERE rather than by the caller so the caller never needs the raw session: holding
+     * it would bypass this guard (see the class docblock). A NEW instance, not a clone, so it
+     * starts its own ownership epoch count exactly as any freshly built guard does.
+     */
+    public function forStore(int $storeId): self
+    {
+        return new self($this->session, $this->helper, $storeId);
     }
 
     /**
@@ -1120,10 +1143,16 @@ class ShopperScopedSessionStores
      * direction: an unrecognised scope costs a re-verify and can never let a decision earned
      * under one store view's API key and prevent_submit toggle replay under another's.
      *
+     * A store id pinned at construction (LOQ-20327, see self::$storeId) wins over all of this.
+     *
      * @return string A store id rendered as a decimal string, or '-' when none is available.
      */
     private function resolveStoreScope(): string
     {
+        if ($this->storeId !== null) {
+            return (string)$this->storeId;
+        }
+
         if ($this->helper === null) {
             return '-';
         }

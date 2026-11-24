@@ -50,6 +50,15 @@ class ValidatorTest extends TestCase
 
     private const PHONE = '02079460000';
 
+    private const API_KEY = 'loqate_settings/settings/api_key';
+    private const EMAIL_TIMEOUT = 'loqate_settings/email_settings/email_validation_timeout_value';
+
+    /** The store view a REST call without a store code runs in. */
+    private const DEFAULT_STORE = 1;
+
+    /** The store view the quote actually belongs to. */
+    private const STORE_B = 2;
+
     private const SUBMIT_AGAIN_MESSAGE = 'Invalid email address. Submit again to use this email address.';
     private const INVALID_MESSAGE = 'The provided email address is invalid.';
     private const UNEXPECTED_ERROR_MESSAGE = 'An unexpected error occurred while trying to validate your email address.';
@@ -65,7 +74,9 @@ class ValidatorTest extends TestCase
         $logger = $this->createMock(Logger::class);
         $session = $this->createMock(Session::class);
         $regionFactory = $this->createMock(RegionFactory::class);
+        // The constructor reads the module version even with no API key (LOQ-20327).
         $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
 
         $this->helper = $this->createMock(Data::class);
         // Empty API key keeps the constructor from instantiating the live Verify
@@ -1174,13 +1185,16 @@ class ValidatorTest extends TestCase
             static fn ($configPath) => $liveConfig[$configPath] ?? ''
         );
         $helper->method('getCurrentStore')->willReturnCallback(static fn (): int => (int)$storeId['id']);
+        // The constructor reads the module version even with no API key (LOQ-20327).
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
 
         $validator = $this->getMockBuilder(Validator::class)
             ->setConstructorArgs([
                 $this->createMock(Logger::class),
                 $session,
                 $this->createMock(RegionFactory::class),
-                $this->createMock(ModuleListInterface::class),
+                $moduleList,
                 $helper,
                 $this->createMock(SerializerInterface::class),
                 $this->createMock(NotifierInterface::class),
@@ -1244,5 +1258,248 @@ class ValidatorTest extends TestCase
         $reflection->setAccessible(true);
 
         return $reflection->invokeArgs($this->validator, $args);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // forStore() (LOQ-20327). A REST place-order with no store code runs in the DEFAULT store
+    // view, so everything read through the current store answered for the wrong store: its API
+    // key, its email settings, its warn-once namespace and its verdict cache keys. forStore()
+    // pins a COPY of the validator to the quote's store; these tests hold it to that.
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * The quote's store decides how its email is checked, not the store the REST request
+     * happened to land in: a merchant who set a longer timeout and catch-all acceptance on store
+     * view B must get them for B's orders even when the API call carries no store code.
+     */
+    public function testForStoreSendsThatStoresEmailTimeoutAndCatchAllNotTheRequestStores(): void
+    {
+        $fixture = $this->storeScopedFixture(
+            [self::API_KEY => 'DEFAULT-KEY', self::EMAIL_TIMEOUT => '1000', self::EMAIL_CATCH_ALL => '0'],
+            [self::STORE_B => [self::EMAIL_TIMEOUT => '5000', self::EMAIL_CATCH_ALL => '1']]
+        );
+        $requests = new ArrayObject();
+        $scoped = $this->withRecordingConnector($fixture['validator']->forStore(self::STORE_B), $requests, [true]);
+
+        $scoped->verifyEmail(self::EMAIL);
+
+        $this->assertSame('5000', $requests[0]['Timeout'], 'Store B\'s timeout must be sent, not the default store\'s.');
+        $this->assertTrue(
+            $requests[0][Verify::ACCEPT_VALID_CATCH_ALL] ?? false,
+            'Store B accepts valid catch-alls; the default store does not, so the flag proves whose config was read.'
+        );
+    }
+
+    /**
+     * prevent_submit is a per-store merchant decision: a store that only warns must not hard-
+     * reject its shoppers just because the REST call was routed through a store that blocks.
+     */
+    public function testForStoreAppliesThatStoresPreventSubmitNotTheRequestStores(): void
+    {
+        $fixture = $this->storeScopedFixture(
+            [self::API_KEY => 'DEFAULT-KEY', self::EMAIL_PREVENT_SUBMIT => '1'],
+            [self::STORE_B => [self::EMAIL_PREVENT_SUBMIT => '0']]
+        );
+        $requests = new ArrayObject();
+        $scoped = $this->withRecordingConnector($fixture['validator']->forStore(self::STORE_B), $requests, []);
+        $default = $this->withRecordingConnector($fixture['validator'], $requests, []);
+
+        $this->assertSame(self::SUBMIT_AGAIN_MESSAGE, (string)$scoped->validateEmail(self::EMAIL));
+        $this->assertSame(self::INVALID_MESSAGE, (string)$default->validateEmail(self::EMAIL));
+    }
+
+    /**
+     * Each store view can bill a different Loqate account. The pinned copy must call the API
+     * with the quote store's key - and must be able to at all when ONLY that store has a key,
+     * which is the exact multi-store setup the ticket was raised on.
+     */
+    public function testForStoreBuildsTheApiClientFromThatStoresKeyEvenWhenTheRequestStoreHasNone(): void
+    {
+        $fixture = $this->storeScopedFixture([], [self::STORE_B => [self::API_KEY => 'STORE-B-KEY']]);
+
+        $connector = $this->readApiConnector($fixture['validator']->forStore(self::STORE_B));
+
+        $this->assertInstanceOf(Verify::class, $connector);
+        $this->assertSame('STORE-B-KEY', (new ReflectionProperty(Verify::class, 'apiKey'))->getValue($connector));
+    }
+
+    /**
+     * Validator is a shared DI instance: if forStore() mutated it, every later caller in the
+     * same request - another plugin, another quote - would silently run against store B.
+     */
+    public function testForStoreLeavesTheSharedInstanceUntouched(): void
+    {
+        $fixture = $this->storeScopedFixture(
+            [self::API_KEY => 'DEFAULT-KEY'],
+            [self::STORE_B => [self::API_KEY => 'STORE-B-KEY']]
+        );
+        $shared = $fixture['validator'];
+        $connectorBefore = $this->readApiConnector($shared);
+
+        $scoped = $shared->forStore(self::STORE_B);
+
+        $this->assertNotSame($shared, $scoped);
+        $this->assertNull((new ReflectionProperty(Validator::class, 'storeId'))->getValue($shared));
+        $this->assertSame($connectorBefore, $this->readApiConnector($shared));
+        $this->assertNotSame($connectorBefore, $this->readApiConnector($scoped));
+    }
+
+    /**
+     * When only store B has a key the shared instance was built with no client and - before
+     * this ticket - no module version either, because the constructor returned early. The
+     * pinned copy must still verify, and tag its requests with the module version.
+     */
+    public function testForStoreVerifiesEmailAndPhoneWhenOnlyThatStoreHasAKey(): void
+    {
+        $fixture = $this->storeScopedFixture([], [self::STORE_B => [self::API_KEY => 'STORE-B-KEY']]);
+        $requests = new ArrayObject();
+        $scoped = $this->withRecordingConnector($fixture['validator']->forStore(self::STORE_B), $requests, [true]);
+
+        $this->assertSame([true], $scoped->verifyEmail(self::EMAIL));
+        $this->assertSame([true], $scoped->verifyPhoneNumber(self::PHONE));
+        $this->assertSame('AdobeCommerce_vtest', $requests[0]['source']);
+        $this->assertSame('AdobeCommerce_vtest', $requests[1]['source']);
+    }
+
+    /**
+     * A store with no key of its own must soft-pass exactly as an unconfigured store does
+     * today, even when the request's store has one: B's orders must not be billed to the
+     * default store's account.
+     */
+    public function testForStoreSoftPassesWhenThatStoreHasNoKey(): void
+    {
+        $fixture = $this->storeScopedFixture(
+            [self::API_KEY => 'DEFAULT-KEY'],
+            [self::STORE_B => [self::API_KEY => '']]
+        );
+        $scoped = $fixture['validator']->forStore(self::STORE_B);
+
+        $this->assertNull($this->readApiConnector($scoped));
+        $this->assertSame(['noKeyFound' => true], $scoped->verifyEmail(self::EMAIL));
+        $this->assertSame(['noKeyFound' => true], $scoped->verifyPhoneNumber(self::PHONE));
+    }
+
+    /**
+     * The key guard reads config but the client is built once; if the two ever disagree (a key
+     * that appears after construction), the result must be the documented soft-pass, never a
+     * fatal "call to a member function on null" that takes the whole checkout down.
+     */
+    public function testVerifyEmailAndPhoneSoftPassWhenNoClientWasBuiltDespiteAKeyNowBeingConfigured(): void
+    {
+        $fixture = $this->storeScopedFixture([], []);
+        $fixture['config'][self::API_KEY] = 'KEY-ADDED-LATER';
+
+        $this->assertSame(['noKeyFound' => true], $fixture['validator']->verifyEmail(self::EMAIL));
+        $this->assertSame(['noKeyFound' => true], $fixture['validator']->verifyPhoneNumber(self::PHONE));
+    }
+
+    /**
+     * The warn-once list is namespaced by store view so a warning earned under one store's
+     * prevent_submit cannot let the email through under another's. A pinned copy must namespace
+     * by the PINNED store: a repeat through forStore(B) passes, but the default store has never
+     * warned about this address and must still warn.
+     */
+    public function testForStoreWarnOnceIsRememberedForThatStoreOnly(): void
+    {
+        $fixture = $this->storeScopedFixture(
+            [self::API_KEY => 'DEFAULT-KEY', self::EMAIL_PREVENT_SUBMIT => '0'],
+            [self::STORE_B => [self::EMAIL_PREVENT_SUBMIT => '0']]
+        );
+        $requests = new ArrayObject();
+        $default = $this->withRecordingConnector($fixture['validator'], $requests, []);
+
+        $first = $this->withRecordingConnector($default->forStore(self::STORE_B), $requests, []);
+        $this->assertSame(self::SUBMIT_AGAIN_MESSAGE, (string)$first->validateEmail(self::EMAIL));
+
+        $repeat = $this->withRecordingConnector($default->forStore(self::STORE_B), $requests, []);
+        $this->assertFalse($repeat->validateEmail(self::EMAIL), 'The resubmission to store B must be accepted.');
+
+        $this->assertSame(
+            self::SUBMIT_AGAIN_MESSAGE,
+            (string)$default->validateEmail(self::EMAIL),
+            'Store B\'s warning must not have been recorded against the default store.'
+        );
+    }
+
+    /**
+     * Address verdicts are judged against a store's thresholds, so the caches that replay them
+     * are keyed by store. A pinned copy must key by the pinned store, or a verdict earned under
+     * the default store's thresholds would be replayed for store B's order.
+     */
+    public function testForStoreKeysAddressVerdictCachesByThatStore(): void
+    {
+        $fixture = $this->storeScopedFixture([], []);
+        $scoped = $fixture['validator']->forStore(self::STORE_B);
+
+        foreach (['buildVerifyCacheKey', 'buildBatchVerifyCacheKey'] as $method) {
+            $reflection = new ReflectionMethod(Validator::class, $method);
+            $this->assertStringStartsWith(self::STORE_B . '|', $reflection->invoke($scoped, 'sig'), $method);
+            $this->assertStringStartsWith(
+                self::DEFAULT_STORE . '|',
+                $reflection->invoke($fixture['validator'], 'sig'),
+                $method . ' on the shared instance must still use the current store.'
+            );
+        }
+    }
+
+    /**
+     * A real Validator whose config helper answers per store: the CURRENT store (DEFAULT_STORE)
+     * through getConfigValue(), any store through getConfigValueForStore() falling back to the
+     * default value as Magento's config inheritance does.
+     *
+     * @param array<string, mixed> $config Current/default-store values.
+     * @param array<int, array<string, mixed>> $storeConfig Per-store overrides.
+     * @return array{validator: Validator, config: ArrayObject}
+     */
+    private function storeScopedFixture(array $config, array $storeConfig): array
+    {
+        $liveConfig = new ArrayObject($config);
+        $helper = $this->createMock(Data::class);
+        $helper->method('getConfigValue')->willReturnCallback(
+            static fn ($configPath) => $liveConfig[$configPath] ?? ''
+        );
+        $helper->method('getConfigValueForStore')->willReturnCallback(
+            static fn ($configPath, $storeId) => $storeConfig[$storeId][$configPath] ?? $liveConfig[$configPath] ?? ''
+        );
+        $helper->method('getCurrentStore')->willReturn(self::DEFAULT_STORE);
+
+        $moduleList = $this->createMock(ModuleListInterface::class);
+        $moduleList->method('getOne')->willReturn(['setup_version' => 'test']);
+
+        $validator = new Validator(
+            $this->createMock(Logger::class),
+            $this->createSessionDouble(new ArrayObject(), new ArrayObject(['customerId' => null])),
+            $this->createMock(RegionFactory::class),
+            $moduleList,
+            $helper,
+            $this->createMock(SerializerInterface::class),
+            $this->createMock(NotifierInterface::class),
+            $this->createMock(CacheInterface::class)
+        );
+
+        return ['validator' => $validator, 'config' => $liveConfig];
+    }
+
+    /**
+     * Swap the SDK client on $validator for one that records each request and answers $response.
+     */
+    private function withRecordingConnector(Validator $validator, ArrayObject $requests, $response): Validator
+    {
+        $connector = $this->createMock(Verify::class);
+        $record = static function (array $data) use ($requests, $response) {
+            $requests[] = $data;
+
+            return $response;
+        };
+        $connector->method('verifyEmail')->willReturnCallback($record);
+        $connector->method('verifyPhone')->willReturnCallback($record);
+        (new ReflectionProperty(Validator::class, 'apiConnector'))->setValue($validator, $connector);
+
+        return $validator;
+    }
+
+    private function readApiConnector(Validator $validator)
+    {
+        return (new ReflectionProperty(Validator::class, 'apiConnector'))->getValue($validator);
     }
 }
